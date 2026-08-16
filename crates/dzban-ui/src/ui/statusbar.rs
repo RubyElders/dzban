@@ -1,7 +1,14 @@
 use gtk4::prelude::*;
 use gtk4::{Box, Label, Orientation, Separator};
+use std::cell::RefCell;
+use std::rc::Rc;
 use super::connection_state::ConnectionStateWidget;
-use super::ConnectionModel;
+use dzban_db::DbConnection;
+
+struct StatusbarBinding {
+    connection: DbConnection,
+    handlers: Vec<gtk4::glib::SignalHandlerId>,
+}
 
 pub struct Statusbar {
     container: Box,
@@ -10,6 +17,7 @@ pub struct Statusbar {
     rows_info: Label,
     server_version: Label,
     latency: Label,
+    binding: Rc<RefCell<Option<StatusbarBinding>>>,
 }
 
 impl Statusbar {
@@ -73,6 +81,7 @@ impl Statusbar {
             rows_info,
             server_version,
             latency,
+            binding: Rc::new(RefCell::new(None)),
         }
     }
     
@@ -80,48 +89,61 @@ impl Statusbar {
         &self.container
     }
     
-    /// Bind this statusbar to a ConnectionModel (reactive updates)
-    /// This is the GTK-idiomatic way - using property bindings
-    pub fn bind_to_model(&self, model: &ConnectionModel) {
+    pub fn bind_to_connection(&self, db_name: &str, connection: &DbConnection) {
+        self.clear_binding();
+        let db_name = db_name.to_string();
         let statusbar = self.clone();
-        
-        // Bind latency property - updates automatically when property changes
-        model.connect_notify_local(Some("latency-micros"), move |model, _| {
-            let latency = model.latency();
+        let latency_handler = connection.connect_notify_local(Some("latency-micros"), move |connection, _| {
+            let latency = connection.latency();
             statusbar.update_latency(latency);
         });
         
         let statusbar = self.clone();
-        // Bind version property
-        model.connect_notify_local(Some("version"), move |model, _| {
-            let version = model.version();
+        let version_handler = connection.connect_notify_local(Some("version"), move |connection, _| {
+            let version = connection.version();
             statusbar.update_version(version.as_deref());
         });
         
         let statusbar = self.clone();
-        // Bind state property
-        model.connect_notify_local(Some("state"), move |model, _| {
-            let state = model.state();
-            let db_name = model.db_name();
+        let db_name_for_state = db_name.clone();
+        let state_handler = connection.connect_notify_local(Some("state"), move |connection, _| {
+            let state = connection.state();
+            let db_name = db_name_for_state.clone();
             statusbar.update_connection(Some(&db_name), state);
+        });
+
+        *self.binding.borrow_mut() = Some(StatusbarBinding {
+            connection: connection.clone(),
+            handlers: vec![latency_handler, version_handler, state_handler],
         });
         
         // Set initial values
-        self.update_latency(model.latency());
-        self.update_version(model.version().as_deref());
-        self.update_connection(Some(&model.db_name()), model.state());
+        self.update_latency(connection.latency());
+        self.update_version(connection.version().as_deref());
+        self.update_connection(Some(&db_name), connection.state());
     }
     
     /// Unbind from current model (if switching tabs or closing connection)
     pub fn unbind(&self) {
+        self.clear_binding();
         self.update_connection(None, dzban_db::ConnectionState::Disconnected);
         self.update_version(None);
         self.update_latency(None);
+        self.update_exec_time(None);
+        self.update_rows(None);
+    }
+
+    fn clear_binding(&self) {
+        if let Some(binding) = self.binding.borrow_mut().take() {
+            for handler in binding.handlers {
+                gtk4::glib::signal::signal_handler_disconnect(&binding.connection, handler);
+            }
+        }
     }
     
     pub fn update_connection(&self, db_name: Option<&str>, state: dzban_db::ConnectionState) {
         if let Some(name) = db_name {
-            let text = format!("{}", name);
+            let text = name.to_string();
             self.connection_widget.update_state(state, Some(&text));
         } else {
             self.connection_widget.update_state(dzban_db::ConnectionState::Disconnected, Some("No database"));
@@ -145,7 +167,6 @@ impl Statusbar {
         }
     }
     
-    #[allow(dead_code)]
     pub fn update_exec_time(&self, seconds: Option<f64>) {
         if let Some(s) = seconds {
             self.exec_time.set_text(&format!("⏱️  {:.2}s", s));
@@ -154,7 +175,6 @@ impl Statusbar {
         }
     }
     
-    #[allow(dead_code)]
     pub fn update_rows(&self, count: Option<usize>) {
         if let Some(n) = count {
             self.rows_info.set_text(&format!("📊 {} rows", n));
@@ -173,6 +193,7 @@ impl Clone for Statusbar {
             rows_info: self.rows_info.clone(),
             server_version: self.server_version.clone(),
             latency: self.latency.clone(),
+            binding: self.binding.clone(),
         }
     }
 }
@@ -202,7 +223,22 @@ fn format_latency(duration: std::time::Duration) -> String {
     }
 }
 
-// TODO: Add methods to update status bar with animated transitions
-// - update_connection_status()
-// - update_query_stats()
-// - show_spinner() for running queries
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[gtk4::test]
+    #[ignore = "requires a graphical display"]
+    fn rebinding_disconnects_the_previous_connection() {
+        let statusbar = Statusbar::new();
+        let first = DbConnection::new("host=first".to_string());
+        let second = DbConnection::new("host=second".to_string());
+
+        statusbar.bind_to_connection("first", &first);
+        statusbar.bind_to_connection("second", &second);
+        first.notify("state");
+
+        assert_eq!(statusbar.connection_widget.text(), "second");
+    }
+}

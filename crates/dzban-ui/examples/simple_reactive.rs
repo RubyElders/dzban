@@ -44,6 +44,12 @@ mod counter {
             Object::builder().build()
         }
     }
+
+    impl Default for Counter {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
 }
 
 fn example_counter(app: &Application) {
@@ -165,6 +171,12 @@ mod text_model {
             Object::builder().build()
         }
     }
+
+    impl Default for TextModel {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
 }
 
 fn example_two_way(app: &Application) {
@@ -227,7 +239,7 @@ fn example_two_way(app: &Application) {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, glib::Enum)]
 #[enum_type(name = "DemoConnectionState")]
-enum DemoState {
+pub enum DemoState {
     Disconnected,
     Connecting,
     Connected,
@@ -249,7 +261,7 @@ mod connection {
         #[derive(Properties)]
         #[properties(wrapper_type = super::Connection)]
         pub struct Connection {
-            #[property(get, set)]
+            #[property(get, set, default)]
             state: Cell<DemoState>,
             
             #[property(get, set)]
@@ -283,6 +295,12 @@ mod connection {
     impl Connection {
         pub fn new() -> Self {
             Object::builder().build()
+        }
+    }
+
+    impl Default for Connection {
+        fn default() -> Self {
+            Self::new()
         }
     }
 }
@@ -395,6 +413,7 @@ fn example_notify(app: &Application) {
 // ============================================================================
 
 fn main() {
+    let example = std::env::args().nth(1).unwrap_or_else(|| "notify".to_string());
     let app = Application::builder()
         .application_id("com.example.simple.reactive")
         .build();
@@ -404,7 +423,11 @@ fn main() {
     // - example_two_way (two-way binding)
     // - example_notify (notify signals - like your connection status!)
     
-    app.connect_activate(example_notify);
+    app.connect_activate(move |app| match example.as_str() {
+        "counter" => example_counter(app),
+        "two-way" => example_two_way(app),
+        _ => example_notify(app),
+    });
     
     app.run();
 }

@@ -1,5 +1,4 @@
-/// UI timing constants
-
+//! UI timing constants.
 /// Duration to wait before triggering auto-EXPLAIN when holding Ctrl
 pub const EXPLAIN_DELAY_MS: u64 = 1000; // 1 second
 

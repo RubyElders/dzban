@@ -10,8 +10,10 @@ use super::query_tabs::QueryTabManager;
 use super::connections;
 use super::statusbar::Statusbar;
 use super::connection_state::ConnectionStateWidget;
-use super::ConnectionModel;
-use dzban_db::{Config, ConnectionManager, ConnectionState, RuntimeBridge};
+use dzban_db::{Config, ConnectionState, DbConnection, RuntimeBridge};
+
+type DatabaseTab = (TabPage, QueryTabManager, DbConnection, ConnectionStateWidget);
+type DatabaseTabs = Rc<RefCell<HashMap<String, DatabaseTab>>>;
 
 // Create a simple colored circle icon using Cairo with exact CSS color
 #[allow(deprecated)]
@@ -66,15 +68,14 @@ pub struct DatabaseTabManager {
     tab_view: TabView,
     _tab_bar: TabBar,
     container: gtk4::Box,
-    tabs: Rc<RefCell<HashMap<String, (TabPage, QueryTabManager, ConnectionModel, ConnectionStateWidget)>>>,
+    tabs: DatabaseTabs,
     connections_page: Rc<RefCell<Option<TabPage>>>,
-    connection_manager: ConnectionManager,
     runtime_bridge: RuntimeBridge,
     statusbar: Statusbar,
 }
 
 impl DatabaseTabManager {
-    pub fn new(connection_manager: ConnectionManager, statusbar: Statusbar) -> Self {
+    pub fn new(statusbar: Statusbar) -> Self {
         let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         container.set_vexpand(true);
         
@@ -104,7 +105,6 @@ impl DatabaseTabManager {
             container,
             tabs: Rc::new(RefCell::new(HashMap::new())),
             connections_page: Rc::new(RefCell::new(None)),
-            connection_manager: connection_manager.clone(),
             runtime_bridge,
             statusbar: statusbar.clone(),
         };
@@ -124,14 +124,9 @@ impl DatabaseTabManager {
             };
             
             if let Some(name) = db_name_to_remove {
-                // Remove from tabs
-                manager_clone.tabs.borrow_mut().remove(&name);
-                
-                // Disconnect in background
-                let conn_mgr = manager_clone.connection_manager.clone();
-                gtk4::glib::spawn_future_local(async move {
-                    conn_mgr.disconnect(&name).await;
-                });
+                if let Some((_, _, connection, _)) = manager_clone.tabs.borrow_mut().remove(&name) {
+                    connection.disconnect();
+                }
                 
                 // Check if any database tabs remain
                 let tabs_empty = manager_clone.tabs.borrow().is_empty();
@@ -140,10 +135,7 @@ impl DatabaseTabManager {
                     if let Some(conn_page) = manager_clone.connections_page.borrow().as_ref() {
                         manager_clone.tab_view.set_selected_page(conn_page);
                     }
-                    // Update statusbar
-                    manager_clone.statusbar.update_connection(None, ConnectionState::Disconnected);
-                    manager_clone.statusbar.update_version(None);
-                    manager_clone.statusbar.update_latency(None);
+                    manager_clone.statusbar.unbind();
                 }
             }
             
@@ -155,16 +147,15 @@ impl DatabaseTabManager {
         tab_view.connect_selected_page_notify(move |view| {
             if let Some(page) = view.selected_page() {
                 // First, find if this is a database tab
-                let model_opt = {
+                let connection = {
                     let tabs = manager_clone.tabs.borrow();
                     tabs.iter()
                         .find(|(_, (tab_page, _, _, _))| tab_page == &page)
-                        .map(|(_, (_, _, model, _))| model.clone())
+                        .map(|(name, (_, _, connection, _))| (name.clone(), connection.clone()))
                 };
                 
-                // Bind statusbar to the model (reactive!)
-                if let Some(model) = model_opt {
-                    manager_clone.statusbar.bind_to_model(&model);
+                if let Some((name, connection)) = connection {
+                    manager_clone.statusbar.bind_to_connection(&name, &connection);
                     return;
                 }
                 
@@ -291,146 +282,82 @@ impl DatabaseTabManager {
             });
             
             if let Some(db_config) = db_config {
-                // Create new database tab (this will trigger set_selected_page)
-                let (page, query_manager, connection_model, state_widget) = self.create_database_tab(db_name);
-                
-                // Insert with connection model
-                self.tabs.borrow_mut().insert(db_name.to_string(), (page.clone(), query_manager, connection_model, state_widget.clone()));
-                
-                // Connect in background using RuntimeBridge
-                let bridge = self.runtime_bridge.clone();
-                let db_tabs_clone = self.clone();
-                let db_name_clone = db_name.to_string();
-                let page_clone = page.clone();
-                
-                // Get connection result channel
-                let rx = bridge.connect(db_config);
-                
-                // Wait for result on GLib's event loop
-                gtk4::glib::spawn_future_local(async move {
-                    match rx.await {
-                        Ok(Ok(db_conn)) => {
-                            tracing::info!("✅ Successfully connected to '{}'", db_name_clone);
-                            
-                            // Update ConnectionModel with the connection
-                            let tabs = db_tabs_clone.tabs.borrow();
-                            if let Some(entry) = tabs.get(&db_name_clone) {
-                                let model = &entry.2;
-                                
-                                // Set the connection in the model
-                                model.set_connection(db_conn.clone());
-                                model.update_state(ConnectionState::Connected);
-                                
-                                // Start monitoring (reactive updates)
-                                model.start_monitoring();
-                                
-                                // Send initial ping to populate latency immediately
-                                let conn_ping = db_conn.clone();
-                                let model_ping = model.clone();
-                                gtk4::glib::spawn_future_local(async move {
-                                    if let Ok(latency) = conn_ping.ping().await {
-                                        model_ping.update_latency(Some(latency));
-                                    }
-                                });
-                                
-                                // Update state widget (still used for internal tracking)
-                                entry.3.update_state(ConnectionState::Connected, Some(&format!("{} - Connected", db_name_clone)));
-                            }
-                            drop(tabs);
-                            
-                            // Update icon to show connected state (green dot)
-                            let icon = create_colored_dot_icon("success");
-                            page_clone.set_icon(Some(&icon));
-                            
-                            // Bind statusbar to model if this is the selected tab
-                            if db_tabs_clone.tab_view.selected_page().as_ref() == Some(&page_clone) {
-                                let tabs = db_tabs_clone.tabs.borrow();
-                                if let Some(entry) = tabs.get(&db_name_clone) {
-                                    db_tabs_clone.statusbar.bind_to_model(&entry.2);
-                                }
-                            }
-                            
-                            // Setup periodic latency updates using RuntimeBridge
-                            let bridge_ping = db_tabs_clone.runtime_bridge.clone();
-                            let db_conn_ping = db_conn.clone();
-                            let db_name_for_ping = db_name_clone.clone();
-                            let tabs_for_ping = db_tabs_clone.tabs.clone();
-                            
-                            // Spawn periodic ping on GLib event loop
-                            gtk4::glib::timeout_add_seconds_local(5, move || {
-                                let bridge_clone = bridge_ping.clone();
-                                let conn_clone = db_conn_ping.clone();
-                                let db_name_ping = db_name_for_ping.clone();
-                                let tabs_ping = tabs_for_ping.clone();
-                                
-                                gtk4::glib::spawn_future_local(async move {
-                                    // Ping and update model (which automatically updates UI via property binding)
-                                    let ping_rx = bridge_clone.ping(conn_clone);
-                                    if let Ok(Ok(latency)) = ping_rx.await {
-                                        let tabs = tabs_ping.borrow();
-                                        if let Some(entry) = tabs.get(&db_name_ping) {
-                                            entry.2.update_latency(Some(latency));
-                                        }
-                                    }
-                                });
-                                
-                                gtk4::glib::ControlFlow::Continue
-                            });
-                        }
-                        Ok(Err(e)) => {
-                            tracing::error!("Failed to connect to '{}': {}", db_name_clone, e);
-                            // Update state widget to show error
-                            let tabs = db_tabs_clone.tabs.borrow();
-                            if let Some(entry) = tabs.get(&db_name_clone) {
-                                entry.3.update_state(ConnectionState::Error, Some(&format!("{} - Error", db_name_clone)));
-                            }
-                            // Update icon to show error state (red dot)
-                            let icon = create_colored_dot_icon("error");
-                            page_clone.set_icon(Some(&icon));
-                        }
-                        Err(_) => {
-                            tracing::error!("Connection task was cancelled for '{}'", db_name_clone);
-                            // Update state widget to show error
-                            let tabs = db_tabs_clone.tabs.borrow();
-                            if let Some(entry) = tabs.get(&db_name_clone) {
-                                entry.3.update_state(ConnectionState::Error, Some(&format!("{} - Cancelled", db_name_clone)));
-                            }
-                            // Update icon to show error state (red dot)
-                            let icon = create_colored_dot_icon("error");
-                            page_clone.set_icon(Some(&icon));
-                        }
+                let connection = DbConnection::new(db_config.connection_string());
+                let (page, query_manager, state_widget) =
+                    self.create_database_tab(db_name, &connection);
+
+                self.tabs.borrow_mut().insert(
+                    db_name.to_string(),
+                    (page.clone(), query_manager, connection.clone(), state_widget.clone()),
+                );
+
+                if self.tab_view.selected_page().as_ref() == Some(&page) {
+                    self.statusbar.bind_to_connection(db_name, &connection);
+                }
+
+                let page_for_state = page.clone();
+                let state_widget_for_state = state_widget.clone();
+                let db_name_for_state = db_name.to_string();
+                connection.connect_notify_local(Some("state"), move |connection, _| {
+                    let state = connection.state();
+                    let (css_class, label) = match state {
+                        ConnectionState::Disconnected => ("dim-label", "Disconnected"),
+                        ConnectionState::Connecting => ("warning", "Connecting"),
+                        ConnectionState::Connected => ("success", "Connected"),
+                        ConnectionState::Error => ("error", "Error"),
+                    };
+                    page_for_state.set_icon(Some(&create_colored_dot_icon(css_class)));
+                    state_widget_for_state.update_state(
+                        state,
+                        Some(&format!("{} - {}", db_name_for_state, label)),
+                    );
+                    if state == ConnectionState::Connected {
+                        connection.ping();
                     }
                 });
+
+                let weak_connection = connection.downgrade();
+                gtk4::glib::timeout_add_seconds_local(5, move || {
+                    let Some(connection) = weak_connection.upgrade() else {
+                        return gtk4::glib::ControlFlow::Break;
+                    };
+                    if connection.state() == ConnectionState::Disconnected {
+                        return gtk4::glib::ControlFlow::Break;
+                    }
+                    if connection.state() == ConnectionState::Connected {
+                        connection.ping();
+                    }
+                    gtk4::glib::ControlFlow::Continue
+                });
+
+                connection.connect();
             }
         }
     }
     
-    fn create_database_tab(&self, db_name: &str) -> (TabPage, QueryTabManager, ConnectionModel, ConnectionStateWidget) {
+    fn create_database_tab(
+        &self,
+        db_name: &str,
+        connection: &DbConnection,
+    ) -> (TabPage, QueryTabManager, ConnectionStateWidget) {
         // Create query tab manager for this database
         let query_manager = QueryTabManager::new(db_name);
         let content = query_manager.get_widget().clone();
         
-        // Create connection model (GObject for reactive updates)
-        let connection_model = ConnectionModel::new(db_name.to_string());
-        connection_model.update_state(ConnectionState::Connecting);
-        
         // Set up auto-EXPLAIN callback
-        let bridge_for_explain = self.runtime_bridge.clone();
-        let connection_model_for_explain = connection_model.clone();
+        let connection_for_explain = connection.clone();
         let query_manager_for_explain = query_manager.clone();
         query_manager.set_explain_callback(move |explain_query| {
             tracing::info!("📊 Running auto-EXPLAIN query in background");
-            
-            if let Some(connection) = connection_model_for_explain.get_connection() {
-                let bridge = bridge_for_explain.clone();
-                let query_mgr = query_manager_for_explain.clone();
-                
-                gtk4::glib::spawn_future_local(async move {
-                    let rx = bridge.execute_query(connection, explain_query.clone());
+            let connection = connection_for_explain.clone();
+            let query_mgr = query_manager_for_explain.clone();
+
+            gtk4::glib::spawn_future_local(async move {
+                let rx = connection.execute_query_rows(explain_query.clone());
                     
                     match rx.await {
-                        Ok(Ok(rows)) => {
-                            if let Some(first_row) = rows.first() {
+                        Ok(Ok(result)) => {
+                            if let Some(first_row) = result.rows.first() {
                                 // Try to get the JSON column
                                 if let Ok(Some(json_val)) = first_row.try_get::<_, Option<serde_json::Value>>(0) {
                                     let formatted = serde_json::to_string_pretty(&json_val)
@@ -451,10 +378,7 @@ impl DatabaseTabManager {
                             tracing::error!("❌ Auto-EXPLAIN was cancelled");
                         }
                     }
-                });
-            } else {
-                tracing::warn!("No database connection available for auto-EXPLAIN");
-            }
+            });
         });
         
         // Create connection state widget for tracking state (not displayed in tab)
@@ -480,7 +404,7 @@ impl DatabaseTabManager {
         // Select the newly created tab
         self.tab_view.set_selected_page(&page);
         
-        (page, query_manager, connection_model, state_widget)
+        (page, query_manager, state_widget)
     }
     
     pub fn toggle_current_sidebar(&self) {
@@ -515,13 +439,12 @@ impl DatabaseTabManager {
             let tabs = self.tabs.borrow();
             
             // Find which database tab this is
-            for (db_name, (page, query_manager, connection_model, _)) in tabs.iter() {
+            for (db_name, (page, query_manager, connection, _)) in tabs.iter() {
                 if page == &current_page {
-                    // Get the query state manager
-                    let state_manager = match query_manager.get_current_state_manager() {
-                        Some(sm) => sm,
+                    let (query_num, sql, state_manager) = match query_manager.current_query() {
+                        Some(query) => query,
                         None => {
-                            query_manager.display_error("No query tab selected");
+                            tracing::debug!("No executable query in the selected tab");
                             return;
                         }
                     };
@@ -533,58 +456,87 @@ impl DatabaseTabManager {
                         return;
                     }
                     
-                    // Get the SQL query text
-                    if let Some(sql) = query_manager.get_current_query_text() {
-                        let sql = sql.trim();
-                        if sql.is_empty() {
-                            state_manager.finish();
-                            query_manager.display_error("No query to execute");
-                            return;
-                        }
-                        
-                        // Show loading state
-                        query_manager.show_loading();
-                        
-                        // Get the connection
-                        if let Some(connection) = connection_model.get_connection() {
-                            let bridge = self.runtime_bridge.clone();
-                            let query_manager_clone = query_manager.clone();
-                            let sql_string = sql.to_string();
-                            let state_manager_clone = state_manager.clone();
-                            
-                            gtk4::glib::spawn_future_local(async move {
-                                // Execute query on Tokio runtime via bridge
-                                let rx = bridge.execute_query(connection, sql_string);
-                                
-                                match rx.await {
-                                    Ok(Ok(rows)) => {
-                                        tracing::info!("Query returned {} rows", rows.len());
-                                        query_manager_clone.display_results(rows);
-                                        // state_manager.finish() is called in display_results
-                                    }
-                                    Ok(Err(e)) => {
-                                        tracing::error!("Query failed: {}", e);
-                                        query_manager_clone.display_error(&e);
-                                        // state_manager.finish() is called in display_error
-                                    }
-                                    Err(_) => {
-                                        tracing::error!("Query execution was cancelled");
-                                        state_manager_clone.finish();
-                                        query_manager_clone.display_error("Query execution was cancelled");
+                    query_manager.show_loading_for(query_num);
+
+                    if connection.state() == ConnectionState::Connected {
+                        let connection = connection.clone();
+                        let query_manager = query_manager.clone();
+                        let statusbar = self.statusbar.clone();
+                        let tab_view = self.tab_view.clone();
+                        let database_page = page.clone();
+
+                        gtk4::glib::spawn_future_local(async move {
+                            let rx = connection.execute_query_rows(sql);
+
+                            match rx.await {
+                                Ok(Ok(result)) => {
+                                    let row_count = result.rows.len();
+                                    tracing::info!("Query returned {} rows", row_count);
+                                    query_manager.display_results_for(query_num, result.rows);
+                                    if tab_view.selected_page().as_ref() == Some(&database_page) {
+                                        statusbar.update_rows(Some(row_count));
+                                        statusbar.update_exec_time(Some(result.duration.as_secs_f64()));
                                     }
                                 }
-                            });
-                        } else {
-                            state_manager.finish();
-                            query_manager.display_error(&format!("Not connected to {}", db_name));
-                        }
+                                Ok(Err(error)) => {
+                                    tracing::error!("Query failed: {}", error);
+                                    query_manager.display_error_for(query_num, &error);
+                                }
+                                Err(_) => {
+                                    let error = "Query execution was cancelled";
+                                    tracing::error!("{}", error);
+                                    query_manager.display_error_for(query_num, error);
+                                }
+                            }
+                        });
                     } else {
                         state_manager.finish();
+                        query_manager.display_error_for(
+                            query_num,
+                            &format!("Not connected to {}", db_name),
+                        );
                     }
                     return;
                 }
             }
         }
+    }
+
+    pub fn cancel_current_query(&self) {
+        let Some(current_page) = self.tab_view.selected_page() else {
+            return;
+        };
+        let tabs = self.tabs.borrow();
+        let Some((_, query_manager, connection, _)) = tabs
+            .values()
+            .find(|(page, _, _, _)| page == &current_page)
+        else {
+            return;
+        };
+        let Some((_, _, state_manager)) = query_manager.current_query() else {
+            return;
+        };
+        if !state_manager.cancel() {
+            return;
+        }
+        if connection.state() != ConnectionState::Connected {
+            state_manager.finish();
+            return;
+        }
+        let connection = connection.clone();
+        gtk4::glib::spawn_future_local(async move {
+            match connection.cancel_query().await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::error!("Failed to cancel query: {}", error);
+                    state_manager.cancel_failed();
+                }
+                Err(_) => {
+                    tracing::error!("Cancellation request was dropped");
+                    state_manager.cancel_failed();
+                }
+            }
+        });
     }
     
     pub fn new_query_in_current_db(&self) {
@@ -634,4 +586,3 @@ impl DatabaseTabManager {
         }
     }
 }
-

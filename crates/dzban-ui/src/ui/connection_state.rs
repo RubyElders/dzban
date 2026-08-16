@@ -78,6 +78,11 @@ impl ConnectionStateWidget {
     pub fn get_widget(&self) -> &Box {
         &self.container
     }
+
+    #[cfg(test)]
+    pub fn text(&self) -> gtk4::glib::GString {
+        self.status_text.text()
+    }
     
     #[allow(dead_code)]
     pub fn get_state(&self) -> ConnectionState {

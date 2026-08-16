@@ -1,0 +1,82 @@
+services:
+  postgres15:
+    image: postgres:15-alpine
+    container_name: dzban-test-pg15
+    environment:
+      POSTGRES_USER: testuser
+      POSTGRES_PASSWORD: testpass
+      POSTGRES_DB: testdb
+    ports:
+      - "5415:5432"
+    volumes:
+      - ./crates/dzban-db/tests/fixtures/init-pg15.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U testuser -d testdb"]
+      interval: 2s
+      timeout: 3s
+      retries: 5
+    networks:
+      - dzban-test
+
+  postgres16:
+    image: postgres:16-alpine
+    container_name: dzban-test-pg16
+    environment:
+      POSTGRES_USER: user16
+      POSTGRES_PASSWORD: pass16
+      POSTGRES_DB: proddb
+    ports:
+      - "5416:5432"
+    volumes:
+      - ./crates/dzban-db/tests/fixtures/init-pg16.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user16 -d proddb"]
+      interval: 2s
+      timeout: 3s
+      retries: 5
+    networks:
+      - dzban-test
+
+  postgres17:
+    image: postgres:17-alpine
+    container_name: dzban-test-pg17
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: devdb
+    ports:
+      - "5417:5432"
+    volumes:
+      - ./crates/dzban-db/tests/fixtures/init-pg17.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d devdb"]
+      interval: 2s
+      timeout: 3s
+      retries: 5
+    networks:
+      - dzban-test
+
+  postgres-slow:
+    image: postgres:15-alpine
+    container_name: dzban-test-slow
+    environment:
+      POSTGRES_USER: slowuser
+      POSTGRES_PASSWORD: slowpass
+      POSTGRES_DB: slowdb
+    ports:
+      - "5418:5432"
+    command: >
+      postgres
+      -c statement_timeout=30000
+      -c log_statement=all
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U slowuser -d slowdb"]
+      interval: 2s
+      timeout: 3s
+      retries: 5
+    networks:
+      - dzban-test
+
+networks:
+  dzban-test:
+    driver: bridge

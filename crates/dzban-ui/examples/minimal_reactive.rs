@@ -41,6 +41,12 @@ mod counter {
             Object::builder().build()
         }
     }
+
+    impl Default for Counter {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
 }
 
 fn main() {

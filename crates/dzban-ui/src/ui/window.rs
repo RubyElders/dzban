@@ -6,12 +6,8 @@ use adw::prelude::*;
 use super::db_tabs::DatabaseTabManager;
 use super::statusbar::create_statusbar;
 use super::shortcuts;
-use dzban_db::ConnectionManager;
 
 pub fn build_ui(app: &Application) {
-    // Create global connection manager
-    let connection_manager = ConnectionManager::new();
-    
     // Create main application window
     let window = ApplicationWindow::builder()
         .application(app)
@@ -30,7 +26,7 @@ pub fn build_ui(app: &Application) {
     let statusbar = create_statusbar();
     
     // Create database tab manager (main content)
-    let db_tab_manager = DatabaseTabManager::new(connection_manager.clone(), statusbar.clone());
+    let db_tab_manager = DatabaseTabManager::new(statusbar.clone());
     let content = db_tab_manager.get_widget().clone();
     
     // Create header bar with search/action bar and controls
@@ -57,6 +53,10 @@ pub fn build_ui(app: &Application) {
             }
             "run_query" => {
                 db_manager_for_shortcuts.run_current_query();
+                true
+            }
+            "stop_query" => {
+                db_manager_for_shortcuts.cancel_current_query();
                 true
             }
             "new_query_tab" => {
@@ -306,8 +306,9 @@ fn create_header_bar(db_tab_manager: &DatabaseTabManager, toast_overlay: &ToastO
                 row.set_subtitle(&action.subtitle);
                 
                 // Then replace with markup by accessing the internal labels
-                if let Some(title_widget) = row.first_child() {
-                    if let Ok(box_widget) = title_widget.downcast::<gtk4::Box>() {
+                if let Some(title_widget) = row.first_child()
+                    && let Ok(box_widget) = title_widget.downcast::<gtk4::Box>()
+                {
                         // Find both title and subtitle labels in the box
                         let mut child = box_widget.first_child();
                         while let Some(widget) = child {
@@ -324,7 +325,6 @@ fn create_header_bar(db_tab_manager: &DatabaseTabManager, toast_overlay: &ToastO
                             }
                             child = widget.next_sibling();
                         }
-                    }
                 }
                 
                 // Add icon as prefix

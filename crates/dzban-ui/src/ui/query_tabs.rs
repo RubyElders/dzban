@@ -19,6 +19,9 @@ struct QueryTab {
     state_manager: QueryStateManager,
 }
 
+type ExplainCallback = Rc<dyn Fn(String)>;
+type ActionBarCallback = Rc<dyn Fn(&str, bool)>;
+
 #[derive(Clone)]
 pub struct QueryTabManager {
     _db_name: String,
@@ -26,9 +29,9 @@ pub struct QueryTabManager {
     container: OverlaySplitView,
     query_counter: Rc<RefCell<u32>>,
     tabs: Rc<RefCell<HashMap<u32, QueryTab>>>, // Map query number to tab data
-    explain_callback: Rc<RefCell<Option<Rc<dyn Fn(String)>>>>,
+    explain_callback: Rc<RefCell<Option<ExplainCallback>>>,
     explain_revealer: Revealer, // Single revealer for all tabs, positioned at top
-    action_bar_callback: Rc<RefCell<Option<Rc<dyn Fn(&str, bool)>>>>, // (text, show_progress)
+    action_bar_callback: Rc<RefCell<Option<ActionBarCallback>>>,
 }
 
 impl QueryTabManager {
@@ -201,7 +204,7 @@ impl QueryTabManager {
                 if let Some(timer_id) = explain_timer_for_release.borrow_mut().take() {
                     // Only try to remove if the timer hasn't fired yet
                     // If remove() returns false, the timer already executed
-                    let _ = timer_id.remove();
+                    timer_id.remove();
                 }
             }
         });
@@ -216,75 +219,56 @@ impl QueryTabManager {
     }
     
     pub fn focus_current_editor(&self) {
-        if let Some(page) = self.tab_view.selected_page() {
-            // Find the editor for this page
-            let tabs = self.tabs.borrow();
-            
-            // Get page title to extract query number
-            let title = page.title();
-            if let Some(num_str) = title.strip_prefix("Query ") {
-                if let Ok(query_num) = num_str.parse::<u32>() {
-                    if let Some(tab) = tabs.get(&query_num) {
-                        tab.editor.grab_focus();
-                    }
-                }
-            }
+        if let Some(query_num) = self.current_query_id()
+            && let Some(tab) = self.tabs.borrow().get(&query_num)
+        {
+            tab.editor.grab_focus();
         }
+    }
+
+    fn current_query_id(&self) -> Option<u32> {
+        self.tab_view
+            .selected_page()?
+            .title()
+            .strip_prefix("Query ")?
+            .parse()
+            .ok()
+    }
+
+    pub fn current_query(&self) -> Option<(u32, String, QueryStateManager)> {
+        let query_num = self.current_query_id()?;
+        let tabs = self.tabs.borrow();
+        let tab = tabs.get(&query_num)?;
+        let buffer = tab.editor.buffer();
+        let (cursor_iter, _) = buffer.selection_bounds().unwrap_or_else(|| {
+            let iter = buffer.iter_at_offset(buffer.cursor_position());
+            (iter, iter)
+        });
+        let full_text = buffer
+            .text(&buffer.start_iter(), &buffer.end_iter(), false)
+            .to_string();
+        let query = extract_query_at_cursor(&full_text, cursor_iter.offset() as usize)?.0;
+        Some((query_num, query, tab.state_manager.clone()))
     }
     
     /// Get the SQL query text from the currently selected tab
     /// Returns the query at cursor position (split by semicolons)
     pub fn get_current_query_text(&self) -> Option<String> {
-        if let Some(page) = self.tab_view.selected_page() {
-            let tabs = self.tabs.borrow();
-            
-            // Get page title to extract query number
-            let title = page.title();
-            if let Some(num_str) = title.strip_prefix("Query ") {
-                if let Ok(query_num) = num_str.parse::<u32>() {
-                    if let Some(tab) = tabs.get(&query_num) {
-                        let buffer = tab.editor.buffer();
-                        
-                        // Get cursor position from selection bounds
-                        let (cursor_iter, _) = buffer.selection_bounds()
-                            .unwrap_or_else(|| {
-                                let iter = buffer.iter_at_offset(buffer.cursor_position());
-                                (iter.clone(), iter)
-                            });
-                        let cursor_offset = cursor_iter.offset();
-                        
-                        // Get full text
-                        let start = buffer.start_iter();
-                        let end = buffer.end_iter();
-                        let full_text = buffer.text(&start, &end, false).to_string();
-                        
-                        // Extract query at cursor position
-                        return extract_query_at_cursor(&full_text, cursor_offset as usize)
-                            .map(|(query, _, _)| query);
-                    }
-                }
-            }
-        }
-        None
+        self.current_query().map(|(_, query, _)| query)
     }
     
     /// Highlight the query that will be executed at the current cursor position
     pub fn highlight_query_at_cursor(&self) {
-        if let Some(page) = self.tab_view.selected_page() {
+        if let Some(query_num) = self.current_query_id() {
             let tabs = self.tabs.borrow();
-            
-            // Get page title to extract query number
-            let title = page.title();
-            if let Some(num_str) = title.strip_prefix("Query ") {
-                if let Ok(query_num) = num_str.parse::<u32>() {
-                    if let Some(tab) = tabs.get(&query_num) {
+            if let Some(tab) = tabs.get(&query_num) {
                         let buffer = tab.editor.buffer();
                         
                         // Get cursor position
                         let (cursor_iter, _) = buffer.selection_bounds()
                             .unwrap_or_else(|| {
                                 let iter = buffer.iter_at_offset(buffer.cursor_position());
-                                (iter.clone(), iter)
+                                (iter, iter)
                             });
                         let cursor_offset = cursor_iter.offset();
                         
@@ -319,22 +303,15 @@ impl QueryTabManager {
                             let query_end = buffer.iter_at_offset(end_offset as i32);
                             buffer.apply_tag(&tag, &query_start, &query_end);
                         }
-                    }
-                }
             }
         }
     }
     
     /// Clear the query highlight
     pub fn clear_query_highlight(&self) {
-        if let Some(page) = self.tab_view.selected_page() {
+        if let Some(query_num) = self.current_query_id() {
             let tabs = self.tabs.borrow();
-            
-            // Get page title to extract query number
-            let title = page.title();
-            if let Some(num_str) = title.strip_prefix("Query ") {
-                if let Ok(query_num) = num_str.parse::<u32>() {
-                    if let Some(tab) = tabs.get(&query_num) {
+            if let Some(tab) = tabs.get(&query_num) {
                         let buffer = tab.editor.buffer();
                         
                         // Remove highlight tag from entire buffer
@@ -344,8 +321,6 @@ impl QueryTabManager {
                             let end = buffer.end_iter();
                             buffer.remove_tag(&tag, &start, &end);
                         }
-                    }
-                }
             }
         }
     }
@@ -374,94 +349,39 @@ impl QueryTabManager {
         }
     }
     
-    /// Get the query state manager for the current tab
-    pub fn get_current_state_manager(&self) -> Option<QueryStateManager> {
-        if let Some(page) = self.tab_view.selected_page() {
-            let tabs = self.tabs.borrow();
-            
-            // Get page title to extract query number
-            let title = page.title();
-            if let Some(num_str) = title.strip_prefix("Query ") {
-                if let Ok(query_num) = num_str.parse::<u32>() {
-                    if let Some(tab) = tabs.get(&query_num) {
-                        return Some(tab.state_manager.clone());
-                    }
-                }
-            }
-        }
-        None
-    }
-    
     /// Display query results in a grid (GTK4 ColumnView)
-    pub fn display_results(&self, rows: Vec<tokio_postgres::Row>) {
-        if let Some(page) = self.tab_view.selected_page() {
-            let tabs = self.tabs.borrow();
-            
-            // Get page title to extract query number
-            let title = page.title();
-            if let Some(num_str) = title.strip_prefix("Query ") {
-                if let Ok(query_num) = num_str.parse::<u32>() {
-                    if let Some(tab) = tabs.get(&query_num) {
-                        // Reset state
-                        tab.state_manager.finish();
-                        
-                        // Create results grid
-                        let results_widget = create_results_grid(rows);
-                        tab.results_scroll.set_child(Some(&results_widget));
-                    }
-                }
-            }
+    pub fn display_results_for(&self, query_num: u32, rows: Vec<tokio_postgres::Row>) {
+        if let Some(tab) = self.tabs.borrow().get(&query_num) {
+            tab.state_manager.finish();
+            let results_widget = create_results_grid(rows);
+            tab.results_scroll.set_child(Some(&results_widget));
         }
     }
     
     /// Show error message in results area
-    pub fn display_error(&self, error: &str) {
-        if let Some(page) = self.tab_view.selected_page() {
-            let tabs = self.tabs.borrow();
-            
-            // Get page title to extract query number
-            let title = page.title();
-            if let Some(num_str) = title.strip_prefix("Query ") {
-                if let Ok(query_num) = num_str.parse::<u32>() {
-                    if let Some(tab) = tabs.get(&query_num) {
-                        // Reset state
-                        tab.state_manager.finish();
-                        
-                        let error_page = adw::StatusPage::new();
-                        error_page.set_icon_name(Some("dialog-error-symbolic"));
-                        error_page.set_title("Query Failed");
-                        error_page.set_description(Some(error));
-                        tab.results_scroll.set_child(Some(&error_page));
-                    }
-                }
-            }
+    pub fn display_error_for(&self, query_num: u32, error: &str) {
+        if let Some(tab) = self.tabs.borrow().get(&query_num) {
+            tab.state_manager.finish();
+            let error_page = adw::StatusPage::new();
+            error_page.set_icon_name(Some("dialog-error-symbolic"));
+            error_page.set_title("Query Failed");
+            error_page.set_description(Some(error));
+            tab.results_scroll.set_child(Some(&error_page));
         }
     }
     
     /// Show loading state in results area
-    pub fn show_loading(&self) {
-        if let Some(page) = self.tab_view.selected_page() {
-            let tabs = self.tabs.borrow();
-            
-            // Get page title to extract query number
-            let title = page.title();
-            if let Some(num_str) = title.strip_prefix("Query ") {
-                if let Ok(query_num) = num_str.parse::<u32>() {
-                    if let Some(tab) = tabs.get(&query_num) {
-                        let loading_page = adw::StatusPage::new();
-                        loading_page.set_icon_name(Some("content-loading-symbolic"));
-                        loading_page.set_title("Running Query...");
-                        loading_page.set_description(Some("Please wait"));
-                        
-                        let spinner = gtk4::Spinner::new();
-                        spinner.set_spinning(true);
-                        spinner.set_size_request(48, 48);
-                        loading_page.set_child(Some(&spinner));
-                        
-                        tab.results_scroll.set_child(Some(&loading_page));
-                    }
-                }
-            }
+    pub fn show_loading_for(&self, query_num: u32) {
+        if let Some(tab) = self.tabs.borrow().get(&query_num) {
+            let loading_page = adw::StatusPage::new();
+            loading_page.set_icon_name(Some("content-loading-symbolic"));
+            loading_page.set_title("Running Query...");
+            loading_page.set_description(Some("Please wait"));
+            let spinner = gtk4::Spinner::new();
+            spinner.set_spinning(true);
+            spinner.set_size_request(48, 48);
+            loading_page.set_child(Some(&spinner));
+            tab.results_scroll.set_child(Some(&loading_page));
         }
     }
     
@@ -536,9 +456,10 @@ fn extract_explain_stats(json_value: &serde_json::Value) -> (i64, f64, f64) {
     let mut last_cost = 0.0f64;
     
     // EXPLAIN (FORMAT JSON) returns an array with one element containing the plan
-    if let Some(plan_array) = json_value.as_array() {
-        if let Some(plan_obj) = plan_array.first() {
-            if let Some(plan) = plan_obj.get("Plan") {
+    if let Some(plan_array) = json_value.as_array()
+        && let Some(plan_obj) = plan_array.first()
+        && let Some(plan) = plan_obj.get("Plan")
+    {
                 // Get row estimate
                 if let Some(rows) = plan.get("Plan Rows") {
                     rows_estimate = rows.as_i64().unwrap_or(0);
@@ -553,8 +474,6 @@ fn extract_explain_stats(json_value: &serde_json::Value) -> (i64, f64, f64) {
                 if let Some(cost) = plan.get("Total Cost") {
                     last_cost = cost.as_f64().unwrap_or(0.0);
                 }
-            }
-        }
     }
     
     (rows_estimate, first_cost, last_cost)
@@ -828,10 +747,10 @@ fn create_results_grid(rows: Vec<tokio_postgres::Row>) -> Box {
             if let Some(string_obj) = item.item().and_then(|o| o.downcast::<gtk4::StringObject>().ok()) {
                 let full_text = string_obj.string().to_string();
                 let parts: Vec<&str> = full_text.split('\t').collect();
-                if let Some(cell_text) = parts.get(col_idx) {
-                    if let Some(label) = item.child().and_then(|c| c.downcast::<Label>().ok()) {
-                        label.set_text(cell_text);
-                    }
+                if let Some(cell_text) = parts.get(col_idx)
+                    && let Some(label) = item.child().and_then(|c| c.downcast::<Label>().ok())
+                {
+                    label.set_text(cell_text);
                 }
             }
         });
@@ -882,5 +801,26 @@ FROM orders
 WHERE created_at > CURRENT_DATE - INTERVAL '7 days'
 ORDER BY created_at DESC;".to_string(),
         _ => "-- New Query\n\n".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[gtk4::test]
+    #[ignore = "requires a graphical display"]
+    fn completion_is_applied_to_the_query_that_started_it() {
+        let manager = QueryTabManager::new("test");
+        manager.new_query_tab();
+        let first_state = manager.tabs.borrow().get(&1).unwrap().state_manager.clone();
+        assert!(first_state.try_start());
+
+        manager.new_query_tab();
+        assert_eq!(manager.current_query_id(), Some(2));
+        manager.display_error_for(1, "failed");
+
+        assert!(first_state.try_start());
+        assert_eq!(manager.current_query_id(), Some(2));
     }
 }

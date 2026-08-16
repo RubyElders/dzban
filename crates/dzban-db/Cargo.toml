@@ -2,6 +2,7 @@
 name = "dzban-db"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 
 [lib]
 name = "dzban_db"
@@ -18,3 +19,6 @@ toml.workspace = true
 # Logging
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+gtk4 = "0.10.2"

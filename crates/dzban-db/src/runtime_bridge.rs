@@ -1,8 +1,8 @@
 //! Bridge between GLib/GTK async runtime and Tokio runtime
-//! 
+//!
 //! This module solves the problem that tokio-postgres requires a Tokio runtime,
 //! but GTK applications run on GLib's MainContext event loop.
-//! 
+//!
 //! Solution: Run a Tokio runtime in a background thread and communicate via channels.
 
 use std::sync::Arc;
@@ -11,10 +11,10 @@ use tokio::sync::oneshot;
 use tracing::{debug, error, info};
 
 use crate::config::DatabaseConfig;
-use crate::connection::DbConnection;
+use crate::internal_connection::InternalConnection;
 
 /// A bridge that runs Tokio tasks from non-Tokio contexts (like GTK/GLib)
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RuntimeBridge {
     runtime: Arc<Runtime>,
 }
@@ -23,36 +23,36 @@ impl RuntimeBridge {
     /// Create a new runtime bridge with a dedicated Tokio runtime
     pub fn new() -> Result<Self, String> {
         info!("Creating Tokio runtime bridge");
-        
+
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2) // 2 threads for DB operations
             .thread_name("dzban-tokio")
             .enable_all()
             .build()
             .map_err(|e| format!("Failed to create Tokio runtime: {}", e))?;
-        
+
         debug!("Tokio runtime bridge created successfully");
-        
+
         Ok(Self {
             runtime: Arc::new(runtime),
         })
     }
-    
+
     /// Connect to a database (runs on Tokio runtime)
     /// Returns a oneshot channel that will receive the result
-    pub fn connect(&self, db_config: DatabaseConfig) -> oneshot::Receiver<Result<DbConnection, String>> {
+    pub fn connect(
+        &self,
+        db_config: DatabaseConfig,
+    ) -> oneshot::Receiver<Result<InternalConnection, String>> {
         let (tx, rx) = oneshot::channel();
-        
+
         self.runtime.spawn(async move {
             debug!("Bridge: Running connect on Tokio runtime");
-            
-            let conn = DbConnection::new(
-                db_config.name.clone(),
-                db_config.connection_string(),
-            );
-            
+
+            let mut conn = InternalConnection::new(db_config);
+
             let result = conn.connect().await;
-            
+
             match result {
                 Ok(()) => {
                     debug!("Bridge: Connection successful");
@@ -64,30 +64,26 @@ impl RuntimeBridge {
                 }
             }
         });
-        
+
         rx
     }
-    
+
     /// Test a database connection (runs on Tokio runtime)
-    pub fn test_connection(&self, db_config: DatabaseConfig) -> oneshot::Receiver<Result<String, String>> {
+    pub fn test_connection(
+        &self,
+        db_config: DatabaseConfig,
+    ) -> oneshot::Receiver<Result<String, String>> {
         let (tx, rx) = oneshot::channel();
-        
+
         self.runtime.spawn(async move {
             debug!("Bridge: Running connection test on Tokio runtime");
-            
-            let conn = DbConnection::new(
-                db_config.name.clone(),
-                db_config.connection_string(),
-            );
-            
-            match conn.connect().await {
-                Ok(()) => {
-                    let version = conn.get_version().await;
-                    conn.disconnect().await;
-                    
-                    let result = version.unwrap_or_else(|| "Unknown".to_string());
-                    debug!("Bridge: Connection test successful, version: {}", result);
-                    let _ = tx.send(Ok(result));
+
+            let result = InternalConnection::test_connection(&db_config).await;
+
+            match result {
+                Ok(version) => {
+                    debug!("Bridge: Connection test successful, version: {}", version);
+                    let _ = tx.send(Ok(version));
                 }
                 Err(e) => {
                     error!("Bridge: Connection test failed: {}", e);
@@ -95,46 +91,93 @@ impl RuntimeBridge {
                 }
             }
         });
-        
+
         rx
     }
-    
+
     /// Disconnect from a database (runs on Tokio runtime)
-    pub fn disconnect(&self, conn: DbConnection) -> oneshot::Receiver<()> {
+    pub fn disconnect(&self, _conn: InternalConnection) -> oneshot::Receiver<()> {
         let (tx, rx) = oneshot::channel();
-        
+
         self.runtime.spawn(async move {
-            debug!("Bridge: Running disconnect on Tokio runtime");
-            conn.disconnect().await;
+            debug!("Bridge: Disconnecting (connection will be dropped)");
             let _ = tx.send(());
         });
-        
+
         rx
     }
-    
+
     /// Execute a query (runs on Tokio runtime)
-    pub fn execute_query(&self, conn: DbConnection, query: String) -> oneshot::Receiver<Result<Vec<tokio_postgres::Row>, String>> {
+    pub fn execute_query(
+        &self,
+        conn: InternalConnection,
+        query: String,
+    ) -> oneshot::Receiver<Result<(u64, InternalConnection), String>> {
         let (tx, rx) = oneshot::channel();
-        
+
         self.runtime.spawn(async move {
             debug!("Bridge: Running query on Tokio runtime");
             let result = conn.execute_query(&query).await;
-            let _ = tx.send(result);
+            match result {
+                Ok(row_count) => {
+                    let _ = tx.send(Ok((row_count, conn)));
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                }
+            }
         });
-        
+
         rx
     }
-    
-    /// Ping a connection (runs on Tokio runtime)
-    pub fn ping(&self, conn: DbConnection) -> oneshot::Receiver<Result<std::time::Duration, String>> {
+
+    pub fn execute_query_rows(
+        &self,
+        conn: InternalConnection,
+        query: String,
+    ) -> oneshot::Receiver<Result<Vec<tokio_postgres::Row>, String>> {
         let (tx, rx) = oneshot::channel();
-        
+
+        self.runtime.spawn(async move {
+            debug!("Bridge: Running row query on Tokio runtime");
+            let result = conn.execute_query_rows(&query).await;
+            let _ = tx.send(result);
+        });
+
+        rx
+    }
+
+    pub fn cancel_query(
+        &self,
+        conn: InternalConnection,
+    ) -> oneshot::Receiver<Result<(), String>> {
+        let (tx, rx) = oneshot::channel();
+        self.runtime.spawn(async move {
+            let _ = tx.send(conn.cancel_query().await);
+        });
+        rx
+    }
+
+    /// Ping a connection (runs on Tokio runtime)
+    pub fn ping(
+        &self,
+        conn: InternalConnection,
+    ) -> oneshot::Receiver<Result<(u64, InternalConnection), String>> {
+        let (tx, rx) = oneshot::channel();
+
         self.runtime.spawn(async move {
             debug!("Bridge: Running ping on Tokio runtime");
             let result = conn.ping().await;
-            let _ = tx.send(result);
+            match result {
+                Ok(latency) => {
+                    let _ = tx.send(Ok((latency, conn)));
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                }
+            }
         });
-        
+
         rx
     }
 }
@@ -148,7 +191,7 @@ impl Default for RuntimeBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_bridge_creation() {
         let bridge = RuntimeBridge::new();

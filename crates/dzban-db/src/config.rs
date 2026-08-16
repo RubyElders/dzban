@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::fs;
 use tracing::{info, debug, warn, instrument};
 
@@ -40,6 +40,38 @@ impl DatabaseConfig {
         
         parts.join(" ")
     }
+
+    /// Parse a PostgreSQL connection string into DatabaseConfig
+    /// Format: "host=localhost port=5432 user=postgres password=pass dbname=mydb"
+    pub fn from_connection_string(conn_str: &str) -> Self {
+        let mut host = None;
+        let mut port = None;
+        let mut user = String::from("postgres");
+        let mut database = String::from("postgres");
+        let mut password = None;
+
+        for part in conn_str.split_whitespace() {
+            if let Some((key, value)) = part.split_once('=') {
+                match key {
+                    "host" => host = Some(value.to_string()),
+                    "port" => port = value.parse().ok(),
+                    "user" => user = value.to_string(),
+                    "dbname" => database = value.to_string(),
+                    "password" => password = Some(value.to_string()),
+                    _ => {}
+                }
+            }
+        }
+
+        Self {
+            name: database.clone(),
+            host,
+            port,
+            user,
+            database,
+            password,
+        }
+    }
 }
 
 impl Config {
@@ -47,14 +79,14 @@ impl Config {
     pub fn load() -> Result<Self, String> {
         debug!("Loading configuration...");
         
-        // Try local file first (for testing)
-        if let Ok(config) = Self::load_from_path("dzban.toml") {
+        let local_path = Path::new("dzban.toml");
+        if local_path.exists() {
+            let config = Self::load_from_path(local_path)?;
             info!("✅ Loaded config from local dzban.toml ({} databases)", config.databases.len());
             return Ok(config);
         }
-        
-        // Try XDG config directory
-        if let Ok(config) = Self::load_from_xdg() {
+
+        if let Some(config) = Self::load_from_xdg()? {
             info!("✅ Loaded config from XDG directory ({} databases)", config.databases.len());
             return Ok(config);
         }
@@ -66,19 +98,20 @@ impl Config {
         })
     }
     
-    #[instrument]
-    fn load_from_path(path: &str) -> Result<Self, String> {
-        debug!("Attempting to load config from: {}", path);
+    #[instrument(skip(path))]
+    pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self, String> {
+        let path = path.as_ref();
+        debug!("Attempting to load config from: {}", path.display());
         
         let content = fs::read_to_string(path)
-            .map_err(|e| format!("Failed to read {}: {}", path, e))?;
+            .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
         
         toml::from_str(&content)
             .map_err(|e| format!("Failed to parse TOML: {}", e))
     }
     
     #[instrument]
-    fn load_from_xdg() -> Result<Self, String> {
+    fn load_from_xdg() -> Result<Option<Self>, String> {
         let config_dir = std::env::var("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| {
@@ -90,9 +123,9 @@ impl Config {
         debug!("Checking XDG config path: {}", config_path.display());
         
         if !config_path.exists() {
-            return Err("Config file not found".to_string());
+            return Ok(None);
         }
         
-        Self::load_from_path(config_path.to_str().unwrap())
+        Self::load_from_path(config_path).map(Some)
     }
 }

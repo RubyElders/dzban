@@ -116,11 +116,6 @@ pub fn shortcuts() -> &'static HashMap<&'static str, Shortcut> {
     SHORTCUTS.get_or_init(init_shortcuts)
 }
 
-/// Get a specific shortcut by ID
-pub fn get(id: &str) -> Option<&'static Shortcut> {
-    shortcuts().get(id)
-}
-
 /// Create a keyboard event handler that dispatches to shortcut callbacks
 pub fn create_controller<F>(callback: F) -> EventControllerKey
 where
@@ -140,10 +135,10 @@ where
         tracing::debug!("Key pressed: {:?} with modifiers: {:?}", key.name(), modifiers);
         
         // Check all shortcuts for a match
-        for (id, shortcut) in shortcuts().iter() {
+        for shortcut in shortcuts().values() {
             if shortcut.matches(key, modifiers) {
-                tracing::info!("Shortcut matched: {}", id);
-                if callback(id) {
+                tracing::info!("Shortcut matched: {}", shortcut.id);
+                if callback(shortcut.id) {
                     return glib::Propagation::Stop;
                 }
             }
@@ -162,9 +157,7 @@ pub fn create_shortcuts_window() -> adw::Dialog {
     // Group shortcuts by category
     let mut groups: HashMap<&str, Vec<&Shortcut>> = HashMap::new();
     for shortcut in shortcuts().values() {
-        groups.entry(shortcut.group)
-            .or_insert_with(Vec::new)
-            .push(shortcut);
+        groups.entry(shortcut.group).or_default().push(shortcut);
     }
     
     let content = Box::new(Orientation::Vertical, 12);
