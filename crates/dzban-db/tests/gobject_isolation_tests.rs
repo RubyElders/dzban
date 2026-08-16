@@ -1,5 +1,5 @@
 use dzban_db::connection_gobject::{ConnectionState, DbConnection};
-use gtk4::prelude::*;
+use glib::prelude::*;
 
 #[test]
 fn test_gobject_properties() {

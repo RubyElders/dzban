@@ -19,6 +19,3 @@ toml.workspace = true
 # Logging
 tracing.workspace = true
 tracing-subscriber.workspace = true
-
-[dev-dependencies]
-gtk4 = "0.10.2"

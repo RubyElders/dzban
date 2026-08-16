@@ -1,6 +1,5 @@
 use dzban_db::{ConnectionState, DbConfig, DbQueryTab};
-use gtk4::glib;
-use gtk4::prelude::*;
+use glib::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -367,13 +366,71 @@ fn test_dbconfig_tabs_have_correct_connection_string() {
 
     assert_eq!(conn1.connection_string(), connection_string);
     assert_eq!(conn2.connection_string(), connection_string);
+    assert_eq!(conn1, config.connection());
+    assert_eq!(conn2, config.connection());
 
     println!("✅ Tabs have correct connection string");
 }
 
-#[gtk4::test]
+#[test]
+fn test_dbconfig_query_signals_stay_with_the_executing_tab() {
+    let config = DbConfig::new("Test Config".to_string(), "host=localhost".to_string());
+    config.add_tab(Some("Tab 1".to_string()));
+    config.add_tab(Some("Tab 2".to_string()));
+
+    let tab1 = config.get_tab(0).unwrap();
+    let tab2 = config.get_tab(1).unwrap();
+    let tab1_errors = Rc::new(RefCell::new(0));
+    let tab2_errors = Rc::new(RefCell::new(0));
+
+    let errors = tab1_errors.clone();
+    tab1.connect_closure(
+        "query-error",
+        false,
+        glib::closure_local!(move |_tab: &DbQueryTab, _error: String| {
+            *errors.borrow_mut() += 1;
+        }),
+    );
+    let errors = tab2_errors.clone();
+    tab2.connect_closure(
+        "query-error",
+        false,
+        glib::closure_local!(move |_tab: &DbQueryTab, _error: String| {
+            *errors.borrow_mut() += 1;
+        }),
+    );
+
+    tab1.set_sql_query("SELECT 1".to_string());
+    tab1.execute_query();
+
+    assert_eq!(*tab1_errors.borrow(), 1);
+    assert_eq!(*tab2_errors.borrow(), 0);
+}
+
+#[test]
+fn test_dbconfig_close_releases_the_object_graph() {
+    let config = DbConfig::new("Test Config".to_string(), "host=localhost".to_string());
+    config.add_tab(None);
+
+    let tab = config.get_tab(0).unwrap();
+    let connection = config.connection();
+    let weak_config = config.downgrade();
+    let weak_tab = tab.downgrade();
+    let weak_connection = connection.downgrade();
+
+    config.close();
+    drop(tab);
+    drop(connection);
+    drop(config);
+
+    assert!(weak_config.upgrade().is_none());
+    assert!(weak_tab.upgrade().is_none());
+    assert!(weak_connection.upgrade().is_none());
+}
+
+#[glib::async_test]
 #[ignore]
-fn test_dbconfig_connect_all_tabs() {
+async fn test_dbconfig_connect_all_tabs() {
     println!("Test: DbConfig can connect all tabs to database");
 
     let config = DbConfig::new(
@@ -400,11 +457,9 @@ fn test_dbconfig_connect_all_tabs() {
 
     config.connect_all();
 
-    let main_context = glib::MainContext::default();
     let start = std::time::Instant::now();
     while !config.all_connected() && start.elapsed().as_secs() < 10 {
-        main_context.iteration(false);
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        glib::timeout_future(std::time::Duration::from_millis(10)).await;
     }
 
     assert!(config.all_connected());
@@ -420,9 +475,9 @@ fn test_dbconfig_connect_all_tabs() {
     config.close();
 }
 
-#[gtk4::test]
+#[glib::async_test]
 #[ignore]
-fn test_dbconfig_parallel_queries() {
+async fn test_dbconfig_parallel_queries() {
     println!("Test: DbConfig tabs can execute queries in parallel");
 
     let config = DbConfig::new(
@@ -435,11 +490,9 @@ fn test_dbconfig_parallel_queries() {
 
     config.connect_all();
 
-    let main_context = glib::MainContext::default();
     let start = std::time::Instant::now();
     while !config.all_connected() && start.elapsed().as_secs() < 5 {
-        main_context.iteration(false);
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        glib::timeout_future(std::time::Duration::from_millis(10)).await;
     }
 
     assert!(config.all_connected());
@@ -466,8 +519,7 @@ fn test_dbconfig_parallel_queries() {
 
     let start = std::time::Instant::now();
     while *query_count.borrow() < 2 && start.elapsed().as_secs() < 10 {
-        main_context.iteration(false);
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        glib::timeout_future(std::time::Duration::from_millis(10)).await;
     }
 
     assert_eq!(*query_count.borrow(), 2);

@@ -1,6 +1,5 @@
 use dzban_db::{ConnectionState, DbConfig, DbManager, DbQueryTab};
-use gtk4::glib;
-use gtk4::prelude::*;
+use glib::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -410,9 +409,9 @@ fn test_dbmanager_multi_config_isolation() {
     println!("✅ Configs are properly isolated");
 }
 
-#[gtk4::test]
+#[glib::async_test]
 #[ignore]
-fn test_dbmanager_full_workflow() {
+async fn test_dbmanager_full_workflow() {
     println!("Test: DbManager complete workflow with real database");
 
     let manager = DbManager::new();
@@ -467,11 +466,9 @@ fn test_dbmanager_full_workflow() {
 
     config.connect_all();
 
-    let main_context = glib::MainContext::default();
     let start = std::time::Instant::now();
     while !config.all_connected() && start.elapsed().as_secs() < 10 {
-        main_context.iteration(false);
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        glib::timeout_future(std::time::Duration::from_millis(10)).await;
     }
 
     assert!(config.all_connected());
@@ -499,8 +496,7 @@ fn test_dbmanager_full_workflow() {
 
     let start = std::time::Instant::now();
     while *query_count.borrow() < 2 && start.elapsed().as_secs() < 10 {
-        main_context.iteration(false);
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        glib::timeout_future(std::time::Duration::from_millis(10)).await;
     }
 
     assert_eq!(*query_count.borrow(), 2);
@@ -513,9 +509,9 @@ fn test_dbmanager_full_workflow() {
     manager.close_all();
 }
 
-#[gtk4::test]
+#[glib::async_test]
 #[ignore]
-fn test_dbmanager_multiple_databases() {
+async fn test_dbmanager_multiple_databases() {
     println!("Test: DbManager with multiple database connections");
 
     let manager = DbManager::new();
@@ -537,8 +533,6 @@ fn test_dbmanager_multiple_databases() {
 
     assert_eq!(manager.config_count(), 3);
 
-    let main_context = glib::MainContext::default();
-
     for config_name in manager.get_all_config_names() {
         let config = manager.get_config(&config_name).unwrap();
         config.add_tab(Some(format!("{} Query", config_name)));
@@ -548,8 +542,7 @@ fn test_dbmanager_multiple_databases() {
     let start = std::time::Instant::now();
     let mut all_connected = false;
     while !all_connected && start.elapsed().as_secs() < 15 {
-        main_context.iteration(false);
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        glib::timeout_future(std::time::Duration::from_millis(10)).await;
 
         all_connected = manager
             .get_all_configs()

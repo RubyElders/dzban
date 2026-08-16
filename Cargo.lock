@@ -141,7 +141,6 @@ name = "dzban-db"
 version = "0.1.0"
 dependencies = [
  "glib",
- "gtk4",
  "serde",
  "tokio",
  "tokio-postgres",

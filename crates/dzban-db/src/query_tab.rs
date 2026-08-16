@@ -11,6 +11,7 @@ mod imp {
 
     pub struct DbQueryTab {
         pub connection: RefCell<Option<DbConnection>>,
+        pub owns_connection: Cell<bool>,
 
         pub tab_label: RefCell<String>,
         pub sql_query: RefCell<String>,
@@ -23,6 +24,7 @@ mod imp {
         fn default() -> Self {
             Self {
                 connection: RefCell::new(None),
+                owns_connection: Cell::new(false),
                 tab_label: RefCell::new("Untitled".to_string()),
                 sql_query: RefCell::new(String::new()),
                 is_executing: Cell::new(false),
@@ -124,6 +126,14 @@ glib::wrapper! {
 impl DbQueryTab {
     /// Create a new query tab with a connection to the specified database
     pub fn new(connection_string: String, tab_label: Option<String>) -> Self {
+        let connection = DbConnection::new(connection_string);
+        let obj = Self::with_connection(connection, tab_label);
+        obj.imp().owns_connection.set(true);
+        obj.connect_query_signals();
+        obj
+    }
+
+    pub fn with_connection(connection: DbConnection, tab_label: Option<String>) -> Self {
         let obj: Self = glib::Object::builder()
             .property(
                 "tab-label",
@@ -131,53 +141,71 @@ impl DbQueryTab {
             )
             .build();
 
-        let connection = DbConnection::new(connection_string);
-
         let obj_clone = obj.clone();
         connection.connect_closure(
             "state-changed",
             false,
-            glib::closure_local!(move |_conn: &DbConnection,
-                                       old: ConnectionState,
-                                       new: ConnectionState| {
-                obj_clone.emit_by_name::<()>("connection-state-changed", &[&old, &new]);
-            }),
-        );
-
-        let obj_clone = obj.clone();
-        connection.connect_closure(
-            "query-started",
-            false,
-            glib::closure_local!(move |_conn: &DbConnection, query: String| {
-                obj_clone.set_is_executing(true);
-                obj_clone.emit_by_name::<()>("query-started", &[&query]);
-            }),
-        );
-
-        let obj_clone = obj.clone();
-        connection.connect_closure(
-            "query-finished",
-            false,
-            glib::closure_local!(move |_conn: &DbConnection, rows: i64, duration_ms: i64| {
-                obj_clone.set_is_executing(false);
-                obj_clone.set_result_count(rows);
-                obj_clone.emit_by_name::<()>("query-finished", &[&rows, &duration_ms]);
-            }),
-        );
-
-        let obj_clone = obj.clone();
-        connection.connect_closure(
-            "query-error",
-            false,
-            glib::closure_local!(move |_conn: &DbConnection, error: String| {
-                obj_clone.set_is_executing(false);
-                obj_clone.emit_by_name::<()>("query-error", &[&error]);
-            }),
+            glib::closure_local!(
+                #[watch]
+                obj_clone,
+                move |_conn: &DbConnection, old: ConnectionState, new: ConnectionState| {
+                    obj_clone.emit_by_name::<()>("connection-state-changed", &[&old, &new]);
+                }
+            ),
         );
 
         obj.imp().connection.replace(Some(connection));
 
         obj
+    }
+
+    fn connect_query_signals(&self) {
+        let connection = self
+            .connection()
+            .expect("DbQueryTab connection is initialized");
+
+        let tab = self.clone();
+        connection.connect_closure(
+            "query-started",
+            false,
+            glib::closure_local!(
+                #[watch]
+                tab,
+                move |_connection: &DbConnection, query: String| {
+                    tab.set_is_executing(true);
+                    tab.emit_by_name::<()>("query-started", &[&query]);
+                }
+            ),
+        );
+
+        let tab = self.clone();
+        connection.connect_closure(
+            "query-finished",
+            false,
+            glib::closure_local!(
+                #[watch]
+                tab,
+                move |_connection: &DbConnection, rows: i64, duration_ms: i64| {
+                    tab.set_is_executing(false);
+                    tab.set_result_count(rows);
+                    tab.emit_by_name::<()>("query-finished", &[&rows, &duration_ms]);
+                }
+            ),
+        );
+
+        let tab = self.clone();
+        connection.connect_closure(
+            "query-error",
+            false,
+            glib::closure_local!(
+                #[watch]
+                tab,
+                move |_connection: &DbConnection, error: String| {
+                    tab.set_is_executing(false);
+                    tab.emit_by_name::<()>("query-error", &[&error]);
+                }
+            ),
+        );
     }
 
     pub fn tab_label(&self) -> String {
@@ -276,7 +304,41 @@ impl DbQueryTab {
                 self.tab_label(),
                 query.chars().take(50).collect::<String>()
             );
-            conn.execute_query(query);
+            if self.imp().owns_connection.get() {
+                conn.execute_query(query);
+                return;
+            }
+            if conn.state() != ConnectionState::Connected {
+                drop(conn.execute_query_rows(query));
+                let error = conn.last_error();
+                self.emit_by_name::<()>("query-error", &[&error]);
+                return;
+            }
+
+            self.set_is_executing(true);
+            self.emit_by_name::<()>("query-started", &[&query]);
+            let receiver = conn.execute_query_rows(query);
+            let tab = self.clone();
+            glib::MainContext::ref_thread_default().spawn_local(async move {
+                match receiver.await {
+                    Ok(Ok(result)) => {
+                        let rows = result.rows.len() as i64;
+                        let duration_ms = result.duration.as_millis() as i64;
+                        tab.set_is_executing(false);
+                        tab.set_result_count(rows);
+                        tab.emit_by_name::<()>("query-finished", &[&rows, &duration_ms]);
+                    }
+                    Ok(Err(error)) => {
+                        tab.set_is_executing(false);
+                        tab.emit_by_name::<()>("query-error", &[&error]);
+                    }
+                    Err(_) => {
+                        let error = "Query result channel closed".to_string();
+                        tab.set_is_executing(false);
+                        tab.emit_by_name::<()>("query-error", &[&error]);
+                    }
+                }
+            });
         } else {
             self.emit_by_name::<()>("query-error", &[&"No connection".to_string()]);
         }
@@ -285,7 +347,9 @@ impl DbQueryTab {
     /// Close this tab (emit signal and cleanup)
     pub fn close(&self) {
         info!("Closing tab: {}", self.tab_label());
-        self.disconnect();
+        if self.imp().owns_connection.get() {
+            self.disconnect();
+        }
         self.emit_by_name::<()>("tab-closed", &[]);
     }
 }

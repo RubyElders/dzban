@@ -161,6 +161,8 @@ impl DbManager {
             "tab-added",
             false,
             glib::closure_local!(
+                #[watch]
+                manager,
                 move |_config: &DbConfig, index: i32, tab: crate::query_tab::DbQueryTab| {
                     manager.emit_by_name::<()>("tab-added", &[&index, &tab]);
                 }
@@ -172,9 +174,13 @@ impl DbManager {
         config.connect_closure(
             "tab-removed",
             false,
-            glib::closure_local!(move |_config: &DbConfig, index: i32| {
-                manager.emit_by_name::<()>("tab-removed", &[&index]);
-            }),
+            glib::closure_local!(
+                #[watch]
+                manager,
+                move |_config: &DbConfig, index: i32| {
+                    manager.emit_by_name::<()>("tab-removed", &[&index]);
+                }
+            ),
         );
 
         let manager = self.clone();
@@ -182,9 +188,13 @@ impl DbManager {
         config.connect_closure(
             "tab-switched",
             false,
-            glib::closure_local!(move |_config: &DbConfig, index: i32| {
-                manager.emit_by_name::<()>("tab-switched", &[&index]);
-            }),
+            glib::closure_local!(
+                #[watch]
+                manager,
+                move |_config: &DbConfig, index: i32| {
+                    manager.emit_by_name::<()>("tab-switched", &[&index]);
+                }
+            ),
         );
 
         let manager = self.clone();
@@ -192,9 +202,13 @@ impl DbManager {
         config.connect_closure(
             "query-started",
             false,
-            glib::closure_local!(move |_config: &DbConfig, query: String| {
-                manager.emit_by_name::<()>("query-started", &[&query]);
-            }),
+            glib::closure_local!(
+                #[watch]
+                manager,
+                move |_config: &DbConfig, query: String| {
+                    manager.emit_by_name::<()>("query-started", &[&query]);
+                }
+            ),
         );
 
         let manager = self.clone();
@@ -202,9 +216,13 @@ impl DbManager {
         config.connect_closure(
             "query-finished",
             false,
-            glib::closure_local!(move |_config: &DbConfig, rows: i64, duration: i64| {
-                manager.emit_by_name::<()>("query-finished", &[&rows, &duration]);
-            }),
+            glib::closure_local!(
+                #[watch]
+                manager,
+                move |_config: &DbConfig, rows: i64, duration: i64| {
+                    manager.emit_by_name::<()>("query-finished", &[&rows, &duration]);
+                }
+            ),
         );
 
         let manager = self.clone();
@@ -212,9 +230,13 @@ impl DbManager {
         config.connect_closure(
             "query-error",
             false,
-            glib::closure_local!(move |_config: &DbConfig, error: String| {
-                manager.emit_by_name::<()>("query-error", &[&error]);
-            }),
+            glib::closure_local!(
+                #[watch]
+                manager,
+                move |_config: &DbConfig, error: String| {
+                    manager.emit_by_name::<()>("query-error", &[&error]);
+                }
+            ),
         );
 
         let manager = self.clone();
@@ -222,11 +244,13 @@ impl DbManager {
         config.connect_closure(
             "connection-state-changed",
             false,
-            glib::closure_local!(move |_config: &DbConfig,
-                                       old: ConnectionState,
-                                       new: ConnectionState| {
-                manager.emit_by_name::<()>("connection-state-changed", &[&old, &new]);
-            }),
+            glib::closure_local!(
+                #[watch]
+                manager,
+                move |_config: &DbConfig, old: ConnectionState, new: ConnectionState| {
+                    manager.emit_by_name::<()>("connection-state-changed", &[&old, &new]);
+                }
+            ),
         );
     }
 }

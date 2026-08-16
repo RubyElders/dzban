@@ -1,9 +1,9 @@
 mod ui;
 
+use adw::Application;
 use gtk4::prelude::*;
 use libadwaita as adw;
-use adw::Application;
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt};
 
 const APP_ID: &str = "com.fuga.dzban";
 
@@ -13,7 +13,7 @@ fn main() {
     fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("dzban_db=debug,dzban_ui=debug"))
+                .unwrap_or_else(|_| EnvFilter::new("dzban_db=debug,dzban_ui=debug")),
         )
         .with_target(true)
         .with_thread_ids(false)
@@ -26,9 +26,7 @@ fn main() {
     adw::init().expect("Failed to initialize Adwaita");
 
     // Create application
-    let app = Application::builder()
-        .application_id(APP_ID)
-        .build();
+    let app = Application::builder().application_id(APP_ID).build();
 
     app.connect_activate(ui::build_ui);
 

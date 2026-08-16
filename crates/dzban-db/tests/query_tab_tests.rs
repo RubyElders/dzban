@@ -1,6 +1,5 @@
 use dzban_db::{ConnectionState, DbQueryTab};
-use gtk4::glib;
-use gtk4::prelude::*;
+use glib::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -202,9 +201,9 @@ fn test_query_tab_empty_query_error() {
     println!("✅ Empty queries are rejected");
 }
 
-#[gtk4::test]
+#[glib::async_test]
 #[ignore]
-fn test_query_tab_real_connection() {
+async fn test_query_tab_real_connection() {
     println!("Test: DbQueryTab with real PostgreSQL connection");
 
     let tab = DbQueryTab::new(
@@ -228,14 +227,12 @@ fn test_query_tab_real_connection() {
 
     tab.connect();
 
-    let main_context = glib::MainContext::default();
     let start = std::time::Instant::now();
     while tab.connection_state() != ConnectionState::Connected
         && tab.connection_state() != ConnectionState::Error
         && start.elapsed().as_secs() < 5
     {
-        main_context.iteration(false);
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        glib::timeout_future(std::time::Duration::from_millis(10)).await;
     }
 
     assert_eq!(tab.connection_state(), ConnectionState::Connected);
@@ -261,8 +258,7 @@ fn test_query_tab_real_connection() {
 
     let start = std::time::Instant::now();
     while !*query_finished.borrow() && start.elapsed().as_secs() < 5 {
-        main_context.iteration(false);
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        glib::timeout_future(std::time::Duration::from_millis(10)).await;
     }
 
     assert!(*query_finished.borrow());
@@ -277,9 +273,9 @@ fn test_query_tab_real_connection() {
     tab.close();
 }
 
-#[gtk4::test]
+#[glib::async_test]
 #[ignore]
-fn test_parallel_queries_different_tabs() {
+async fn test_parallel_queries_different_tabs() {
     println!("Test: Multiple tabs can execute queries in parallel");
 
     let tab1 = DbQueryTab::new(
@@ -295,14 +291,12 @@ fn test_parallel_queries_different_tabs() {
     tab1.connect();
     tab2.connect();
 
-    let main_context = glib::MainContext::default();
     let start = std::time::Instant::now();
     while (tab1.connection_state() != ConnectionState::Connected
         || tab2.connection_state() != ConnectionState::Connected)
         && start.elapsed().as_secs() < 5
     {
-        main_context.iteration(false);
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        glib::timeout_future(std::time::Duration::from_millis(10)).await;
     }
 
     assert_eq!(tab1.connection_state(), ConnectionState::Connected);
@@ -341,8 +335,7 @@ fn test_parallel_queries_different_tabs() {
 
     let start = std::time::Instant::now();
     while (!*tab1_done.borrow() || !*tab2_done.borrow()) && start.elapsed().as_secs() < 10 {
-        main_context.iteration(false);
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        glib::timeout_future(std::time::Duration::from_millis(10)).await;
     }
 
     assert!(*tab1_done.borrow());

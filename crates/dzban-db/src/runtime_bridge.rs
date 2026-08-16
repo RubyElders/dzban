@@ -147,10 +147,7 @@ impl RuntimeBridge {
         rx
     }
 
-    pub fn cancel_query(
-        &self,
-        conn: InternalConnection,
-    ) -> oneshot::Receiver<Result<(), String>> {
+    pub fn cancel_query(&self, conn: InternalConnection) -> oneshot::Receiver<Result<(), String>> {
         let (tx, rx) = oneshot::channel();
         self.runtime.spawn(async move {
             let _ = tx.send(conn.cancel_query().await);

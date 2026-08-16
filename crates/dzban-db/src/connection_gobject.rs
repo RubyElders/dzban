@@ -280,7 +280,7 @@ impl DbConnection {
 
         let rx = bridge.connect(config);
 
-        glib::MainContext::default().spawn_local(async move {
+        glib::MainContext::ref_thread_default().spawn_local(async move {
             match rx.await {
                 Ok(Ok(db_conn)) => {
                     info!("✅ Connected successfully");
@@ -333,7 +333,7 @@ impl DbConnection {
 
             let rx = bridge.disconnect(db_conn);
 
-            glib::MainContext::default().spawn_local(async move {
+            glib::MainContext::ref_thread_default().spawn_local(async move {
                 let _ = rx.await;
                 debug!("Background disconnect completed");
             });
@@ -369,7 +369,7 @@ impl DbConnection {
             .expect("RuntimeBridge not initialized")
             .clone();
 
-        glib::MainContext::default().spawn_local(async move {
+        glib::MainContext::ref_thread_default().spawn_local(async move {
             let rx = bridge.ping(db_conn);
 
             match rx.await {
@@ -428,7 +428,7 @@ impl DbConnection {
             .clone();
         let this = self.clone();
 
-        glib::MainContext::default().spawn_local(async move {
+        glib::MainContext::ref_thread_default().spawn_local(async move {
             let start = std::time::Instant::now();
             let result = match bridge.execute_query_rows(db_conn, query).await {
                 Ok(result) => result,
@@ -468,7 +468,7 @@ impl DbConnection {
             .get()
             .expect("RuntimeBridge not initialized")
             .clone();
-        glib::MainContext::default().spawn_local(async move {
+        glib::MainContext::ref_thread_default().spawn_local(async move {
             let result = bridge
                 .cancel_query(db_conn)
                 .await

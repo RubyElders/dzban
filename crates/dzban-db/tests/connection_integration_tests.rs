@@ -1,29 +1,26 @@
 use dzban_db::{ConnectionState, DbConnection};
-use gtk4::glib;
-use gtk4::prelude::*;
+use glib::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-fn connected_connection() -> DbConnection {
+async fn connected_connection() -> DbConnection {
     let connection = DbConnection::new(
         "host=localhost port=5415 user=testuser password=testpass dbname=testdb".to_string(),
     );
     connection.connect();
-    let context = glib::MainContext::default();
     let deadline = Instant::now() + Duration::from_secs(10);
     while connection.state() == ConnectionState::Connecting && Instant::now() < deadline {
-        context.iteration(false);
-        std::thread::sleep(Duration::from_millis(10));
+        glib::timeout_future(Duration::from_millis(10)).await;
     }
     assert_eq!(connection.state(), ConnectionState::Connected);
     connection
 }
 
-#[gtk4::test]
+#[glib::async_test]
 #[ignore]
-fn row_query_reports_rows_timing_and_state() {
-    let connection = connected_connection();
+async fn row_query_reports_rows_timing_and_state() {
+    let connection = connected_connection().await;
     let finished = Rc::new(RefCell::new(None));
     let finished_clone = finished.clone();
     connection.connect_closure(
@@ -38,10 +35,7 @@ fn row_query_reports_rows_timing_and_state() {
 
     let receiver = connection.execute_query_rows("SELECT generate_series(1, 3)".to_string());
     assert!(connection.query_running());
-    let result = glib::MainContext::default()
-        .block_on(receiver)
-        .unwrap()
-        .unwrap();
+    let result = receiver.await.unwrap().unwrap();
 
     assert_eq!(result.rows.len(), 3);
     assert!(!connection.query_running());
@@ -50,21 +44,19 @@ fn row_query_reports_rows_timing_and_state() {
     connection.disconnect();
 }
 
-#[gtk4::test]
+#[glib::async_test]
 #[ignore]
-fn running_query_can_be_cancelled() {
-    let connection = connected_connection();
+async fn running_query_can_be_cancelled() {
+    let connection = connected_connection().await;
     let query_receiver = connection.execute_query_rows("SELECT pg_sleep(10)".to_string());
-    let context = glib::MainContext::default();
     let deadline = Instant::now() + Duration::from_millis(100);
     while Instant::now() < deadline {
-        context.iteration(false);
-        std::thread::sleep(Duration::from_millis(10));
+        glib::timeout_future(Duration::from_millis(10)).await;
     }
 
-    let cancel_result = context.block_on(connection.cancel_query()).unwrap();
+    let cancel_result = connection.cancel_query().await.unwrap();
     assert!(cancel_result.is_ok());
-    let query_result = context.block_on(query_receiver).unwrap();
+    let query_result = query_receiver.await.unwrap();
 
     assert!(query_result.is_err());
     assert!(!connection.query_running());

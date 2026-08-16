@@ -8,7 +8,7 @@ Run the tests that do not need PostgreSQL:
 cargo test --workspace --all-targets
 ```
 
-Unit tests use the standard Rust harness. Database tests that pump the GLib main context use `#[gtk4::test]` so their local callbacks stay on one worker thread.
+All `dzban-db` tests use the standard Rust harness and do not require a graphical display. Run ignored database tests with one test thread to keep their shared database fixtures deterministic.
 
 ## PostgreSQL integration tests
 
@@ -24,9 +24,9 @@ The Compose setup provides PostgreSQL 15, 16, and 17 on ports 5415, 5416, and 54
 
 The integration suite covers connections, pings, multi-version configuration, parallel queries, returned rows, execution timing, query state, errors, and cancellation.
 
-## GTK widget tests
+## GTK widget test
 
-The query-routing and statusbar-binding regression tests need a display:
+The query-routing regression test needs a display:
 
 ```bash
 xvfb-run -a cargo test -p dzban-ui --bin dzban -- --ignored

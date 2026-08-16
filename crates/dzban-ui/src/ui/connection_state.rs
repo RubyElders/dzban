@@ -1,8 +1,8 @@
-use gtk4::prelude::*;
-use gtk4::{Box, Orientation, Label};
-use std::rc::Rc;
-use std::cell::RefCell;
 use dzban_db::ConnectionState;
+use gtk4::prelude::*;
+use gtk4::{Box, Label, Orientation};
+use std::cell::RefCell;
+use std::rc::Rc;
 
 /// A reusable widget showing connection state with a colored dot
 pub struct ConnectionStateWidget {
@@ -16,19 +16,19 @@ impl ConnectionStateWidget {
     pub fn new() -> Self {
         let container = Box::new(Orientation::Horizontal, 4);
         container.set_valign(gtk4::Align::Center);
-        
+
         // Colored dot indicator
         let status_dot = Label::new(Some("●"));
         status_dot.add_css_class("dim-label");
-        
+
         // Status text
         let status_text = Label::new(Some("Not connected"));
         status_text.add_css_class("caption");
         status_text.add_css_class("dim-label");
-        
+
         container.append(&status_dot);
         container.append(&status_text);
-        
+
         Self {
             container,
             status_dot,
@@ -36,21 +36,21 @@ impl ConnectionStateWidget {
             state: Rc::new(RefCell::new(ConnectionState::Disconnected)),
         }
     }
-    
+
     pub fn update_state(&self, state: ConnectionState, text: Option<&str>) {
         *self.state.borrow_mut() = state;
-        
+
         // Remove all color classes
         self.status_dot.remove_css_class("success");
         self.status_dot.remove_css_class("warning");
         self.status_dot.remove_css_class("error");
         self.status_dot.remove_css_class("dim-label");
-        
+
         self.status_text.remove_css_class("success");
         self.status_text.remove_css_class("warning");
         self.status_text.remove_css_class("error");
         self.status_text.remove_css_class("dim-label");
-        
+
         match state {
             ConnectionState::Disconnected => {
                 self.status_dot.add_css_class("dim-label");
@@ -74,16 +74,11 @@ impl ConnectionStateWidget {
             }
         }
     }
-    
+
     pub fn get_widget(&self) -> &Box {
         &self.container
     }
 
-    #[cfg(test)]
-    pub fn text(&self) -> gtk4::glib::GString {
-        self.status_text.text()
-    }
-    
     #[allow(dead_code)]
     pub fn get_state(&self) -> ConnectionState {
         *self.state.borrow()

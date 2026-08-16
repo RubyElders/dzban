@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::connection_gobject::ConnectionState;
+use crate::connection_gobject::DbConnection;
 use crate::query_tab::DbQueryTab;
 
 glib::wrapper! {
@@ -24,6 +25,21 @@ impl DbConfig {
             .property("active-tab-index", -1i32)
             .build();
 
+        let connection = DbConnection::new(connection_string);
+        let config = obj.clone();
+        connection.connect_closure(
+            "state-changed",
+            false,
+            glib::closure_local!(
+                #[watch]
+                config,
+                move |_connection: &DbConnection, old: ConnectionState, new: ConnectionState| {
+                    config.emit_by_name::<()>("connection-state-changed", &[&old, &new]);
+                }
+            ),
+        );
+        obj.imp().connection.replace(Some(connection));
+
         obj
     }
 
@@ -43,6 +59,14 @@ impl DbConfig {
         self.property("active-tab-index")
     }
 
+    pub fn connection(&self) -> DbConnection {
+        self.imp()
+            .connection
+            .borrow()
+            .clone()
+            .expect("DbConfig connection is initialized")
+    }
+
     pub fn set_active_tab_index(&self, index: i32) {
         if index >= -1 && index < self.tab_count() {
             self.set_property("active-tab-index", index);
@@ -55,8 +79,8 @@ impl DbConfig {
     /// Add a new query tab with optional label
     /// Returns the index of the new tab
     pub fn add_tab(&self, tab_label: Option<String>) -> i32 {
-        let tab = DbQueryTab::new(
-            self.connection_string(),
+        let tab = DbQueryTab::with_connection(
+            self.connection(),
             tab_label.or_else(|| Some(format!("Tab {}", self.tab_count() + 1))),
         );
 
@@ -184,25 +208,19 @@ impl DbConfig {
         result
     }
 
-    /// Connect all tabs (in parallel)
+    /// Connect the shared database connection
     pub fn connect_all(&self) {
-        for tab in self.get_all_tabs() {
-            tab.connect();
-        }
+        self.connection().connect();
     }
 
-    /// Disconnect all tabs
+    /// Disconnect the shared database connection
     pub fn disconnect_all(&self) {
-        for tab in self.get_all_tabs() {
-            tab.disconnect();
-        }
+        self.connection().disconnect();
     }
 
-    /// Check if all tabs are connected
+    /// Check whether the shared database connection is connected
     pub fn all_connected(&self) -> bool {
-        self.get_all_tabs()
-            .iter()
-            .all(|tab| tab.connection_state() == ConnectionState::Connected)
+        self.connection().state() == ConnectionState::Connected
     }
 
     /// Close all tabs and cleanup
@@ -211,6 +229,7 @@ impl DbConfig {
         for tab in tabs {
             tab.close();
         }
+        self.connection().disconnect();
 
         self.imp().tabs.borrow_mut().clear();
         self.set_property("tab-count", 0);
@@ -225,9 +244,13 @@ impl DbConfig {
         tab.connect_closure(
             "query-started",
             false,
-            glib::closure_local!(move |_tab: &DbQueryTab, query: String| {
-                config.emit_by_name::<()>("query-started", &[&query]);
-            }),
+            glib::closure_local!(
+                #[watch]
+                config,
+                move |_tab: &DbQueryTab, query: String| {
+                    config.emit_by_name::<()>("query-started", &[&query]);
+                }
+            ),
         );
 
         let config = self.clone();
@@ -235,9 +258,13 @@ impl DbConfig {
         tab.connect_closure(
             "query-finished",
             false,
-            glib::closure_local!(move |_tab: &DbQueryTab, rows: i64, duration: i64| {
-                config.emit_by_name::<()>("query-finished", &[&rows, &duration]);
-            }),
+            glib::closure_local!(
+                #[watch]
+                config,
+                move |_tab: &DbQueryTab, rows: i64, duration: i64| {
+                    config.emit_by_name::<()>("query-finished", &[&rows, &duration]);
+                }
+            ),
         );
 
         let config = self.clone();
@@ -245,21 +272,13 @@ impl DbConfig {
         tab.connect_closure(
             "query-error",
             false,
-            glib::closure_local!(move |_tab: &DbQueryTab, error: String| {
-                config.emit_by_name::<()>("query-error", &[&error]);
-            }),
-        );
-
-        let config = self.clone();
-
-        tab.connect_closure(
-            "connection-state-changed",
-            false,
-            glib::closure_local!(move |_tab: &DbQueryTab,
-                                       old: ConnectionState,
-                                       new: ConnectionState| {
-                config.emit_by_name::<()>("connection-state-changed", &[&old, &new]);
-            }),
+            glib::closure_local!(
+                #[watch]
+                config,
+                move |_tab: &DbQueryTab, error: String| {
+                    config.emit_by_name::<()>("query-error", &[&error]);
+                }
+            ),
         );
     }
 }
@@ -276,6 +295,7 @@ mod imp {
         pub tab_count: Cell<i32>,
         pub active_tab_index: Cell<i32>,
         pub tabs: RefCell<HashMap<String, DbQueryTab>>,
+        pub connection: RefCell<Option<DbConnection>>,
     }
 
     #[glib::object_subclass]
