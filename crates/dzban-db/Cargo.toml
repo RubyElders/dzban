@@ -13,6 +13,7 @@ path = "src/lib.rs"
 glib.workspace = true
 tokio.workspace = true
 tokio-postgres.workspace = true
+tokio-postgres-rustls.workspace = true
 serde.workspace = true
 toml.workspace = true
 

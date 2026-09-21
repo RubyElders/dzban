@@ -1,7 +1,7 @@
 use glib::prelude::*;
 use glib::subclass::prelude::*;
 use std::cell::{Cell, RefCell};
-use tracing::{debug, info};
+use tracing::{info, trace};
 
 use crate::connection_gobject::ConnectionState;
 use crate::connection_gobject::DbConnection;
@@ -285,7 +285,7 @@ impl DbQueryTab {
 
     pub fn ping(&self) {
         if let Some(conn) = self.connection() {
-            debug!("Pinging from tab: {}", self.tab_label());
+            trace!("Pinging from tab: {}", self.tab_label());
             conn.ping();
         }
     }

@@ -462,7 +462,14 @@ async fn test_dbconfig_connect_all_tabs() {
         glib::timeout_future(std::time::Duration::from_millis(10)).await;
     }
 
-    assert!(config.all_connected());
+    assert!(
+        config.all_connected(),
+        "connection errors: {:?}",
+        (0..config.tab_count())
+            .filter_map(|index| config.get_tab(index)?.connection())
+            .map(|connection| connection.last_error())
+            .collect::<Vec<_>>()
+    );
 
     for i in 0..config.tab_count() {
         let tab = config.get_tab(i).unwrap();
@@ -495,7 +502,14 @@ async fn test_dbconfig_parallel_queries() {
         glib::timeout_future(std::time::Duration::from_millis(10)).await;
     }
 
-    assert!(config.all_connected());
+    assert!(
+        config.all_connected(),
+        "connection errors: {:?}",
+        (0..config.tab_count())
+            .filter_map(|index| config.get_tab(index)?.connection())
+            .map(|connection| connection.last_error())
+            .collect::<Vec<_>>()
+    );
 
     let query_count = Rc::new(RefCell::new(0));
     let query_count_clone = query_count.clone();

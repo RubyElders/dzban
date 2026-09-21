@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, trace};
 
 use crate::config::DatabaseConfig;
 use crate::internal_connection::InternalConnection;
@@ -163,7 +163,7 @@ impl RuntimeBridge {
         let (tx, rx) = oneshot::channel();
 
         self.runtime.spawn(async move {
-            debug!("Bridge: Running ping on Tokio runtime");
+            trace!("Bridge: Running ping on Tokio runtime");
             let result = conn.ping().await;
             match result {
                 Ok(latency) => {

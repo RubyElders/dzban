@@ -2,7 +2,7 @@ use glib::prelude::*;
 use glib::subclass::prelude::*;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::time::Duration;
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{debug, error, info, instrument, trace, warn};
 
 use crate::internal_connection::InternalConnection;
 use crate::runtime_bridge::RuntimeBridge;
@@ -374,7 +374,7 @@ impl DbConnection {
 
             match rx.await {
                 Ok(Ok((latency_micros, _))) => {
-                    debug!("Ping successful: {} µs", latency_micros);
+                    trace!("Ping successful: {} µs", latency_micros);
 
                     this.set_latency_micros(latency_micros as i64);
                     this.increment_ping_count();

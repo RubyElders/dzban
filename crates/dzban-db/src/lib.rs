@@ -19,3 +19,4 @@ pub use connection_gobject::{ConnectionState, DbConnection, QueryResult};
 pub use manager_gobject::DbManager;
 pub use query_tab::DbQueryTab;
 pub use runtime_bridge::RuntimeBridge;
+pub use tokio_postgres::Row;
