@@ -3,11 +3,13 @@ use adw::{Application, ApplicationWindow, HeaderBar, Toast, ToastOverlay, Toolba
 use gtk4::prelude::*;
 use libadwaita as adw;
 
-use super::db_tabs::DatabaseTabManager;
+use super::db_tabs::{DatabaseTabManager, QueryPreviewState};
 use super::shortcuts;
 use super::statusbar::create_statusbar;
 
 pub fn build_ui(app: &Application) {
+    install_styles();
+
     // Create main application window
     let window = ApplicationWindow::builder()
         .application(app)
@@ -33,8 +35,27 @@ pub fn build_ui(app: &Application) {
     let (header, search_entry) = create_header_bar(&db_tab_manager, &toast_overlay);
     toolbar_view.add_top_bar(&header);
 
-    // Wire up search entry to show action status when query manager updates
-    db_tab_manager.set_search_entry(&search_entry);
+    let query_preview_controller = gtk4::EventControllerKey::new();
+    query_preview_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    let db_manager_for_preview = db_tab_manager.clone();
+    query_preview_controller.connect_key_pressed(move |_, key, _, modifiers| {
+        if key == gtk4::gdk::Key::Control_L || key == gtk4::gdk::Key::Control_R {
+            db_manager_for_preview.begin_query_preview();
+        } else if modifiers.contains(gtk4::gdk::ModifierType::CONTROL_MASK)
+            && key != gtk4::gdk::Key::Return
+            && key != gtk4::gdk::Key::KP_Enter
+        {
+            db_manager_for_preview.cancel_query_preview();
+        }
+        gtk4::glib::Propagation::Proceed
+    });
+    let db_manager_for_preview = db_tab_manager.clone();
+    query_preview_controller.connect_key_released(move |_, key, _, _| {
+        if key == gtk4::gdk::Key::Control_L || key == gtk4::gdk::Key::Control_R {
+            db_manager_for_preview.cancel_query_preview();
+        }
+    });
+    window.add_controller(query_preview_controller);
 
     // Create shortcuts dialog (persistent, shown/hidden on demand)
     let shortcuts_dialog = shortcuts::create_shortcuts_window();
@@ -47,10 +68,12 @@ pub fn build_ui(app: &Application) {
 
     let key_controller = shortcuts::create_controller(move |shortcut_id| match shortcut_id {
         "search_focus" => {
+            db_manager_for_shortcuts.cancel_query_preview();
             search_entry_for_shortcuts.grab_focus();
             true
         }
         "run_query" => {
+            db_manager_for_shortcuts.cancel_query_preview();
             db_manager_for_shortcuts.run_current_query();
             true
         }
@@ -93,13 +116,39 @@ pub fn build_ui(app: &Application) {
     window.present();
 }
 
+fn install_styles() {
+    let provider = gtk4::CssProvider::new();
+    provider.load_from_string(
+        "progressbar.query-action-wave trough {
+            min-height: 30px;
+            border-radius: 9px;
+            background-color: transparent;
+        }
+        progressbar.query-action-wave progress {
+            min-height: 30px;
+            border-radius: 9px;
+            background-image: linear-gradient(
+                90deg,
+                alpha(@accent_bg_color, 0.05),
+                alpha(@accent_bg_color, 0.32),
+                alpha(@accent_bg_color, 0.05)
+            );
+        }",
+    );
+    gtk4::style_context_add_provider_for_display(
+        &gtk4::gdk::Display::default().expect("a display is available after GTK initialization"),
+        &provider,
+        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+}
+
 fn create_header_bar(
     db_tab_manager: &DatabaseTabManager,
     toast_overlay: &ToastOverlay,
-) -> (HeaderBar, gtk4::SearchEntry) {
+) -> (HeaderBar, gtk4::Entry) {
     use gtk4::{
-        Button, EventControllerKey, Label, ListBox, MenuButton, Popover, ProgressBar,
-        ScrolledWindow, SearchEntry, gdk,
+        Button, Entry, EntryIconPosition, EventControllerKey, Label, ListBox, MenuButton, Popover,
+        ScrolledWindow, gdk,
     };
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -125,43 +174,46 @@ fn create_header_bar(
 
     header.pack_start(&sidebar_toggle);
 
-    // Multi-purpose search/action bar - shows search and action status
-    let search_container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-    search_container.set_halign(gtk4::Align::Center);
+    let (search_container, db_search, progress_bar) = create_query_action_field();
 
-    let db_search = SearchEntry::new();
-    db_search.set_placeholder_text(Some("Search databases... (Ctrl+K)"));
-    db_search.set_width_chars(45); // Made wider
-    search_container.append(&db_search);
+    let pulse_timer: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+    let search_for_preview = db_search.clone();
+    let progress_for_preview = progress_bar.clone();
+    let pulse_timer_for_preview = Rc::clone(&pulse_timer);
+    db_tab_manager.set_query_preview_callback(move |state| {
+        if let Some(timer) = pulse_timer_for_preview.borrow_mut().take() {
+            timer.remove();
+        }
 
-    // Progress bar at the bottom of search entry
-    let progress_bar = ProgressBar::new();
-    progress_bar.set_fraction(0.0);
-    progress_bar.set_show_text(false);
-    progress_bar.set_hexpand(true);
-    progress_bar.set_visible(false);
-    search_container.append(&progress_bar);
+        search_for_preview.set_placeholder_text(Some(&query_preview_message(&state)));
+        match &state {
+            QueryPreviewState::Loading => {
+                search_for_preview.set_tooltip_text(Some("Release Ctrl to dismiss"));
+                progress_for_preview.set_visible(true);
+                progress_for_preview.set_fraction(0.2);
+                let weak_progress = progress_for_preview.downgrade();
+                *pulse_timer_for_preview.borrow_mut() = Some(glib::timeout_add_local(
+                    std::time::Duration::from_millis(80),
+                    move || {
+                        let Some(progress) = weak_progress.upgrade() else {
+                            return glib::ControlFlow::Break;
+                        };
+                        progress.pulse();
+                        glib::ControlFlow::Continue
+                    },
+                ));
+            }
+            QueryPreviewState::Error(error) => {
+                search_for_preview.set_tooltip_text(Some(error));
+                clear_progress(&progress_for_preview);
+            }
+            QueryPreviewState::Idle | QueryPreviewState::Ready { .. } => {
+                search_for_preview.set_tooltip_text(None);
+                clear_progress(&progress_for_preview);
+            }
+        }
+    });
 
-    // Create suggestions popover - make it match search width
-    let suggestions_popover = Popover::new();
-    suggestions_popover.set_parent(&db_search);
-    suggestions_popover.set_autohide(false); // Don't auto-hide to keep focus in search
-    suggestions_popover.set_has_arrow(false);
-    suggestions_popover.set_width_request(500); // Fixed wider width
-
-    let suggestions_scroll = ScrolledWindow::new();
-    suggestions_scroll.set_max_content_height(400);
-    suggestions_scroll.set_propagate_natural_height(true);
-    suggestions_scroll.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
-
-    let suggestions_list = ListBox::new();
-    suggestions_list.add_css_class("navigation-sidebar");
-    suggestions_scroll.set_child(Some(&suggestions_list));
-    suggestions_popover.set_child(Some(&suggestions_scroll));
-    db_search.set_placeholder_text(Some("Search databases... (Ctrl+K)"));
-    db_search.set_width_chars(45); // Made wider
-
-    // Create suggestions popover - make it match search width
     let suggestions_popover = Popover::new();
     suggestions_popover.set_parent(&db_search);
     suggestions_popover.set_autohide(false); // Don't auto-hide to keep focus in search
@@ -234,7 +286,7 @@ fn create_header_bar(
     let execute_action = {
         let db_manager = db_tab_manager.clone();
         let toast = toast_overlay.clone();
-        move |action: &str, entry: &SearchEntry| {
+        move |action: &str, entry: &Entry| {
             if action == "connections" {
                 db_manager.open_connection_manager();
                 entry.set_text("");
@@ -366,9 +418,18 @@ fn create_header_bar(
 
     // Wire up search changed to update suggestions
     let update_suggestions_clone = update_suggestions.clone();
-    db_search.connect_search_changed(move |entry| {
+    db_search.connect_changed(move |entry| {
         let text = entry.text();
+        entry.set_icon_from_icon_name(
+            EntryIconPosition::Secondary,
+            (!text.is_empty()).then_some("edit-clear-symbolic"),
+        );
         update_suggestions_clone(&text);
+    });
+    db_search.connect_icon_release(|entry, position| {
+        if position == EntryIconPosition::Secondary {
+            entry.set_text("");
+        }
     });
 
     // Wire up keyboard navigation (Up/Down arrows)
@@ -478,9 +539,117 @@ fn create_header_bar(
     (header, db_search)
 }
 
+fn query_preview_message(state: &QueryPreviewState) -> String {
+    match state {
+        QueryPreviewState::Idle => "Search databases... (Ctrl+K)".to_string(),
+        QueryPreviewState::Loading => {
+            "Enter to run query - estimating rows and cost...".to_string()
+        }
+        QueryPreviewState::Ready {
+            rows,
+            startup_cost,
+            total_cost,
+        } => format!(
+            "Enter to run query - ~{} rows - cost {:.2}..{:.2}",
+            rows, startup_cost, total_cost
+        ),
+        QueryPreviewState::Error(_) => {
+            "Enter to run query - estimate unavailable (hover for details)".to_string()
+        }
+    }
+}
+
+fn create_query_action_field() -> (gtk4::Overlay, gtk4::Entry, gtk4::ProgressBar) {
+    let overlay = gtk4::Overlay::new();
+    overlay.set_halign(gtk4::Align::Center);
+
+    let entry = gtk4::Entry::new();
+    entry.set_placeholder_text(Some("Search databases... (Ctrl+K)"));
+    entry.set_width_chars(64);
+    entry.add_css_class("search");
+    entry.set_icon_from_icon_name(
+        gtk4::EntryIconPosition::Primary,
+        Some("system-search-symbolic"),
+    );
+    overlay.set_child(Some(&entry));
+
+    let progress = gtk4::ProgressBar::new();
+    progress.add_css_class("query-action-wave");
+    progress.set_halign(gtk4::Align::Fill);
+    progress.set_valign(gtk4::Align::Fill);
+    progress.set_pulse_step(0.08);
+    progress.set_can_target(false);
+    progress.set_opacity(0.25);
+    progress.set_visible(false);
+    overlay.add_overlay(&progress);
+
+    (overlay, entry, progress)
+}
+
+fn clear_progress(progress: &gtk4::ProgressBar) {
+    progress.set_fraction(0.0);
+    progress.set_visible(false);
+}
+
 fn setup_toasts(toast_overlay: &ToastOverlay) {
     // Example: Show a toast notification
     let toast = Toast::new("Welcome to Dzban!");
     toast.set_timeout(3);
     toast_overlay.add_toast(toast);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ready_query_preview_prompts_for_execution_with_estimates() {
+        let message = query_preview_message(&QueryPreviewState::Ready {
+            rows: 42,
+            startup_cost: 1.25,
+            total_cost: 9.5,
+        });
+
+        assert_eq!(message, "Enter to run query - ~42 rows - cost 1.25..9.50");
+    }
+
+    #[gtk4::test]
+    #[ignore = "requires a graphical display"]
+    fn query_action_progress_preserves_layout_and_can_restart() {
+        install_styles();
+        let (field, entry, progress) = create_query_action_field();
+        let window = gtk4::Window::new();
+        window.set_child(Some(&field));
+        window.present();
+        gtk4::test_widget_wait_for_draw(&field);
+        let baseline = (field.width(), field.height());
+
+        progress.set_visible(true);
+        progress.pulse();
+        gtk4::test_widget_wait_for_draw(&field);
+        assert!(progress.is_visible());
+        assert!((progress.opacity() - 0.25).abs() < 0.01);
+        assert_eq!((progress.width(), progress.height()), baseline);
+        assert_eq!((field.width(), field.height()), baseline);
+
+        clear_progress(&progress);
+        gtk4::test_widget_wait_for_draw(&field);
+        assert!(!progress.is_visible());
+        assert_eq!(progress.fraction(), 0.0);
+        assert_eq!((field.width(), field.height()), baseline);
+
+        progress.set_visible(true);
+        progress.pulse();
+        gtk4::test_widget_wait_for_draw(&field);
+        assert!(progress.is_visible());
+        assert_eq!((progress.width(), progress.height()), baseline);
+        assert_eq!((field.width(), field.height()), baseline);
+
+        clear_progress(&progress);
+        assert_eq!(
+            entry.placeholder_text().as_deref(),
+            Some("Search databases... (Ctrl+K)")
+        );
+        window.close();
+    }
 }

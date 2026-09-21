@@ -239,19 +239,14 @@ fn example_two_way(app: &Application) {
 // Example 3: Notify Signals (Like Your Connection Status!)
 // ============================================================================
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, glib::Enum)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, glib::Enum)]
 #[enum_type(name = "DemoConnectionState")]
 pub enum DemoState {
+    #[default]
     Disconnected,
     Connecting,
     Connected,
     Error,
-}
-
-impl Default for DemoState {
-    fn default() -> Self {
-        Self::Disconnected
-    }
 }
 
 mod connection {

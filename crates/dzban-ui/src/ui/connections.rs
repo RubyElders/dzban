@@ -8,13 +8,12 @@ use std::rc::Rc;
 
 use dzban_db::{Config, DatabaseConfig, RuntimeBridge};
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TestStatus {
     NotTested,
     Testing,
     Success,
-    Failed,
+    Failed(String),
 }
 
 pub fn create_connection_manager<F>(bridge: RuntimeBridge, on_database_open: F) -> Box
@@ -144,14 +143,15 @@ where
     F: Fn(&str) + 'static,
 {
     let row = ActionRow::new();
+    row.set_use_markup(false);
     row.set_title(&db_config.name);
 
     // Build subtitle with connection details
-    let details = if db_config.host.is_some() {
+    let details = if let Some(host) = &db_config.host {
         format!(
             "{}@{}:{}/{}",
             db_config.user,
-            db_config.host.as_ref().unwrap(),
+            host,
             db_config.port.unwrap_or(5432),
             db_config.database
         )
@@ -230,14 +230,17 @@ fn create_status_indicator(status: TestStatus) -> Box {
             text.add_css_class("success");
             box_widget.append(&text);
         }
-        TestStatus::Failed => {
+        TestStatus::Failed(error) => {
             let label = Label::new(Some("●"));
             label.add_css_class("error");
             box_widget.append(&label);
 
-            let text = Label::new(Some("Failed"));
+            let text = Label::new(Some(&error));
             text.add_css_class("caption");
             text.add_css_class("error");
+            text.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            text.set_max_width_chars(40);
+            text.set_tooltip_text(Some(&error));
             box_widget.append(&text);
         }
     }
@@ -267,40 +270,15 @@ fn test_connection<F>(
             Ok(Ok(_version)) => {
                 update_status_indicator(&status_container, TestStatus::Success);
             }
-            Ok(Err(e)) => {
-                // Show error in status
-                while let Some(child) = status_container.first_child() {
-                    status_container.remove(&child);
-                }
-
-                let label = Label::new(Some("●"));
-                label.add_css_class("error");
-                status_container.append(&label);
-
-                let text = Label::new(Some(&format!("Error: {}", e)));
-                text.add_css_class("caption");
-                text.add_css_class("error");
-                text.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-                text.set_max_width_chars(40);
-                text.set_tooltip_text(Some(&e.to_string()));
-                status_container.append(&text);
-            }
+            Ok(Err(error)) => update_status_indicator(
+                &status_container,
+                TestStatus::Failed(format!("Error: {}", error)),
+            ),
             Err(_) => {
-                // Channel closed, connection task was cancelled
-                while let Some(child) = status_container.first_child() {
-                    status_container.remove(&child);
-                }
-
-                let label = Label::new(Some("●"));
-                label.add_css_class("error");
-                status_container.append(&label);
-
-                let text = Label::new(Some("Cancelled"));
-                text.add_css_class("caption");
-                text.add_css_class("error");
-                text.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-                text.set_max_width_chars(40);
-                status_container.append(&text);
+                update_status_indicator(
+                    &status_container,
+                    TestStatus::Failed("Cancelled".to_string()),
+                );
             }
         }
 

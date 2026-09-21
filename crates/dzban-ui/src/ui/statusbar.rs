@@ -132,24 +132,46 @@ impl Statusbar {
         let state_handler = connection.connect_notify_local(Some("state"), move |connection, _| {
             let state = connection.state();
             let db_name = db_name_for_state.clone();
-            statusbar.update_connection(Some(&db_name), state);
+            let error = connection.last_error();
+            statusbar.update_connection(Some(&db_name), state, Some(&error));
         });
+
+        let statusbar = self.clone();
+        let db_name_for_error = db_name.clone();
+        let error_handler =
+            connection.connect_notify_local(Some("last-error"), move |connection, _| {
+                let error = connection.last_error();
+                statusbar.update_connection(
+                    Some(&db_name_for_error),
+                    connection.state(),
+                    Some(&error),
+                );
+            });
 
         self.binding.replace(
             connection,
-            vec![latency_handler, version_handler, state_handler],
+            vec![
+                latency_handler,
+                version_handler,
+                state_handler,
+                error_handler,
+            ],
         );
 
         // Set initial values
         self.update_latency(connection.latency());
         self.update_version(connection.version().as_deref());
-        self.update_connection(Some(&db_name), connection.state());
+        self.update_connection(
+            Some(&db_name),
+            connection.state(),
+            Some(&connection.last_error()),
+        );
     }
 
     /// Unbind from current model (if switching tabs or closing connection)
     pub fn unbind(&self) {
         self.clear_binding();
-        self.update_connection(None, dzban_db::ConnectionState::Disconnected);
+        self.update_connection(None, dzban_db::ConnectionState::Disconnected, None);
         self.update_version(None);
         self.update_latency(None);
         self.update_exec_time(None);
@@ -160,9 +182,14 @@ impl Statusbar {
         self.binding.clear();
     }
 
-    pub fn update_connection(&self, db_name: Option<&str>, state: dzban_db::ConnectionState) {
+    pub fn update_connection(
+        &self,
+        db_name: Option<&str>,
+        state: dzban_db::ConnectionState,
+        error: Option<&str>,
+    ) {
         if let Some(name) = db_name {
-            let text = name.to_string();
+            let text = connection_status_text(name, state, error);
             self.connection_widget.update_state(state, Some(&text));
         } else {
             self.connection_widget
@@ -201,6 +228,21 @@ impl Statusbar {
         } else {
             self.rows_info.set_text("📊 -- rows");
         }
+    }
+}
+
+fn connection_status_text(
+    name: &str,
+    state: dzban_db::ConnectionState,
+    error: Option<&str>,
+) -> String {
+    if state == dzban_db::ConnectionState::Error {
+        error
+            .filter(|error| !error.is_empty())
+            .map(|error| format!("{}: {}", name, error))
+            .unwrap_or_else(|| format!("{}: connection failed", name))
+    } else {
+        name.to_string()
     }
 }
 
@@ -273,5 +315,17 @@ mod tests {
 
         assert_eq!(first_notifications.get(), 0);
         assert_eq!(second_notifications.get(), 1);
+    }
+
+    #[test]
+    fn connection_errors_include_the_database_and_cause() {
+        assert_eq!(
+            connection_status_text(
+                "reporting",
+                dzban_db::ConnectionState::Error,
+                Some("password authentication failed")
+            ),
+            "reporting: password authentication failed"
+        );
     }
 }

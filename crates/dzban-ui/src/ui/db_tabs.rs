@@ -2,29 +2,40 @@ use adw::{TabBar, TabPage, TabView};
 use gtk4::gdk;
 use gtk4::prelude::*;
 use libadwaita as adw;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::Duration;
 
 use super::connection_state::ConnectionStateWidget;
 use super::connections;
+use super::query_state::QueryExecution;
 use super::query_tabs::QueryTabManager;
 use super::statusbar::Statusbar;
-use dzban_db::{Config, ConnectionState, DbConfig, DbConnection, DbManager, RuntimeBridge};
+use dzban_db::{Config, ConnectionState, DbConfig, DbManager, RuntimeBridge};
 
 type DatabaseTab = (TabPage, QueryTabManager, DbConfig, ConnectionStateWidget);
 type DatabaseTabs = Rc<RefCell<HashMap<String, DatabaseTab>>>;
+type QueryPreviewCallback = Rc<dyn Fn(QueryPreviewState)>;
 
-// Create a simple colored circle icon using Cairo with exact CSS color
-#[allow(deprecated)]
+const QUERY_PREVIEW_DELAY: Duration = Duration::from_millis(250);
+
+#[derive(Clone, Debug)]
+pub enum QueryPreviewState {
+    Idle,
+    Loading,
+    Ready {
+        rows: i64,
+        startup_cost: f64,
+        total_cost: f64,
+    },
+    Error(String),
+}
+
 fn create_colored_dot_icon(css_class: &str) -> gtk4::gio::Icon {
-    // Create a temporary label with the CSS class to get the actual rendered color
     let label = gtk4::Label::new(Some("●"));
     label.add_css_class(css_class);
-
-    // Get the actual color from the CSS (widget doesn't need to be realized)
-    let context = label.style_context();
-    let color = context.color();
+    let color = label.color();
 
     // Create a 16x16 surface with a colored circle
     let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, 16, 16)
@@ -67,6 +78,10 @@ pub struct DatabaseTabManager {
     runtime_bridge: RuntimeBridge,
     db_manager: DbManager,
     statusbar: Statusbar,
+    query_preview_callback: Rc<RefCell<Option<QueryPreviewCallback>>>,
+    query_preview_generation: Rc<Cell<u64>>,
+    query_preview_timer: Rc<RefCell<Option<glib::SourceId>>>,
+    query_preview_manager: Rc<RefCell<Option<QueryTabManager>>>,
 }
 
 impl DatabaseTabManager {
@@ -102,6 +117,10 @@ impl DatabaseTabManager {
             runtime_bridge,
             db_manager: DbManager::new(),
             statusbar: statusbar.clone(),
+            query_preview_callback: Rc::new(RefCell::new(None)),
+            query_preview_generation: Rc::new(Cell::new(0)),
+            query_preview_timer: Rc::new(RefCell::new(None)),
+            query_preview_manager: Rc::new(RefCell::new(None)),
         };
 
         // Create connection manager as first (leftmost) pinned tab
@@ -178,86 +197,97 @@ impl DatabaseTabManager {
         &self.container
     }
 
-    /// Set the search entry for updating with action status
-    pub fn set_search_entry(&self, search_entry: &gtk4::SearchEntry) {
-        use super::constants::EXPLAIN_DELAY_MS;
+    pub fn set_query_preview_callback<F>(&self, callback: F)
+    where
+        F: Fn(QueryPreviewState) + 'static,
+    {
+        *self.query_preview_callback.borrow_mut() = Some(Rc::new(callback));
+    }
 
-        let search_entry_clone = search_entry.clone();
+    pub fn begin_query_preview(&self) {
+        self.cancel_query_preview();
 
-        // Find the progress bar in the search entry's parent container
-        let progress_bar = if let Some(parent) = search_entry.parent() {
-            if let Ok(container) = parent.downcast::<gtk4::Box>() {
-                // The progress bar is the second child
-                container
-                    .last_child()
-                    .and_then(|child| child.downcast::<gtk4::ProgressBar>().ok())
-            } else {
-                None
-            }
-        } else {
-            None
+        let Some(current_page) = self.tab_view.selected_page() else {
+            return;
+        };
+        let preview_target = self
+            .tabs
+            .borrow()
+            .values()
+            .find(|(page, _, _, _)| page == &current_page)
+            .map(|(_, query_manager, config, _)| (query_manager.clone(), config.connection()));
+        let Some((query_manager, connection)) = preview_target else {
+            return;
+        };
+        let Some(sql) = query_manager.highlight_current_query() else {
+            return;
         };
 
-        // Track the animation timer
-        let timer_handle: std::rc::Rc<std::cell::RefCell<Option<gtk4::glib::SourceId>>> =
-            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let generation = self.query_preview_generation.get().wrapping_add(1);
+        self.query_preview_generation.set(generation);
+        *self.query_preview_manager.borrow_mut() = Some(query_manager);
+        self.emit_query_preview(QueryPreviewState::Loading);
 
-        // Set the callback on each existing tab's query manager
-        let tabs = self.tabs.borrow();
-        for (_, (_, query_manager, _, _)) in tabs.iter() {
-            let se = search_entry_clone.clone();
-            let pb = progress_bar.clone();
-            let timer = timer_handle.clone();
+        let manager = self.clone();
+        let timer = glib::timeout_add_local_once(QUERY_PREVIEW_DELAY, move || {
+            manager.query_preview_timer.borrow_mut().take();
+            if manager.query_preview_generation.get() != generation {
+                return;
+            }
+            if connection.state() != ConnectionState::Connected {
+                manager.emit_query_preview(QueryPreviewState::Error(
+                    "Database is not connected".to_string(),
+                ));
+                return;
+            }
+            let Some(explain_sql) = explain_statement(&sql) else {
+                manager.emit_query_preview(QueryPreviewState::Error(
+                    "Current statement is already EXPLAIN".to_string(),
+                ));
+                return;
+            };
 
-            query_manager.set_action_bar_callback(move |text, show_progress| {
-                se.set_placeholder_text(Some(text));
-
-                // Cancel any existing timer
-                if let Some(timer_id) = timer.borrow_mut().take() {
-                    timer_id.remove();
-                }
-
-                if let Some(ref progress) = pb {
-                    progress.set_visible(show_progress);
-
-                    if show_progress {
-                        // Animate progress bar over EXPLAIN_DELAY_MS
-                        progress.set_fraction(0.0);
-
-                        let progress_clone = progress.clone();
-                        let timer_clone = timer.clone();
-                        let steps = 20;
-                        let interval_ms = EXPLAIN_DELAY_MS / steps;
-                        let increment = 1.0 / steps as f64;
-
-                        let current_step = std::rc::Rc::new(std::cell::RefCell::new(0u64));
-
-                        let timer_id = gtk4::glib::timeout_add_local(
-                            std::time::Duration::from_millis(interval_ms),
-                            {
-                                let current_step = current_step.clone();
-                                move || {
-                                    let mut step = current_step.borrow_mut();
-                                    *step += 1;
-
-                                    let fraction = (*step as f64) * increment;
-                                    progress_clone.set_fraction(fraction.min(1.0));
-
-                                    if *step >= steps {
-                                        gtk4::glib::ControlFlow::Break
-                                    } else {
-                                        gtk4::glib::ControlFlow::Continue
-                                    }
-                                }
+            let manager_for_result = manager.clone();
+            let rx = connection.execute_query_rows(explain_sql);
+            glib::spawn_future_local(async move {
+                let state = match rx.await {
+                    Ok(Ok(result)) => extract_explain_plan(&result.rows)
+                        .and_then(|plan| extract_query_estimate(&plan))
+                        .map(
+                            |(rows, startup_cost, total_cost)| QueryPreviewState::Ready {
+                                rows,
+                                startup_cost,
+                                total_cost,
                             },
-                        );
-
-                        *timer_clone.borrow_mut() = Some(timer_id);
-                    } else {
-                        progress.set_fraction(0.0);
-                    }
+                        )
+                        .unwrap_or_else(QueryPreviewState::Error),
+                    Ok(Err(error)) => QueryPreviewState::Error(error),
+                    Err(_) => QueryPreviewState::Error("EXPLAIN was cancelled".to_string()),
+                };
+                if manager_for_result.query_preview_generation.get() == generation {
+                    manager_for_result.emit_query_preview(state);
                 }
             });
+        });
+        *self.query_preview_timer.borrow_mut() = Some(timer);
+    }
+
+    pub fn cancel_query_preview(&self) {
+        if let Some(timer) = self.query_preview_timer.borrow_mut().take() {
+            timer.remove();
+        }
+        self.query_preview_generation
+            .set(self.query_preview_generation.get().wrapping_add(1));
+        let query_manager = self.query_preview_manager.borrow_mut().take();
+        if let Some(query_manager) = query_manager {
+            query_manager.clear_query_highlight();
+            self.emit_query_preview(QueryPreviewState::Idle);
+        }
+    }
+
+    fn emit_query_preview(&self, state: QueryPreviewState) {
+        if let Some(callback) = self.query_preview_callback.borrow().as_ref() {
+            callback(state);
         }
     }
 
@@ -292,8 +322,7 @@ impl DatabaseTabManager {
                     .get_config(db_name)
                     .expect("newly added database config is available");
                 let connection = config.connection();
-                let (page, query_manager, state_widget) =
-                    self.create_database_tab(db_name, &connection);
+                let (page, query_manager, state_widget) = self.create_database_tab(db_name);
 
                 self.tabs.borrow_mut().insert(
                     db_name.to_string(),
@@ -345,50 +374,10 @@ impl DatabaseTabManager {
     fn create_database_tab(
         &self,
         db_name: &str,
-        connection: &DbConnection,
     ) -> (TabPage, QueryTabManager, ConnectionStateWidget) {
         // Create query tab manager for this database
         let query_manager = QueryTabManager::new(db_name);
         let content = query_manager.get_widget().clone();
-
-        // Set up auto-EXPLAIN callback
-        let connection_for_explain = connection.clone();
-        let query_manager_for_explain = query_manager.clone();
-        query_manager.set_explain_callback(move |explain_query| {
-            tracing::info!("📊 Running auto-EXPLAIN query in background");
-            let connection = connection_for_explain.clone();
-            let query_mgr = query_manager_for_explain.clone();
-
-            gtk4::glib::spawn_future_local(async move {
-                let rx = connection.execute_query_rows(explain_query.clone());
-
-                match rx.await {
-                    Ok(Ok(result)) => {
-                        if let Some(first_row) = result.rows.first() {
-                            // Try to get the JSON column
-                            if let Ok(Some(json_val)) =
-                                first_row.try_get::<_, Option<serde_json::Value>>(0)
-                            {
-                                let formatted = serde_json::to_string_pretty(&json_val)
-                                    .unwrap_or_else(|_| json_val.to_string());
-                                tracing::info!("✅ Auto-EXPLAIN result:\n{}", formatted);
-
-                                // Show the results in the fancy slider
-                                query_mgr.show_explain_results(&json_val);
-                            } else {
-                                tracing::warn!("Could not parse EXPLAIN result as JSON");
-                            }
-                        }
-                    }
-                    Ok(Err(e)) => {
-                        tracing::error!("❌ Auto-EXPLAIN failed: {}", e);
-                    }
-                    Err(_) => {
-                        tracing::error!("❌ Auto-EXPLAIN was cancelled");
-                    }
-                }
-            });
-        });
 
         // Create connection state widget for tracking state (not displayed in tab)
         let state_widget = ConnectionStateWidget::new();
@@ -423,7 +412,7 @@ impl DatabaseTabManager {
         if let Some(current_page) = self.tab_view.selected_page() {
             let tabs = self.tabs.borrow();
             // Find the QueryTabManager for the current page
-            for (_db_name, (page, query_manager, _, _)) in tabs.iter() {
+            for (page, query_manager, _, _) in tabs.values() {
                 if page == &current_page {
                     query_manager.toggle_sidebar();
                     break;
@@ -435,7 +424,7 @@ impl DatabaseTabManager {
     pub fn is_current_sidebar_visible(&self) -> bool {
         if let Some(current_page) = self.tab_view.selected_page() {
             let tabs = self.tabs.borrow();
-            for (_db_name, (page, query_manager, _, _)) in tabs.iter() {
+            for (page, query_manager, _, _) in tabs.values() {
                 if page == &current_page {
                     return query_manager.is_sidebar_visible();
                 }
@@ -462,14 +451,18 @@ impl DatabaseTabManager {
                         }
                     };
 
-                    // Check if query is already running
-                    if !state_manager.try_start() {
+                    let Some(execution) = QueryExecution::start(query_num, state_manager) else {
                         // Query is already running, ignore this request
                         tracing::debug!("Query already running, ignoring duplicate request");
                         return;
-                    }
+                    };
 
-                    query_manager.show_loading_for(query_num);
+                    let Some(output_generation) =
+                        query_manager.show_loading_for(execution.query_num())
+                    else {
+                        execution.finish();
+                        return;
+                    };
 
                     if connection.state() == ConnectionState::Connected {
                         let connection = connection.clone();
@@ -477,36 +470,97 @@ impl DatabaseTabManager {
                         let statusbar = self.statusbar.clone();
                         let tab_view = self.tab_view.clone();
                         let database_page = page.clone();
+                        let history_sql = sql.clone();
 
                         gtk4::glib::spawn_future_local(async move {
                             let rx = connection.execute_query_rows(sql);
 
                             match rx.await {
                                 Ok(Ok(result)) => {
+                                    execution.finish();
                                     let row_count = result.rows.len();
+                                    let duration = result.duration;
+                                    let explain_sql = explain_statement(&history_sql);
+                                    let embedded_plan = if explain_sql.is_none() {
+                                        extract_explain_plan(&result.rows).ok()
+                                    } else {
+                                        None
+                                    };
                                     tracing::info!("Query returned {} rows", row_count);
-                                    query_manager.display_results_for(query_num, result.rows);
-                                    if tab_view.selected_page().as_ref() == Some(&database_page) {
+                                    let stored_result = query_manager
+                                        .display_results_for(execution.query_num(), result.rows);
+                                    if tab_view.selected_page().as_ref() == Some(&database_page)
+                                        && query_manager.is_query_selected(execution.query_num())
+                                    {
                                         statusbar.update_rows(Some(row_count));
-                                        statusbar
-                                            .update_exec_time(Some(result.duration.as_secs_f64()));
+                                        statusbar.update_exec_time(Some(duration.as_secs_f64()));
                                     }
+
+                                    let (explain, explain_error) = match explain_sql {
+                                        Some(explain_sql) => {
+                                            match connection.execute_query_rows(explain_sql).await {
+                                                Ok(Ok(explain_result)) => {
+                                                    match extract_explain_plan(&explain_result.rows) {
+                                                        Ok(plan) => (Some(plan), None),
+                                                        Err(error) => (None, Some(error)),
+                                                    }
+                                                }
+                                                Ok(Err(error)) => (None, Some(error)),
+                                                Err(_) => (
+                                                    None,
+                                                    Some("EXPLAIN request was cancelled".to_string()),
+                                                ),
+                                            }
+                                        }
+                                        None => embedded_plan.map_or_else(
+                                            || {
+                                                (
+                                                    None,
+                                                    Some(
+                                                        "The existing EXPLAIN did not return a JSON plan"
+                                                            .to_string(),
+                                                    ),
+                                                )
+                                            },
+                                            |plan| (Some(plan), None),
+                                        ),
+                                    };
+                                    query_manager.display_explain_for(
+                                        execution.query_num(),
+                                        output_generation,
+                                        explain.as_ref(),
+                                        explain_error.as_deref(),
+                                    );
+                                    query_manager.record_query_success(
+                                        history_sql,
+                                        duration,
+                                        row_count,
+                                        stored_result,
+                                        explain,
+                                        explain_error,
+                                    );
                                 }
                                 Ok(Err(error)) => {
+                                    execution.finish();
                                     tracing::error!("Query failed: {}", error);
-                                    query_manager.display_error_for(query_num, &error);
+                                    query_manager.display_error_for(execution.query_num(), &error);
+                                    query_manager.record_query_failure(history_sql, error);
                                 }
                                 Err(_) => {
+                                    execution.finish();
                                     let error = "Query execution was cancelled";
                                     tracing::error!("{}", error);
-                                    query_manager.display_error_for(query_num, error);
+                                    query_manager.display_error_for(execution.query_num(), error);
+                                    query_manager
+                                        .record_query_failure(history_sql, error.to_string());
                                 }
                             }
                         });
                     } else {
-                        state_manager.finish();
-                        query_manager
-                            .display_error_for(query_num, &format!("Not connected to {}", db_name));
+                        execution.finish();
+                        let error = format!("Not connected to {}", db_name);
+                        query_manager.display_error_for(execution.query_num(), &error);
+                        query_manager.record_query_failure(sql, error);
                     }
                     return;
                 }
@@ -554,7 +608,7 @@ impl DatabaseTabManager {
     pub fn new_query_in_current_db(&self) {
         if let Some(current_page) = self.tab_view.selected_page() {
             let tabs = self.tabs.borrow();
-            for (_db_name, (page, query_manager, _, _)) in tabs.iter() {
+            for (page, query_manager, _, _) in tabs.values() {
                 if page == &current_page {
                     query_manager.new_query_tab();
                     return;
@@ -596,5 +650,82 @@ impl DatabaseTabManager {
         } else {
             Vec::new()
         }
+    }
+}
+
+fn explain_statement(sql: &str) -> Option<String> {
+    let sql = sql.trim();
+    if sql
+        .split_whitespace()
+        .next()
+        .is_some_and(|keyword| keyword.eq_ignore_ascii_case("EXPLAIN"))
+    {
+        None
+    } else {
+        Some(format!("EXPLAIN (FORMAT JSON) {}", sql))
+    }
+}
+
+fn extract_explain_plan(rows: &[dzban_db::Row]) -> Result<serde_json::Value, String> {
+    rows.first()
+        .ok_or_else(|| "EXPLAIN returned no rows".to_string())?
+        .try_get::<_, serde_json::Value>(0)
+        .map_err(|error| format!("EXPLAIN returned an invalid JSON plan: {}", error))
+}
+
+fn extract_query_estimate(plan: &serde_json::Value) -> Result<(i64, f64, f64), String> {
+    let plan = plan
+        .as_array()
+        .and_then(|plans| plans.first())
+        .and_then(|root| root.get("Plan"))
+        .ok_or_else(|| "EXPLAIN returned no query plan".to_string())?;
+    let rows = plan
+        .get("Plan Rows")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| "EXPLAIN returned no row estimate".to_string())?;
+    let startup_cost = plan
+        .get("Startup Cost")
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(|| "EXPLAIN returned no startup cost".to_string())?;
+    let total_cost = plan
+        .get("Total Cost")
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(|| "EXPLAIN returned no total cost".to_string())?;
+    Ok((rows, startup_cost, total_cost))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{explain_statement, extract_query_estimate};
+
+    #[test]
+    fn explain_is_plain_and_json_formatted() {
+        assert_eq!(
+            explain_statement("select * from users"),
+            Some("EXPLAIN (FORMAT JSON) select * from users".to_string())
+        );
+        assert!(
+            !explain_statement("select * from users")
+                .unwrap()
+                .contains("ANALYZE")
+        );
+    }
+
+    #[test]
+    fn existing_explain_is_not_wrapped() {
+        assert_eq!(explain_statement("  explain select 1"), None);
+    }
+
+    #[test]
+    fn query_estimate_uses_the_root_plan() {
+        let plan = serde_json::json!([{
+            "Plan": {
+                "Plan Rows": 42,
+                "Startup Cost": 1.25,
+                "Total Cost": 9.5
+            }
+        }]);
+
+        assert_eq!(extract_query_estimate(&plan), Ok((42, 1.25, 9.5)));
     }
 }

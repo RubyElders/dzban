@@ -14,6 +14,29 @@ pub struct QueryStateManager {
     state: Arc<Mutex<QueryState>>,
 }
 
+#[derive(Clone)]
+pub struct QueryExecution {
+    query_num: u32,
+    state_manager: QueryStateManager,
+}
+
+impl QueryExecution {
+    pub fn start(query_num: u32, state_manager: QueryStateManager) -> Option<Self> {
+        state_manager.try_start().then_some(Self {
+            query_num,
+            state_manager,
+        })
+    }
+
+    pub fn query_num(&self) -> u32 {
+        self.query_num
+    }
+
+    pub fn finish(&self) {
+        self.state_manager.finish();
+    }
+}
+
 impl QueryStateManager {
     pub fn new() -> Self {
         Self {
@@ -78,5 +101,19 @@ mod tests {
         assert!(!state.try_start());
         state.finish();
         assert!(state.try_start());
+    }
+
+    #[test]
+    fn completion_finishes_the_execution_that_started_it() {
+        let first = QueryStateManager::new();
+        let second = QueryStateManager::new();
+        let execution = QueryExecution::start(1, first.clone()).unwrap();
+        assert!(QueryExecution::start(2, second.clone()).is_some());
+
+        execution.finish();
+
+        assert_eq!(execution.query_num(), 1);
+        assert!(first.try_start());
+        assert!(!second.try_start());
     }
 }

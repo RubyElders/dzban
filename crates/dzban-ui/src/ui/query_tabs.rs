@@ -1,31 +1,33 @@
-use adw::{OverlaySplitView, TabBar, TabView};
+use adw::{OverlaySplitView, TabBar, TabPage, TabView};
+use gtk4::gdk;
 use gtk4::prelude::*;
 use gtk4::{
-    Box, ColumnView, ColumnViewColumn, EventControllerKey, Label, ListItem, Orientation, Overlay,
-    Paned, Revealer, ScrolledWindow, SignalListItemFactory, SingleSelection, StringList, gdk,
+    Box, ColumnView, ColumnViewColumn, Label, ListItem, Orientation, Paned, ScrolledWindow,
+    SignalListItemFactory, SingleSelection, StringList,
 };
 use libadwaita as adw;
 use sourceview5::prelude::*;
 use sourceview5::{
     Buffer as SourceBuffer, LanguageManager, StyleSchemeManager, View as SourceView,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::Duration;
 
-use super::constants::{EXPLAIN_ANIMATION_MS, EXPLAIN_DELAY_MS, EXPLAIN_TOP_MARGIN};
+use super::query_history::{QueryHistoryEntry, QueryHistoryOutcome, QueryResultSnapshot};
 use super::query_state::QueryStateManager;
-use super::sidebar::create_query_sidebar;
+use super::sidebar::QueryHistory;
+use dzban_db::Row;
 
 // Stores UI elements for each query tab
 struct QueryTab {
+    page: TabPage,
     editor: SourceView,
     results_scroll: ScrolledWindow,
     state_manager: QueryStateManager,
+    output_generation: Cell<u64>,
 }
-
-type ExplainCallback = Rc<dyn Fn(String)>;
-type ActionBarCallback = Rc<dyn Fn(&str, bool)>;
 
 #[derive(Clone)]
 pub struct QueryTabManager {
@@ -34,9 +36,7 @@ pub struct QueryTabManager {
     container: OverlaySplitView,
     query_counter: Rc<RefCell<u32>>,
     tabs: Rc<RefCell<HashMap<u32, QueryTab>>>, // Map query number to tab data
-    explain_callback: Rc<RefCell<Option<ExplainCallback>>>,
-    explain_revealer: Revealer, // Single revealer for all tabs, positioned at top
-    action_bar_callback: Rc<RefCell<Option<ActionBarCallback>>>,
+    history: QueryHistory,
 }
 
 impl QueryTabManager {
@@ -52,15 +52,9 @@ impl QueryTabManager {
         split_view.set_max_sidebar_width(450.0);
         split_view.set_sidebar_width_fraction(0.20);
 
-        // Create sidebar with query history
-        let sidebar = create_query_sidebar(db_name);
-        split_view.set_sidebar(Some(&sidebar));
+        let history = QueryHistory::new(db_name);
+        split_view.set_sidebar(Some(history.widget()));
 
-        // Create main content area with overlay for floating revealer
-        let content_overlay = Overlay::new();
-        content_overlay.set_vexpand(true);
-
-        // Content box with TabBar and TabView (base layer)
         let content_box = Box::new(Orientation::Vertical, 0);
         content_box.set_vexpand(true);
 
@@ -77,64 +71,77 @@ impl QueryTabManager {
         content_box.append(&tab_bar);
         content_box.append(&tab_view);
 
-        // Set content_box as the base child (bottom layer)
-        content_overlay.set_child(Some(&content_box));
+        split_view.set_content(Some(&content_box));
 
-        // Create revealer for EXPLAIN info - floats on top as overlay
-        let explain_revealer = Revealer::new();
-        explain_revealer.set_transition_type(gtk4::RevealerTransitionType::SlideDown);
-        explain_revealer.set_transition_duration(EXPLAIN_ANIMATION_MS);
-        explain_revealer.set_reveal_child(false);
-        explain_revealer.set_valign(gtk4::Align::Start);
-        explain_revealer.set_halign(gtk4::Align::Fill);
-        explain_revealer.set_margin_start(12);
-        explain_revealer.set_margin_end(12);
-        explain_revealer.set_margin_top(EXPLAIN_TOP_MARGIN);
-
-        // Don't let the revealer receive input events when hidden
-        explain_revealer.set_can_target(false);
-
-        // Add revealer as overlay (top layer) - this floats on top without affecting layout
-        content_overlay.add_overlay(&explain_revealer);
-
-        split_view.set_content(Some(&content_overlay));
-
-        Self {
+        let manager = Self {
             _db_name: db_name.to_string(),
             tab_view,
             container: split_view,
             query_counter: Rc::new(RefCell::new(0)),
             tabs: Rc::new(RefCell::new(HashMap::new())),
-            explain_callback: Rc::new(RefCell::new(None)),
-            explain_revealer,
-            action_bar_callback: Rc::new(RefCell::new(None)),
-        }
+            history,
+        };
+
+        let weak_tab_view = manager.tab_view.downgrade();
+        let weak_tabs = Rc::downgrade(&manager.tabs);
+        manager.history.set_open_callback(move |entry| {
+            let Some(tab_view) = weak_tab_view.upgrade() else {
+                return;
+            };
+            let Some(selected_page) = tab_view.selected_page() else {
+                return;
+            };
+            let Some(tabs) = weak_tabs.upgrade() else {
+                return;
+            };
+            let tabs = tabs.borrow();
+            let Some(tab) = tabs.values().find(|tab| tab.page == selected_page) else {
+                return;
+            };
+            tab.output_generation
+                .set(tab.output_generation.get().wrapping_add(1));
+            tab.editor.buffer().set_text(&entry.sql);
+            match &entry.outcome {
+                QueryHistoryOutcome::Success {
+                    result,
+                    explain,
+                    explain_error,
+                    ..
+                } => {
+                    tab.results_scroll.set_child(Some(&create_query_output(
+                        result.as_ref(),
+                        explain.as_ref(),
+                        explain_error.as_deref(),
+                    )));
+                }
+                QueryHistoryOutcome::Failure { error } => {
+                    tab.results_scroll
+                        .set_child(Some(&create_error_page(error)));
+                }
+            }
+            tab.editor.grab_focus();
+        });
+
+        let weak_tabs = Rc::downgrade(&manager.tabs);
+        manager.tab_view.connect_close_page(move |_view, page| {
+            if let Some(tabs) = weak_tabs.upgrade() {
+                let query_num = tabs
+                    .borrow()
+                    .iter()
+                    .find(|(_, tab)| tab.page == *page)
+                    .map(|(query_num, _)| *query_num);
+                if let Some(query_num) = query_num {
+                    tabs.borrow_mut().remove(&query_num);
+                }
+            }
+            glib::Propagation::Proceed
+        });
+
+        manager
     }
 
     pub fn get_widget(&self) -> &OverlaySplitView {
         &self.container
-    }
-
-    /// Set callback for auto-EXPLAIN queries
-    pub fn set_explain_callback<F>(&self, callback: F)
-    where
-        F: Fn(String) + 'static,
-    {
-        *self.explain_callback.borrow_mut() = Some(Rc::new(callback));
-    }
-
-    /// Set callback for action bar updates (text, show_progress)
-    pub fn set_action_bar_callback<F>(&self, callback: F)
-    where
-        F: Fn(&str, bool) + 'static,
-    {
-        *self.action_bar_callback.borrow_mut() = Some(Rc::new(callback));
-    }
-
-    fn update_action_bar(&self, text: &str, show_progress: bool) {
-        if let Some(callback) = self.action_bar_callback.borrow().as_ref() {
-            callback(text, show_progress);
-        }
     }
 
     pub fn new_query_tab(&self) {
@@ -142,7 +149,6 @@ impl QueryTabManager {
         *counter += 1;
         let query_num = *counter;
 
-        // Create query editor with results pane (no revealer per tab anymore)
         let (content, editor, results_scroll) = create_query_editor_pane(query_num);
 
         // Create state manager for this tab
@@ -157,67 +163,13 @@ impl QueryTabManager {
         self.tabs.borrow_mut().insert(
             query_num,
             QueryTab {
+                page: page.clone(),
                 editor: editor.clone(),
                 results_scroll,
                 state_manager,
+                output_generation: Cell::new(0),
             },
         );
-
-        // Add keyboard event controller to highlight query on Ctrl press
-        let key_controller = EventControllerKey::new();
-        let manager_for_highlight = self.clone();
-
-        // Store timer handle to cancel if Ctrl is released early
-        let explain_timer: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
-        let explain_timer_for_press = explain_timer.clone();
-
-        key_controller.connect_key_pressed(move |_controller, key, _code, _modifiers| {
-            // Highlight when Ctrl key itself is pressed
-            if key == gdk::Key::Control_L || key == gdk::Key::Control_R {
-                manager_for_highlight.highlight_query_at_cursor();
-
-                // Update action bar to show preparing EXPLAIN with progress
-                manager_for_highlight.update_action_bar("Preparing EXPLAIN…", true);
-
-                // Start 1-second timer for auto-EXPLAIN
-                let manager_for_timer = manager_for_highlight.clone();
-                let timer_handle_for_callback = explain_timer_for_press.clone();
-                let timer_id = glib::timeout_add_local_once(
-                    std::time::Duration::from_millis(EXPLAIN_DELAY_MS),
-                    move || {
-                        // Clear the timer ID since it has fired
-                        *timer_handle_for_callback.borrow_mut() = None;
-                        manager_for_timer.run_auto_explain();
-                    },
-                );
-                *explain_timer_for_press.borrow_mut() = Some(timer_id);
-            }
-            glib::Propagation::Proceed
-        });
-
-        let manager_for_clear = self.clone();
-        let explain_timer_for_release = explain_timer.clone();
-        key_controller.connect_key_released(move |_controller, key, _code, _modifiers| {
-            // Clear highlight when Ctrl is released
-            if key == gdk::Key::Control_L || key == gdk::Key::Control_R {
-                manager_for_clear.clear_query_highlight();
-
-                // Hide explain revealer when Ctrl is released
-                manager_for_clear.hide_explain_results();
-
-                // Reset action bar to default state
-                manager_for_clear.update_action_bar("Search databases... (Ctrl+K)", false);
-
-                // Cancel auto-EXPLAIN timer if Ctrl released early and timer still pending
-                if let Some(timer_id) = explain_timer_for_release.borrow_mut().take() {
-                    // Only try to remove if the timer hasn't fired yet
-                    // If remove() returns false, the timer already executed
-                    timer_id.remove();
-                }
-            }
-        });
-
-        editor.add_controller(key_controller);
 
         // Select the new tab
         self.tab_view.set_selected_page(&page);
@@ -235,12 +187,16 @@ impl QueryTabManager {
     }
 
     fn current_query_id(&self) -> Option<u32> {
-        self.tab_view
-            .selected_page()?
-            .title()
-            .strip_prefix("Query ")?
-            .parse()
-            .ok()
+        let selected_page = self.tab_view.selected_page()?;
+        self.tabs
+            .borrow()
+            .iter()
+            .find(|(_, tab)| tab.page == selected_page)
+            .map(|(query_num, _)| *query_num)
+    }
+
+    pub fn is_query_selected(&self, query_num: u32) -> bool {
+        self.current_query_id() == Some(query_num)
     }
 
     pub fn current_query(&self) -> Option<(u32, String, QueryStateManager)> {
@@ -259,130 +215,122 @@ impl QueryTabManager {
         Some((query_num, query, tab.state_manager.clone()))
     }
 
-    /// Get the SQL query text from the currently selected tab
-    /// Returns the query at cursor position (split by semicolons)
-    pub fn get_current_query_text(&self) -> Option<String> {
-        self.current_query().map(|(_, query, _)| query)
-    }
-
-    /// Highlight the query that will be executed at the current cursor position
-    pub fn highlight_query_at_cursor(&self) {
-        if let Some(query_num) = self.current_query_id() {
-            let tabs = self.tabs.borrow();
-            if let Some(tab) = tabs.get(&query_num) {
-                let buffer = tab.editor.buffer();
-
-                // Get cursor position
-                let (cursor_iter, _) = buffer.selection_bounds().unwrap_or_else(|| {
-                    let iter = buffer.iter_at_offset(buffer.cursor_position());
-                    (iter, iter)
-                });
-                let cursor_offset = cursor_iter.offset();
-
-                // Get full text
-                let start = buffer.start_iter();
-                let end = buffer.end_iter();
-                let full_text = buffer.text(&start, &end, false).to_string();
-
-                // Extract query at cursor position with range
-                if let Some((_query, start_offset, end_offset)) =
-                    extract_query_at_cursor(&full_text, cursor_offset as usize)
-                {
-                    // Create or get the highlight tag
-                    let tag_table = buffer.tag_table();
-                    let tag = if let Some(existing_tag) = tag_table.lookup("query-highlight") {
-                        existing_tag
-                    } else {
-                        let new_tag = gtk4::TextTag::new(Some("query-highlight"));
-                        // Use a subtle background color for highlighting
-                        new_tag.set_background(Some("rgba(100, 150, 255, 0.15)"));
-                        tag_table.add(&new_tag);
-                        new_tag
-                    };
-
-                    // Remove any existing highlights first
-                    let buffer_start = buffer.start_iter();
-                    let buffer_end = buffer.end_iter();
-                    buffer.remove_tag(&tag, &buffer_start, &buffer_end);
-
-                    // Apply highlight to the query range
-                    let query_start = buffer.iter_at_offset(start_offset as i32);
-                    let query_end = buffer.iter_at_offset(end_offset as i32);
-                    buffer.apply_tag(&tag, &query_start, &query_end);
-                }
-            }
+    pub fn highlight_current_query(&self) -> Option<String> {
+        let query_num = self.current_query_id()?;
+        let tabs = self.tabs.borrow();
+        let tab = tabs.get(&query_num)?;
+        if !tab.editor.has_focus() {
+            return None;
         }
+
+        let buffer = tab.editor.buffer();
+        let (cursor_iter, _) = buffer.selection_bounds().unwrap_or_else(|| {
+            let iter = buffer.iter_at_offset(buffer.cursor_position());
+            (iter, iter)
+        });
+        let full_text = buffer
+            .text(&buffer.start_iter(), &buffer.end_iter(), false)
+            .to_string();
+        let (query, start_offset, end_offset) =
+            extract_query_at_cursor(&full_text, cursor_iter.offset() as usize)?;
+
+        let tag_table = buffer.tag_table();
+        let tag = tag_table.lookup("query-highlight").unwrap_or_else(|| {
+            let tag = gtk4::TextTag::new(Some("query-highlight"));
+            tag.set_background_rgba(Some(&gdk::RGBA::new(0.39, 0.59, 1.0, 0.18)));
+            tag_table.add(&tag);
+            tag
+        });
+        buffer.remove_tag(&tag, &buffer.start_iter(), &buffer.end_iter());
+        buffer.apply_tag(
+            &tag,
+            &buffer.iter_at_offset(start_offset as i32),
+            &buffer.iter_at_offset(end_offset as i32),
+        );
+
+        Some(query)
     }
 
-    /// Clear the query highlight
     pub fn clear_query_highlight(&self) {
-        if let Some(query_num) = self.current_query_id() {
-            let tabs = self.tabs.borrow();
-            if let Some(tab) = tabs.get(&query_num) {
-                let buffer = tab.editor.buffer();
-
-                // Remove highlight tag from entire buffer
-                let tag_table = buffer.tag_table();
-                if let Some(tag) = tag_table.lookup("query-highlight") {
-                    let start = buffer.start_iter();
-                    let end = buffer.end_iter();
-                    buffer.remove_tag(&tag, &start, &end);
-                }
+        let tabs = self.tabs.borrow();
+        for tab in tabs.values() {
+            let buffer = tab.editor.buffer();
+            if let Some(tag) = buffer.tag_table().lookup("query-highlight") {
+                buffer.remove_tag(&tag, &buffer.start_iter(), &buffer.end_iter());
             }
         }
     }
 
-    /// Run auto-EXPLAIN after holding Ctrl for 2 seconds
-    fn run_auto_explain(&self) {
-        if let Some(query_text) = self.get_current_query_text() {
-            // Check if query already starts with EXPLAIN
-            let trimmed = query_text.trim();
-            if trimmed.to_uppercase().starts_with("EXPLAIN") {
-                tracing::info!("Query already contains EXPLAIN, skipping auto-EXPLAIN");
-                return;
-            }
-
-            // Prepend EXPLAIN (FORMAT JSON)
-            let explain_query = format!("EXPLAIN (FORMAT JSON) {}", query_text);
-
-            tracing::info!(
-                "🔍 Auto-EXPLAIN triggered for query: {}",
-                query_text.lines().next().unwrap_or("")
-            );
-
-            // Call the explain callback if set
-            if let Some(callback) = self.explain_callback.borrow().as_ref() {
-                callback(explain_query);
-            } else {
-                tracing::warn!("Auto-EXPLAIN callback not set");
-            }
-        }
-    }
-
-    /// Display query results in a grid (GTK4 ColumnView)
-    pub fn display_results_for(&self, query_num: u32, rows: Vec<tokio_postgres::Row>) {
+    pub fn display_results_for(&self, query_num: u32, rows: Vec<Row>) -> QueryResultSnapshot {
+        let result = result_snapshot(&rows);
         if let Some(tab) = self.tabs.borrow().get(&query_num) {
-            tab.state_manager.finish();
-            let results_widget = create_results_grid(rows);
+            let results_widget = create_results_grid(&result);
             tab.results_scroll.set_child(Some(&results_widget));
         }
+        bounded_result_snapshot(&result)
+    }
+
+    pub fn display_explain_for(
+        &self,
+        query_num: u32,
+        output_generation: u64,
+        explain: Option<&serde_json::Value>,
+        explain_error: Option<&str>,
+    ) {
+        let Some(results_scroll) = self
+            .tabs
+            .borrow()
+            .get(&query_num)
+            .filter(|tab| tab.output_generation.get() == output_generation)
+            .map(|tab| tab.results_scroll.clone())
+        else {
+            return;
+        };
+        let Some(content) = results_scroll
+            .child()
+            .and_then(|child| child.downcast::<Box>().ok())
+        else {
+            return;
+        };
+        append_explain(&content, explain, explain_error);
     }
 
     /// Show error message in results area
     pub fn display_error_for(&self, query_num: u32, error: &str) {
         if let Some(tab) = self.tabs.borrow().get(&query_num) {
-            tab.state_manager.finish();
-            let error_page = adw::StatusPage::new();
-            error_page.set_icon_name(Some("dialog-error-symbolic"));
-            error_page.set_title("Query Failed");
-            error_page.set_description(Some(error));
-            tab.results_scroll.set_child(Some(&error_page));
+            tab.results_scroll
+                .set_child(Some(&create_error_page(error)));
         }
     }
 
+    pub fn record_query_success(
+        &self,
+        sql: String,
+        duration: Duration,
+        rows: usize,
+        result: QueryResultSnapshot,
+        explain: Option<serde_json::Value>,
+        explain_error: Option<String>,
+    ) {
+        self.history.add(QueryHistoryEntry::success(
+            sql,
+            duration,
+            rows,
+            result,
+            explain,
+            explain_error,
+        ));
+    }
+
+    pub fn record_query_failure(&self, sql: String, error: String) {
+        self.history.add(QueryHistoryEntry::failure(sql, error));
+    }
+
     /// Show loading state in results area
-    pub fn show_loading_for(&self, query_num: u32) {
+    pub fn show_loading_for(&self, query_num: u32) -> Option<u64> {
         if let Some(tab) = self.tabs.borrow().get(&query_num) {
+            let output_generation = tab.output_generation.get().wrapping_add(1);
+            tab.output_generation.set(output_generation);
             let loading_page = adw::StatusPage::new();
             loading_page.set_icon_name(Some("content-loading-symbolic"));
             loading_page.set_title("Running Query...");
@@ -392,6 +340,9 @@ impl QueryTabManager {
             spinner.set_size_request(48, 48);
             loading_page.set_child(Some(&spinner));
             tab.results_scroll.set_child(Some(&loading_page));
+            Some(output_generation)
+        } else {
+            None
         }
     }
 
@@ -403,62 +354,120 @@ impl QueryTabManager {
     pub fn is_sidebar_visible(&self) -> bool {
         self.container.shows_sidebar()
     }
+}
 
-    /// Display EXPLAIN results in the fancy top slider
-    pub fn show_explain_results(&self, json_value: &serde_json::Value) {
-        // Extract EXPLAIN stats
-        let (rows_estimate, first_cost, last_cost) = extract_explain_stats(json_value);
+fn create_query_output(
+    result: Option<&QueryResultSnapshot>,
+    explain: Option<&serde_json::Value>,
+    explain_error: Option<&str>,
+) -> Box {
+    let content = result.map_or_else(
+        || {
+            let content = Box::new(Orientation::Vertical, 0);
+            content.append(&create_results_unavailable());
+            content
+        },
+        create_results_grid,
+    );
+    append_explain(&content, explain, explain_error);
+    content
+}
 
-        // Create info box with stats
-        let info_box = Box::new(Orientation::Horizontal, 12);
-        info_box.set_margin_start(12);
-        info_box.set_margin_end(12);
-        info_box.set_margin_top(8);
-        info_box.set_margin_bottom(8);
-        info_box.add_css_class("card");
-        info_box.add_css_class("toolbar");
-
-        let explain_icon = Label::new(Some("🔍"));
-        explain_icon.add_css_class("title-3");
-        info_box.append(&explain_icon);
-
-        let title_label = Label::new(Some("Query Plan"));
-        title_label.add_css_class("title-4");
-        title_label.set_halign(gtk4::Align::Start);
-        info_box.append(&title_label);
-
-        // Add spacer
-        let spacer = Box::new(Orientation::Horizontal, 0);
-        spacer.set_hexpand(true);
-        info_box.append(&spacer);
-
-        // Stats
-        let stats_box = Box::new(Orientation::Horizontal, 20);
-
-        let rows_label = Label::new(Some(&format!("📊 ~{} rows", rows_estimate)));
-        rows_label.add_css_class("dim-label");
-        stats_box.append(&rows_label);
-
-        let cost_label = Label::new(Some(&format!(
-            "💰 Cost: {:.2}..{:.2}",
-            first_cost, last_cost
-        )));
-        cost_label.add_css_class("dim-label");
-        stats_box.append(&cost_label);
-
-        info_box.append(&stats_box);
-
-        // Set the info box as the revealer's child
-        self.explain_revealer.set_child(Some(&info_box));
-
-        // Reveal with animation
-        self.explain_revealer.set_reveal_child(true);
+fn append_explain(content: &Box, explain: Option<&serde_json::Value>, explain_error: Option<&str>) {
+    if let Some(explain) = explain {
+        content.append(&create_explain_section(explain));
+    } else if let Some(error) = explain_error {
+        content.append(&create_explain_error(error));
     }
+}
 
-    /// Hide EXPLAIN results slider
-    pub fn hide_explain_results(&self) {
-        self.explain_revealer.set_reveal_child(false);
-    }
+fn create_explain_section(json_value: &serde_json::Value) -> Box {
+    let (rows_estimate, first_cost, last_cost) = extract_explain_stats(json_value);
+
+    let section = Box::new(Orientation::Vertical, 8);
+    section.set_margin_start(12);
+    section.set_margin_end(12);
+    section.set_margin_top(12);
+    section.set_margin_bottom(12);
+    section.add_css_class("card");
+
+    let info_box = Box::new(Orientation::Horizontal, 12);
+    info_box.set_margin_start(12);
+    info_box.set_margin_end(12);
+    info_box.set_margin_top(8);
+    info_box.set_margin_bottom(4);
+
+    let explain_icon = Label::new(Some("🔍"));
+    explain_icon.add_css_class("title-3");
+    info_box.append(&explain_icon);
+
+    let title_label = Label::new(Some("Query Plan"));
+    title_label.add_css_class("title-4");
+    title_label.set_halign(gtk4::Align::Start);
+    info_box.append(&title_label);
+
+    let spacer = Box::new(Orientation::Horizontal, 0);
+    spacer.set_hexpand(true);
+    info_box.append(&spacer);
+
+    let stats_box = Box::new(Orientation::Horizontal, 20);
+
+    let rows_label = Label::new(Some(&format!("📊 ~{} rows", rows_estimate)));
+    rows_label.add_css_class("dim-label");
+    stats_box.append(&rows_label);
+
+    let cost_label = Label::new(Some(&format!(
+        "💰 Cost: {:.2}..{:.2}",
+        first_cost, last_cost
+    )));
+    cost_label.add_css_class("dim-label");
+    stats_box.append(&cost_label);
+
+    info_box.append(&stats_box);
+
+    let plan = serde_json::to_string_pretty(json_value).unwrap_or_else(|_| json_value.to_string());
+    let plan_label = Label::new(Some(&plan));
+    plan_label.set_halign(gtk4::Align::Fill);
+    plan_label.set_xalign(0.0);
+    plan_label.set_selectable(true);
+    plan_label.add_css_class("monospace");
+    plan_label.set_margin_start(12);
+    plan_label.set_margin_end(12);
+    plan_label.set_margin_bottom(8);
+
+    section.append(&info_box);
+    section.append(&gtk4::Separator::new(Orientation::Horizontal));
+    section.append(&plan_label);
+    section
+}
+
+fn create_explain_error(error: &str) -> Box {
+    let section = Box::new(Orientation::Vertical, 4);
+    section.set_margin_start(12);
+    section.set_margin_end(12);
+    section.set_margin_top(12);
+    section.set_margin_bottom(12);
+    section.add_css_class("card");
+
+    let title = Label::new(Some("Query Plan Unavailable"));
+    title.set_halign(gtk4::Align::Start);
+    title.add_css_class("heading");
+    title.set_margin_start(12);
+    title.set_margin_end(12);
+    title.set_margin_top(8);
+
+    let detail = Label::new(Some(error));
+    detail.set_halign(gtk4::Align::Start);
+    detail.set_xalign(0.0);
+    detail.set_wrap(true);
+    detail.add_css_class("dim-label");
+    detail.set_margin_start(12);
+    detail.set_margin_end(12);
+    detail.set_margin_bottom(8);
+
+    section.append(&title);
+    section.append(&detail);
+    section
 }
 
 /// Extract key statistics from EXPLAIN JSON output
@@ -670,11 +679,110 @@ fn create_results_placeholder() -> adw::StatusPage {
     status_page
 }
 
-/// Create a ColumnView grid to display PostgreSQL query results
-fn create_results_grid(rows: Vec<tokio_postgres::Row>) -> Box {
+fn create_results_unavailable() -> adw::StatusPage {
+    let status_page = adw::StatusPage::new();
+    status_page.set_icon_name(Some("document-open-recent-symbolic"));
+    status_page.set_title("Results Not Stored");
+    status_page.set_description(Some("This history entry predates stored result snapshots"));
+    status_page
+}
+
+fn create_error_page(error: &str) -> adw::StatusPage {
+    let error_page = adw::StatusPage::new();
+    error_page.set_icon_name(Some("dialog-error-symbolic"));
+    error_page.set_title("Query Failed");
+    error_page.set_description(Some(error));
+    error_page
+}
+
+const MAX_HISTORY_RESULT_ROWS: usize = 200;
+const MAX_HISTORY_RESULT_BYTES: usize = 1_000_000;
+
+fn result_snapshot(rows: &[Row]) -> QueryResultSnapshot {
+    let columns = rows
+        .first()
+        .map(|row| {
+            row.columns()
+                .iter()
+                .map(|column| column.name().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    let data = rows
+        .iter()
+        .map(|row| {
+            row.columns()
+                .iter()
+                .enumerate()
+                .map(|(index, column)| display_value(row, index, column.type_().name()))
+                .collect()
+        })
+        .collect();
+    QueryResultSnapshot {
+        columns,
+        rows: data,
+        total_rows: rows.len(),
+    }
+}
+
+fn display_value(row: &Row, index: usize, type_name: &str) -> String {
+    if let Ok(Some(value)) = row.try_get::<_, Option<String>>(index) {
+        value
+    } else if let Ok(None) = row.try_get::<_, Option<String>>(index) {
+        "NULL".to_string()
+    } else if let Ok(value) = row.try_get::<_, Option<i32>>(index) {
+        value
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "NULL".to_string())
+    } else if let Ok(value) = row.try_get::<_, Option<i64>>(index) {
+        value
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "NULL".to_string())
+    } else if let Ok(value) = row.try_get::<_, Option<f64>>(index) {
+        value
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "NULL".to_string())
+    } else if let Ok(value) = row.try_get::<_, Option<bool>>(index) {
+        value
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "NULL".to_string())
+    } else if let Ok(value) = row.try_get::<_, Option<serde_json::Value>>(index) {
+        value
+            .map(|json| serde_json::to_string_pretty(&json).unwrap_or_else(|_| json.to_string()))
+            .unwrap_or_else(|| "NULL".to_string())
+    } else {
+        format!("<{}>", type_name)
+    }
+}
+
+fn bounded_result_snapshot(result: &QueryResultSnapshot) -> QueryResultSnapshot {
+    let mut stored_bytes = result.columns.iter().map(String::len).sum::<usize>();
+    let rows = result
+        .rows
+        .iter()
+        .take(MAX_HISTORY_RESULT_ROWS)
+        .take_while(|row| {
+            let row_bytes = row.iter().map(String::len).sum::<usize>();
+            if stored_bytes.saturating_add(row_bytes) > MAX_HISTORY_RESULT_BYTES {
+                false
+            } else {
+                stored_bytes += row_bytes;
+                true
+            }
+        })
+        .cloned()
+        .collect();
+    QueryResultSnapshot {
+        columns: result.columns.clone(),
+        rows,
+        total_rows: result.total_rows,
+    }
+}
+
+fn create_results_grid(result: &QueryResultSnapshot) -> Box {
     let container = Box::new(Orientation::Vertical, 0);
 
-    if rows.is_empty() {
+    if result.total_rows == 0 {
         let empty_page = adw::StatusPage::new();
         empty_page.set_icon_name(Some("emblem-ok-symbolic"));
         empty_page.set_title("Query Successful");
@@ -683,63 +791,18 @@ fn create_results_grid(rows: Vec<tokio_postgres::Row>) -> Box {
         return container;
     }
 
-    // Get column names from first row
-    let columns = rows[0].columns();
-
-    // Convert rows to Vec<Vec<String>> for display
-    let mut data: Vec<Vec<String>> = Vec::new();
-    for row in &rows {
-        let mut row_data = Vec::new();
-        for (i, column) in columns.iter().enumerate() {
-            let display_value = if let Ok(Some(s)) = row.try_get::<_, Option<String>>(i) {
-                s
-            } else if let Ok(None) = row.try_get::<_, Option<String>>(i) {
-                "NULL".to_string()
-            } else if let Ok(v) = row.try_get::<_, Option<i32>>(i) {
-                v.map(|n| n.to_string())
-                    .unwrap_or_else(|| "NULL".to_string())
-            } else if let Ok(v) = row.try_get::<_, Option<i64>>(i) {
-                v.map(|n| n.to_string())
-                    .unwrap_or_else(|| "NULL".to_string())
-            } else if let Ok(v) = row.try_get::<_, Option<f64>>(i) {
-                v.map(|n| n.to_string())
-                    .unwrap_or_else(|| "NULL".to_string())
-            } else if let Ok(v) = row.try_get::<_, Option<bool>>(i) {
-                v.map(|b| b.to_string())
-                    .unwrap_or_else(|| "NULL".to_string())
-            } else if let Ok(v) = row.try_get::<_, Option<serde_json::Value>>(i) {
-                // Handle JSON - pretty print it
-                v.map(|json| {
-                    serde_json::to_string_pretty(&json).unwrap_or_else(|_| json.to_string())
-                })
-                .unwrap_or_else(|| "NULL".to_string())
-            } else {
-                // Fallback for unknown types
-                format!("<{}>", column.type_().name())
-            };
-            row_data.push(display_value);
-        }
-        data.push(row_data);
-    }
-
-    // Create model with all data as strings (simple approach)
     let string_list = StringList::new(&[]);
-    for row_data in &data {
-        string_list.append(&row_data.join("\t"));
+    for row in &result.rows {
+        string_list.append(&serde_json::to_string(row).unwrap_or_default());
     }
 
-    let selection_model = SingleSelection::new(Some(string_list.clone()));
-
-    // Create ColumnView
+    let selection_model = SingleSelection::new(Some(string_list));
     let column_view = ColumnView::new(Some(selection_model));
     column_view.set_show_column_separators(true);
     column_view.set_show_row_separators(true);
 
-    let selection_model = SingleSelection::new(Some(string_list));
-    column_view.set_model(Some(&selection_model));
-
     // Add columns
-    for (col_idx, column) in columns.iter().enumerate() {
+    for (col_idx, column) in result.columns.iter().enumerate() {
         let factory = SignalListItemFactory::new();
 
         factory.connect_setup(move |_, list_item| {
@@ -762,8 +825,8 @@ fn create_results_grid(rows: Vec<tokio_postgres::Row>) -> Box {
                 .and_then(|o| o.downcast::<gtk4::StringObject>().ok())
             {
                 let full_text = string_obj.string().to_string();
-                let parts: Vec<&str> = full_text.split('\t').collect();
-                if let Some(cell_text) = parts.get(col_idx)
+                let row: Vec<String> = serde_json::from_str(&full_text).unwrap_or_default();
+                if let Some(cell_text) = row.get(col_idx)
                     && let Some(label) = item.child().and_then(|c| c.downcast::<Label>().ok())
                 {
                     label.set_text(cell_text);
@@ -771,7 +834,7 @@ fn create_results_grid(rows: Vec<tokio_postgres::Row>) -> Box {
             }
         });
 
-        let col = ColumnViewColumn::new(Some(column.name()), Some(factory));
+        let col = ColumnViewColumn::new(Some(column), Some(factory));
         col.set_resizable(true);
         col.set_expand(true);
         column_view.append_column(&col);
@@ -785,7 +848,16 @@ fn create_results_grid(rows: Vec<tokio_postgres::Row>) -> Box {
     header.set_margin_bottom(6);
     header.add_css_class("toolbar");
 
-    let row_count_label = Label::new(Some(&format!("📊 {} rows returned", rows.len())));
+    let row_count = if result.rows.len() == result.total_rows {
+        format!("📊 {} rows returned", result.total_rows)
+    } else {
+        format!(
+            "📊 {} of {} rows stored",
+            result.rows.len(),
+            result.total_rows
+        )
+    };
+    let row_count_label = Label::new(Some(&row_count));
     row_count_label.add_css_class("dim-label");
     row_count_label.add_css_class("caption");
     header.append(&row_count_label);
@@ -826,19 +898,45 @@ ORDER BY created_at DESC;"
 mod tests {
     use super::*;
 
-    #[gtk4::test]
-    #[ignore = "requires a graphical display"]
-    fn completion_is_applied_to_the_query_that_started_it() {
-        let manager = QueryTabManager::new("test");
-        manager.new_query_tab();
-        let first_state = manager.tabs.borrow().get(&1).unwrap().state_manager.clone();
-        assert!(first_state.try_start());
+    #[test]
+    fn extracts_the_query_at_the_cursor() {
+        let sql = "SELECT 1;\n\nSELECT 2;";
 
-        manager.new_query_tab();
-        assert_eq!(manager.current_query_id(), Some(2));
-        manager.display_error_for(1, "failed");
+        assert_eq!(extract_query_at_cursor(sql, 3).unwrap().0, "SELECT 1");
+        assert_eq!(extract_query_at_cursor(sql, 13).unwrap().0, "SELECT 2");
+        assert_eq!(extract_query_at_cursor(sql, 9).unwrap().0, "SELECT 1");
+    }
 
-        assert!(first_state.try_start());
-        assert_eq!(manager.current_query_id(), Some(2));
+    #[test]
+    fn stored_results_are_bounded() {
+        let result = QueryResultSnapshot {
+            columns: vec!["value".to_string()],
+            rows: (0..MAX_HISTORY_RESULT_ROWS + 1)
+                .map(|index| vec![index.to_string()])
+                .collect(),
+            total_rows: MAX_HISTORY_RESULT_ROWS + 1,
+        };
+
+        let stored = bounded_result_snapshot(&result);
+
+        assert_eq!(stored.rows.len(), MAX_HISTORY_RESULT_ROWS);
+        assert_eq!(stored.total_rows, MAX_HISTORY_RESULT_ROWS + 1);
+    }
+
+    #[test]
+    fn stored_results_respect_the_size_limit() {
+        let result = QueryResultSnapshot {
+            columns: vec!["value".to_string()],
+            rows: vec![
+                vec!["a".repeat(MAX_HISTORY_RESULT_BYTES)],
+                vec!["second".to_string()],
+            ],
+            total_rows: 2,
+        };
+
+        let stored = bounded_result_snapshot(&result);
+
+        assert!(stored.rows.is_empty());
+        assert_eq!(stored.total_rows, 2);
     }
 }

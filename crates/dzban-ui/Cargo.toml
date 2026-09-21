@@ -37,9 +37,6 @@ tokio.workspace = true
 serde.workspace = true
 toml.workspace = true
 
-# Direct postgres for connection testing (TODO: should use dzban-db)
-tokio-postgres.workspace = true
-
 # Logging
 tracing.workspace = true
 tracing-subscriber.workspace = true

@@ -1,7 +1,7 @@
 mod connection_state;
 mod connections;
-mod constants;
 mod db_tabs;
+mod query_history;
 mod query_state;
 mod query_tabs;
 mod shortcuts;

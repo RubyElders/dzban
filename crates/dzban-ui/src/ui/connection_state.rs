@@ -1,15 +1,12 @@
 use dzban_db::ConnectionState;
 use gtk4::prelude::*;
 use gtk4::{Box, Label, Orientation};
-use std::cell::RefCell;
-use std::rc::Rc;
 
 /// A reusable widget showing connection state with a colored dot
 pub struct ConnectionStateWidget {
     container: Box,
     status_dot: Label,
     status_text: Label,
-    state: Rc<RefCell<ConnectionState>>,
 }
 
 impl ConnectionStateWidget {
@@ -25,6 +22,8 @@ impl ConnectionStateWidget {
         let status_text = Label::new(Some("Not connected"));
         status_text.add_css_class("caption");
         status_text.add_css_class("dim-label");
+        status_text.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        status_text.set_max_width_chars(80);
 
         container.append(&status_dot);
         container.append(&status_text);
@@ -33,13 +32,11 @@ impl ConnectionStateWidget {
             container,
             status_dot,
             status_text,
-            state: Rc::new(RefCell::new(ConnectionState::Disconnected)),
         }
     }
 
     pub fn update_state(&self, state: ConnectionState, text: Option<&str>) {
-        *self.state.borrow_mut() = state;
-
+        self.status_text.set_tooltip_text(None);
         // Remove all color classes
         self.status_dot.remove_css_class("success");
         self.status_dot.remove_css_class("warning");
@@ -71,17 +68,13 @@ impl ConnectionStateWidget {
                 self.status_dot.add_css_class("error");
                 self.status_text.add_css_class("error");
                 self.status_text.set_text(text.unwrap_or("Error"));
+                self.status_text.set_tooltip_text(text);
             }
         }
     }
 
     pub fn get_widget(&self) -> &Box {
         &self.container
-    }
-
-    #[allow(dead_code)]
-    pub fn get_state(&self) -> ConnectionState {
-        *self.state.borrow()
     }
 }
 
@@ -91,7 +84,6 @@ impl Clone for ConnectionStateWidget {
             container: self.container.clone(),
             status_dot: self.status_dot.clone(),
             status_text: self.status_text.clone(),
-            state: Rc::clone(&self.state),
         }
     }
 }
