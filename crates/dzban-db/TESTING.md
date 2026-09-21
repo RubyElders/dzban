@@ -24,21 +24,13 @@ The Compose setup provides PostgreSQL 15, 16, and 17 on ports 5415, 5416, and 54
 
 The integration suite covers connections, pings, multi-version configuration, parallel queries, returned rows, execution timing, query state, errors, and cancellation.
 
-## GTK widget test
-
-The query-routing regression test needs a display:
-
-```bash
-xvfb-run -a cargo test -p dzban-ui --bin dzban -- --ignored
-```
-
-If Xvfb cannot create its socket, verify the ownership and permissions of `/tmp/.X11-unix`.
-
 ## Required checks
 
 ```bash
+cargo +1.88.0 check --workspace --all-targets
 cargo check --workspace --all-targets
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets
+cargo fmt --all -- --check
 git diff --check
 ```

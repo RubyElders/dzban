@@ -1,0 +1,3 @@
+interface:
+  display_name: "Dzban Testing"
+  short_description: "Run Dzban Rust and PostgreSQL tests"
