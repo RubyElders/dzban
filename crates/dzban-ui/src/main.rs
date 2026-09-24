@@ -20,7 +20,7 @@ fn main() {
         .with_line_number(true)
         .init();
 
-    tracing::info!("🚀 Starting Dzban PostgreSQL Client");
+    tracing::info!("Starting Dzban PostgreSQL Client");
 
     // Initialize Adwaita
     adw::init().expect("Failed to initialize Adwaita");

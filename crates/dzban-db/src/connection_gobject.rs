@@ -214,7 +214,7 @@ impl DbConnection {
             self.imp().state.set(new_state);
             self.notify("state");
             self.emit_by_name::<()>("state-changed", &[&old_state, &new_state]);
-            debug!("Connection state: {:?} → {:?}", old_state, new_state);
+            debug!("Connection state: {:?} -> {:?}", old_state, new_state);
         }
     }
 
@@ -283,7 +283,7 @@ impl DbConnection {
         glib::MainContext::ref_thread_default().spawn_local(async move {
             match rx.await {
                 Ok(Ok(db_conn)) => {
-                    info!("✅ Connected successfully");
+                    info!("Connected successfully");
 
                     match db_conn.get_version().await {
                         Ok(version) => {
@@ -305,13 +305,13 @@ impl DbConnection {
                 }
                 Ok(Err(e)) => {
                     let error_msg = format!("Connection failed: {}", e);
-                    error!("❌ {}", error_msg);
+                    error!("{}", error_msg);
                     this.set_state(ConnectionState::Error);
                     this.set_last_error(error_msg);
                 }
                 Err(_) => {
                     let error_msg = "Connection cancelled".to_string();
-                    error!("❌ {}", error_msg);
+                    error!("{}", error_msg);
                     this.set_state(ConnectionState::Error);
                     this.set_last_error(error_msg);
                 }
@@ -344,7 +344,7 @@ impl DbConnection {
         self.set_version(None);
         self.set_latency_micros(-1);
         self.set_last_error(String::new());
-        debug!("✅ Disconnected");
+        debug!("Disconnected");
     }
 
     /// Ping the database to check connectivity and measure latency
@@ -374,7 +374,7 @@ impl DbConnection {
 
             match rx.await {
                 Ok(Ok((latency_micros, _))) => {
-                    trace!("Ping successful: {} µs", latency_micros);
+                    trace!("Ping successful: {} us", latency_micros);
 
                     this.set_latency_micros(latency_micros as i64);
                     this.increment_ping_count();
@@ -382,7 +382,7 @@ impl DbConnection {
                 }
                 Ok(Err(e)) => {
                     let error_msg = format!("Ping failed: {}", e);
-                    error!("❌ {}", error_msg);
+                    error!("{}", error_msg);
 
                     this.set_state(ConnectionState::Error);
                     this.set_last_error(error_msg.clone());
@@ -390,7 +390,7 @@ impl DbConnection {
                 }
                 Err(_) => {
                     let error_msg = "Ping cancelled".to_string();
-                    error!("❌ {}", error_msg);
+                    error!("{}", error_msg);
                     this.emit_by_name::<()>("ping-failed", &[&error_msg]);
                 }
             }

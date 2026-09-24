@@ -83,7 +83,7 @@ impl Config {
         if local_path.exists() {
             let config = Self::load_from_path(local_path)?;
             info!(
-                "✅ Loaded config from local dzban.toml ({} databases)",
+                "Loaded config from local dzban.toml ({} databases)",
                 config.databases.len()
             );
             return Ok(config);
@@ -91,7 +91,7 @@ impl Config {
 
         if let Some(config) = Self::load_from_xdg()? {
             info!(
-                "✅ Loaded config from XDG directory ({} databases)",
+                "Loaded config from XDG directory ({} databases)",
                 config.databases.len()
             );
             return Ok(config);
