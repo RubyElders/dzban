@@ -44,12 +44,15 @@ pub struct Statusbar {
 
 impl Statusbar {
     pub fn new() -> Self {
+        let container = Box::new(Orientation::Vertical, 0);
+        container.add_css_class("toolbar");
+        container.add_css_class("workspace-statusbar");
+
         let statusbar = Box::new(Orientation::Horizontal, 12);
         statusbar.set_margin_start(12);
         statusbar.set_margin_end(12);
         statusbar.set_margin_top(6);
         statusbar.set_margin_bottom(6);
-        statusbar.add_css_class("toolbar");
 
         // Connection status with state widget
         let connection_widget = ConnectionStateWidget::new();
@@ -95,9 +98,10 @@ impl Statusbar {
         server_version.add_css_class("dim-label");
         server_version.add_css_class("caption");
         statusbar.append(&server_version);
+        container.append(&statusbar);
 
         Self {
-            container: statusbar,
+            container,
             connection_widget,
             exec_time,
             rows_info,

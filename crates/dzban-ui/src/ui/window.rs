@@ -4,8 +4,69 @@ use gtk4::prelude::*;
 use libadwaita as adw;
 
 use super::db_tabs::{DatabaseTabManager, QueryPreviewState};
+use super::plan_inspector::PlanScroll;
 use super::shortcuts;
+use super::shortcuts::ShortcutAction;
 use super::statusbar::create_statusbar;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreviewKeyAction {
+    Begin { show_plan: bool },
+    ShowPlan,
+    HidePlan,
+    Cancel,
+    Scroll(PlanScroll),
+}
+
+fn relevant_modifiers(modifiers: gtk4::gdk::ModifierType) -> gtk4::gdk::ModifierType {
+    modifiers
+        & (gtk4::gdk::ModifierType::CONTROL_MASK
+            | gtk4::gdk::ModifierType::SHIFT_MASK
+            | gtk4::gdk::ModifierType::ALT_MASK)
+}
+
+fn plan_scroll(key: gtk4::gdk::Key) -> Option<PlanScroll> {
+    match key {
+        gtk4::gdk::Key::Up => Some(PlanScroll::LineUp),
+        gtk4::gdk::Key::Down => Some(PlanScroll::LineDown),
+        gtk4::gdk::Key::Page_Up => Some(PlanScroll::PageUp),
+        gtk4::gdk::Key::Page_Down => Some(PlanScroll::PageDown),
+        _ => None,
+    }
+}
+
+fn preview_key_pressed(
+    key: gtk4::gdk::Key,
+    modifiers: gtk4::gdk::ModifierType,
+) -> Option<PreviewKeyAction> {
+    let modifiers = relevant_modifiers(modifiers);
+    if key == gtk4::gdk::Key::Control_L || key == gtk4::gdk::Key::Control_R {
+        return Some(PreviewKeyAction::Begin {
+            show_plan: modifiers.contains(gtk4::gdk::ModifierType::SHIFT_MASK),
+        });
+    }
+    if (key == gtk4::gdk::Key::Shift_L || key == gtk4::gdk::Key::Shift_R)
+        && modifiers.contains(gtk4::gdk::ModifierType::CONTROL_MASK)
+    {
+        return Some(PreviewKeyAction::ShowPlan);
+    }
+    if modifiers == (gtk4::gdk::ModifierType::CONTROL_MASK | gtk4::gdk::ModifierType::SHIFT_MASK)
+        || modifiers.is_empty()
+    {
+        return plan_scroll(key).map(PreviewKeyAction::Scroll);
+    }
+    None
+}
+
+fn preview_key_released(key: gtk4::gdk::Key) -> Option<PreviewKeyAction> {
+    if key == gtk4::gdk::Key::Shift_L || key == gtk4::gdk::Key::Shift_R {
+        Some(PreviewKeyAction::HidePlan)
+    } else if key == gtk4::gdk::Key::Control_L || key == gtk4::gdk::Key::Control_R {
+        Some(PreviewKeyAction::Cancel)
+    } else {
+        None
+    }
+}
 
 pub fn build_ui(app: &Application) {
     install_styles();
@@ -31,34 +92,45 @@ pub fn build_ui(app: &Application) {
     let db_tab_manager = DatabaseTabManager::new(statusbar.clone());
     let content = db_tab_manager.get_widget().clone();
 
+    let shortcuts_dialog = shortcuts::create_shortcuts_window();
+
     // Create header bar with search/action bar and controls
-    let (header, search_entry) = create_header_bar(&db_tab_manager, &toast_overlay);
+    let (header, search_entry) =
+        create_header_bar(&db_tab_manager, &toast_overlay, &window, &shortcuts_dialog);
     toolbar_view.add_top_bar(&header);
 
     let query_preview_controller = gtk4::EventControllerKey::new();
     query_preview_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
     let db_manager_for_preview = db_tab_manager.clone();
     query_preview_controller.connect_key_pressed(move |_, key, _, modifiers| {
-        if key == gtk4::gdk::Key::Control_L || key == gtk4::gdk::Key::Control_R {
-            db_manager_for_preview.begin_query_preview();
-        } else if modifiers.contains(gtk4::gdk::ModifierType::CONTROL_MASK)
-            && key != gtk4::gdk::Key::Return
-            && key != gtk4::gdk::Key::KP_Enter
-        {
-            db_manager_for_preview.cancel_query_preview();
+        match preview_key_pressed(key, modifiers) {
+            Some(PreviewKeyAction::Begin { show_plan }) => {
+                db_manager_for_preview.begin_query_preview();
+                if show_plan {
+                    db_manager_for_preview.show_query_plan();
+                }
+            }
+            Some(PreviewKeyAction::ShowPlan) => {
+                db_manager_for_preview.show_query_plan();
+            }
+            Some(PreviewKeyAction::Scroll(direction))
+                if db_manager_for_preview.scroll_query_plan(direction) =>
+            {
+                return gtk4::glib::Propagation::Stop;
+            }
+            _ => {}
         }
         gtk4::glib::Propagation::Proceed
     });
     let db_manager_for_preview = db_tab_manager.clone();
     query_preview_controller.connect_key_released(move |_, key, _, _| {
-        if key == gtk4::gdk::Key::Control_L || key == gtk4::gdk::Key::Control_R {
-            db_manager_for_preview.cancel_query_preview();
+        match preview_key_released(key) {
+            Some(PreviewKeyAction::HidePlan) => db_manager_for_preview.hide_query_plan(),
+            Some(PreviewKeyAction::Cancel) => db_manager_for_preview.cancel_query_preview(),
+            _ => {}
         }
     });
     window.add_controller(query_preview_controller);
-
-    // Create shortcuts dialog (persistent, shown/hidden on demand)
-    let shortcuts_dialog = shortcuts::create_shortcuts_window();
 
     // Setup keyboard shortcuts using unified system
     let search_entry_for_shortcuts = search_entry.clone();
@@ -66,36 +138,26 @@ pub fn build_ui(app: &Application) {
     let window_for_shortcuts = window.clone();
     let shortcuts_dialog_for_shortcut = shortcuts_dialog.clone();
 
-    let key_controller = shortcuts::create_controller(move |shortcut_id| match shortcut_id {
-        "search_focus" => {
-            db_manager_for_shortcuts.cancel_query_preview();
-            search_entry_for_shortcuts.grab_focus();
-            true
-        }
-        "run_query" => {
-            db_manager_for_shortcuts.cancel_query_preview();
-            db_manager_for_shortcuts.run_current_query();
-            true
-        }
-        "stop_query" => {
-            db_manager_for_shortcuts.cancel_current_query();
-            true
-        }
-        "new_query_tab" => {
-            db_manager_for_shortcuts.new_query_in_current_db();
-            true
-        }
-        "show_shortcuts" => {
-            shortcuts_dialog_for_shortcut.present(Some(&window_for_shortcuts));
-            true
-        }
-        _ => false,
+    let key_controller = shortcuts::create_controller(move |action| {
+        execute_shortcut_action(
+            action,
+            &db_manager_for_shortcuts,
+            &search_entry_for_shortcuts,
+            &window_for_shortcuts,
+            &shortcuts_dialog_for_shortcut,
+        )
     });
     window.add_controller(key_controller);
 
     // Add keyboard icon button to header bar to show shortcuts
     let shortcuts_button = gtk4::Button::from_icon_name("input-keyboard-symbolic");
-    shortcuts_button.set_tooltip_text(Some("Keyboard Shortcuts (Ctrl+?)"));
+    shortcuts_button.set_tooltip_text(Some(
+        &shortcuts::shortcut(ShortcutAction::ShowShortcuts).tooltip(),
+    ));
+    shortcuts_button.update_property(&[
+        gtk4::accessible::Property::Label("Keyboard shortcuts"),
+        gtk4::accessible::Property::KeyShortcuts("Control+Shift+question"),
+    ]);
     let shortcuts_dialog_for_button = shortcuts_dialog.clone();
     let window_for_button = window.clone();
     shortcuts_button.connect_clicked(move |_| {
@@ -104,9 +166,13 @@ pub fn build_ui(app: &Application) {
     header.pack_end(&shortcuts_button);
 
     toast_overlay.set_child(Some(&content));
-    toolbar_view.set_content(Some(&toast_overlay));
+    toast_overlay.set_vexpand(true);
 
-    toolbar_view.add_bottom_bar(statusbar.get_widget());
+    let workspace = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    workspace.set_vexpand(true);
+    workspace.append(&toast_overlay);
+    workspace.append(statusbar.get_widget());
+    toolbar_view.set_content(Some(&workspace));
 
     window.set_content(Some(&toolbar_view));
 
@@ -114,6 +180,144 @@ pub fn build_ui(app: &Application) {
     setup_toasts(&toast_overlay);
 
     window.present();
+    let manager_for_initial_focus = db_tab_manager;
+    let window_for_initial_focus = window.clone();
+    glib::timeout_add_local_once(std::time::Duration::from_millis(100), move || {
+        if let Some(row) = manager_for_initial_focus.selected_connection_row() {
+            gtk4::prelude::GtkWindowExt::set_focus(&window_for_initial_focus, Some(&row));
+        }
+    });
+}
+
+fn execute_shortcut_action(
+    action: ShortcutAction,
+    db_manager: &DatabaseTabManager,
+    search_entry: &gtk4::Entry,
+    window: &ApplicationWindow,
+    shortcuts_dialog: &adw::Dialog,
+) -> bool {
+    match action {
+        ShortcutAction::FocusSearch => {
+            db_manager.cancel_query_preview();
+            search_entry.grab_focus()
+        }
+        ShortcutAction::ShowConnections => {
+            db_manager.open_connection_manager();
+            true
+        }
+        ShortcutAction::TestAllConnections => {
+            db_manager.open_connection_manager();
+            db_manager.test_all_connections()
+        }
+        ShortcutAction::FocusDatabaseTabs => db_manager.focus_database_tabs(),
+        ShortcutAction::NextDatabaseTab => db_manager.select_next_database_tab(),
+        ShortcutAction::PreviousDatabaseTab => db_manager.select_previous_database_tab(),
+        ShortcutAction::LocateDatabaseTab => {
+            search_entry.set_text("select open database tab");
+            search_entry.grab_focus()
+        }
+        ShortcutAction::ToggleSidebar => {
+            db_manager.toggle_current_sidebar();
+            true
+        }
+        ShortcutAction::NewQueryTab => {
+            db_manager.new_query_in_current_db();
+            true
+        }
+        ShortcutAction::CloseQueryTab => {
+            if !db_manager.close_current_query_tab() {
+                window.close();
+            }
+            true
+        }
+        ShortcutAction::NextQueryTab => db_manager.select_next_query_tab(),
+        ShortcutAction::PreviousQueryTab => db_manager.select_previous_query_tab(),
+        ShortcutAction::RenameQueryTab => show_rename_query_dialog(db_manager, window),
+        ShortcutAction::LocateQueryTab => {
+            search_entry.set_text("select query tab");
+            search_entry.grab_focus()
+        }
+        ShortcutAction::FocusQueryTabs => db_manager.focus_query_tabs(),
+        ShortcutAction::FocusQueryEditor => db_manager.focus_query_editor(),
+        ShortcutAction::FocusQueryResults => db_manager.focus_query_results(),
+        ShortcutAction::PreviewResultRow => {
+            db_manager.focus_query_results()
+                && db_manager.show_focused_result()
+                && db_manager.pin_result_preview()
+        }
+        ShortcutAction::FocusQueryHistory => db_manager.focus_query_history(),
+        ShortcutAction::RunQuery => {
+            db_manager.cancel_query_preview();
+            db_manager.run_current_query();
+            true
+        }
+        ShortcutAction::StopQuery => {
+            db_manager.cancel_current_query();
+            true
+        }
+        ShortcutAction::PreviewQuery => {
+            db_manager.begin_query_preview();
+            true
+        }
+        ShortcutAction::PeekPlan => {
+            db_manager.begin_query_preview();
+            db_manager.show_query_plan()
+        }
+        ShortcutAction::PinPlan => db_manager.pin_query_plan(),
+        ShortcutAction::ClosePlan => {
+            db_manager.close_result_preview() || db_manager.close_query_plan()
+        }
+        ShortcutAction::ShowShortcuts => {
+            shortcuts_dialog.present(Some(window));
+            true
+        }
+    }
+}
+
+fn show_rename_query_dialog(db_manager: &DatabaseTabManager, window: &ApplicationWindow) -> bool {
+    let Some(current_title) = db_manager.current_query_tab_title() else {
+        return false;
+    };
+    let dialog = adw::Dialog::new();
+    dialog.set_title("Rename Query Tab");
+    dialog.set_content_width(420);
+
+    let toolbar = ToolbarView::new();
+    let header = HeaderBar::new();
+    header.set_show_start_title_buttons(true);
+    toolbar.add_top_bar(&header);
+
+    let content = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+    content.set_margin_top(18);
+    content.set_margin_bottom(18);
+    content.set_margin_start(18);
+    content.set_margin_end(18);
+    let entry = gtk4::Entry::new();
+    entry.set_text(&current_title);
+    entry.set_activates_default(true);
+    entry.update_property(&[gtk4::accessible::Property::Label("Query tab name")]);
+    let rename = gtk4::Button::with_label("Rename");
+    rename.add_css_class("suggested-action");
+    rename.set_halign(gtk4::Align::End);
+    rename.set_receives_default(true);
+    content.append(&entry);
+    content.append(&rename);
+    toolbar.set_content(Some(&content));
+    dialog.set_child(Some(&toolbar));
+
+    let manager_for_rename = db_manager.clone();
+    let entry_for_rename = entry.clone();
+    let dialog_for_rename = dialog.clone();
+    rename.connect_clicked(move |_| {
+        if manager_for_rename.rename_current_query_tab(&entry_for_rename.text()) {
+            dialog_for_rename.close();
+        }
+    });
+    let rename_for_activate = rename.clone();
+    entry.connect_activate(move |_| rename_for_activate.emit_clicked());
+    dialog.present(Some(window));
+    entry.grab_focus();
+    true
 }
 
 fn install_styles() {
@@ -133,6 +337,68 @@ fn install_styles() {
                 alpha(@accent_bg_color, 0.32),
                 alpha(@accent_bg_color, 0.05)
             );
+        }
+        .plan-inspector {
+            background-color: @window_bg_color;
+            box-shadow: 0 6px 24px alpha(black, 0.28);
+        }
+        .query-history-pane {
+            background-color: @view_bg_color;
+            border-right: 1px solid alpha(@window_fg_color, 0.18);
+        }
+        .workspace-section-header {
+            background-color: @headerbar_bg_color;
+            border-bottom: 1px solid alpha(@window_fg_color, 0.18);
+        }
+        .workspace-list {
+            background-color: @view_bg_color;
+        }
+        .workspace-list row {
+            border-radius: 0;
+        }
+        .workspace-list row:hover {
+            background-color: alpha(@view_fg_color, 0.06);
+        }
+        .workspace-list row:selected {
+            background-color: alpha(@accent_bg_color, 0.16);
+            color: @view_fg_color;
+        }
+        .query-history-list row {
+            min-height: 54px;
+            padding: 0;
+            transition: background-color 140ms ease;
+        }
+        .query-history-content {
+            padding: 9px 12px;
+        }
+        .query-history-title {
+            font-weight: 600;
+        }
+        .query-history-status {
+            border-radius: 999px;
+        }
+        .query-history-status.success {
+            background-color: @success_color;
+        }
+        .query-history-status.error {
+            background-color: @error_color;
+        }
+        .query-history-row .history-row-action {
+            opacity: 0;
+            transition: opacity 140ms ease;
+        }
+        .query-history-row:hover .history-row-action,
+        .query-history-row:selected .history-row-action,
+        .query-history-row:focus-within .history-row-action {
+            opacity: 1;
+        }
+        paned.query-split > separator {
+            min-height: 1px;
+            background-color: alpha(@window_fg_color, 0.18);
+        }
+        .workspace-statusbar {
+            border-top: 1px solid alpha(@window_fg_color, 0.18);
+            background-color: @headerbar_bg_color;
         }",
     );
     gtk4::style_context_add_provider_for_display(
@@ -145,6 +411,8 @@ fn install_styles() {
 fn create_header_bar(
     db_tab_manager: &DatabaseTabManager,
     toast_overlay: &ToastOverlay,
+    window: &ApplicationWindow,
+    shortcuts_dialog: &adw::Dialog,
 ) -> (HeaderBar, gtk4::Entry) {
     use gtk4::{
         Button, Entry, EntryIconPosition, EventControllerKey, Label, ListBox, MenuButton, Popover,
@@ -157,7 +425,9 @@ fn create_header_bar(
 
     // Left side - sidebar toggle
     let sidebar_toggle = Button::from_icon_name("sidebar-show-symbolic");
-    sidebar_toggle.set_tooltip_text(Some("Toggle Sidebar (Ctrl+B)"));
+    sidebar_toggle.set_tooltip_text(Some(
+        &shortcuts::shortcut(ShortcutAction::ToggleSidebar).tooltip(),
+    ));
 
     // Wire up sidebar toggle
     let db_manager_clone = db_tab_manager.clone();
@@ -233,39 +503,45 @@ fn create_header_bar(
     // Track selected row index
     let selected_index: Rc<RefCell<i32>> = Rc::new(RefCell::new(0));
 
-    // Get real database list
-    let db_list = db_tab_manager.get_database_list();
+    #[derive(Clone)]
+    enum SearchActionKind {
+        Shortcut(ShortcutAction),
+        OpenDatabase(String),
+        FocusConnection(String),
+        SelectDatabase(String),
+        SelectQuery(u32),
+    }
 
-    // Define search actions
     #[derive(Clone)]
     struct SearchAction {
         title: String,
         subtitle: String,
         icon: String,
-        action: String, // "db:name" or "connections"
+        action: SearchActionKind,
     }
 
+    let manager_for_actions = db_tab_manager.clone();
     let create_search_actions = move |search_text: &str| -> Vec<SearchAction> {
         let mut actions = Vec::new();
         let search_lower = search_text.to_lowercase();
 
-        // Add "Connections" if it matches title or subtitle
-        let conn_title = "Connections";
-        let conn_subtitle = "Manage database connections";
-        if search_text.is_empty()
-            || conn_title.to_lowercase().contains(&search_lower)
-            || conn_subtitle.to_lowercase().contains(&search_lower)
-        {
-            actions.push(SearchAction {
-                title: conn_title.to_string(),
-                subtitle: conn_subtitle.to_string(),
-                icon: "network-server-symbolic".to_string(),
-                action: "connections".to_string(),
-            });
+        for action in shortcuts::shortcuts() {
+            let searchable = std::iter::once(action.name)
+                .chain(std::iter::once(action.description))
+                .chain(action.keywords.iter().copied())
+                .any(|value| value.to_lowercase().contains(&search_lower));
+            if search_text.is_empty() || searchable {
+                actions.push(SearchAction {
+                    title: action.name.to_string(),
+                    subtitle: action.description.to_string(),
+                    icon: "system-run-symbolic".to_string(),
+                    action: SearchActionKind::Shortcut(action.action),
+                });
+            }
         }
 
-        // Add matching databases (search in both name and subtitle)
-        for db_name in &db_list {
+        let databases = manager_for_actions.get_database_list();
+        for db_name in &databases {
             let subtitle = "Open database connection";
             if search_text.is_empty()
                 || db_name.to_lowercase().contains(&search_lower)
@@ -275,7 +551,46 @@ fn create_header_bar(
                     title: db_name.clone(),
                     subtitle: subtitle.to_string(),
                     icon: "server-database-symbolic".to_string(),
-                    action: format!("db:{}", db_name),
+                    action: SearchActionKind::OpenDatabase(db_name.clone()),
+                });
+            }
+        }
+
+        for db_name in databases {
+            let subtitle = "Focus database in the connection list";
+            let searchable = format!("connection database {} {}", db_name, subtitle).to_lowercase();
+            if search_text.is_empty() || searchable.contains(&search_lower) {
+                actions.push(SearchAction {
+                    title: format!("Connection: {}", db_name),
+                    subtitle: subtitle.to_string(),
+                    icon: "network-server-symbolic".to_string(),
+                    action: SearchActionKind::FocusConnection(db_name),
+                });
+            }
+        }
+
+        for db_name in manager_for_actions.open_database_tabs() {
+            let subtitle = "Select open database tab";
+            let searchable = format!("database tab {} {}", db_name, subtitle).to_lowercase();
+            if search_text.is_empty() || searchable.contains(&search_lower) {
+                actions.push(SearchAction {
+                    title: format!("Database tab: {}", db_name),
+                    subtitle: subtitle.to_string(),
+                    icon: "go-jump-symbolic".to_string(),
+                    action: SearchActionKind::SelectDatabase(db_name),
+                });
+            }
+        }
+
+        for (query_num, title) in manager_for_actions.query_tabs() {
+            let subtitle = "Select query tab";
+            let searchable = format!("query tab {} {}", title, subtitle).to_lowercase();
+            if search_text.is_empty() || searchable.contains(&search_lower) {
+                actions.push(SearchAction {
+                    title: format!("Query tab: {}", title),
+                    subtitle: subtitle.to_string(),
+                    icon: "go-jump-symbolic".to_string(),
+                    action: SearchActionKind::SelectQuery(query_num),
                 });
             }
         }
@@ -286,17 +601,40 @@ fn create_header_bar(
     let execute_action = {
         let db_manager = db_tab_manager.clone();
         let toast = toast_overlay.clone();
-        move |action: &str, entry: &Entry| {
-            if action == "connections" {
-                db_manager.open_connection_manager();
-                entry.set_text("");
-                let toast_msg = Toast::new("Showing database connections");
-                toast_msg.set_timeout(2);
-                toast.add_toast(toast_msg);
-            } else if let Some(db_name) = action.strip_prefix("db:") {
-                db_manager.open_database(db_name);
-                entry.set_text("");
-                let toast_msg = Toast::new(&format!("Opened: {}", db_name));
+        let window = window.clone();
+        let shortcuts_dialog = shortcuts_dialog.clone();
+        move |action: &SearchActionKind, entry: &Entry| {
+            let message = match action {
+                SearchActionKind::Shortcut(action) => {
+                    execute_shortcut_action(
+                        *action,
+                        &db_manager,
+                        entry,
+                        &window,
+                        &shortcuts_dialog,
+                    );
+                    None
+                }
+                SearchActionKind::OpenDatabase(db_name) => {
+                    db_manager.open_database(db_name);
+                    Some(format!("Opened: {}", db_name))
+                }
+                SearchActionKind::FocusConnection(db_name) => {
+                    db_manager.focus_connection(db_name);
+                    None
+                }
+                SearchActionKind::SelectDatabase(db_name) => {
+                    db_manager.select_database_tab(db_name);
+                    Some(format!("Selected database tab: {}", db_name))
+                }
+                SearchActionKind::SelectQuery(query_num) => {
+                    db_manager.select_query_tab(*query_num);
+                    None
+                }
+            };
+            entry.set_text("");
+            if let Some(message) = message {
+                let toast_msg = Toast::new(&message);
                 toast_msg.set_timeout(2);
                 toast.add_toast(toast_msg);
             }
@@ -363,6 +701,10 @@ fn create_header_bar(
                 // Set title and subtitle as plain text first
                 row.set_title(&action.title);
                 row.set_subtitle(&action.subtitle);
+                row.update_property(&[
+                    gtk4::accessible::Property::Label(&action.title),
+                    gtk4::accessible::Property::Description(&action.subtitle),
+                ]);
 
                 // Then replace with markup by accessing the internal labels
                 if let Some(title_widget) = row.first_child()
@@ -394,13 +736,29 @@ fn create_header_bar(
 
                 row.set_activatable(true);
 
-                let action_str = action.action.clone();
+                let action_kind = action.action.clone();
                 let execute_clone = execute_action.clone();
                 let entry_clone = db_search.clone();
                 let popover_clone = suggestions_popover.clone();
 
+                let action_button = Button::from_icon_name("go-next-symbolic");
+                action_button.add_css_class("flat");
+                action_button.update_property(&[gtk4::accessible::Property::Label(&format!(
+                    "Run action: {}",
+                    action.title
+                ))]);
+                let action_for_button = action_kind.clone();
+                let execute_for_button = execute_action.clone();
+                let entry_for_button = db_search.clone();
+                let popover_for_button = suggestions_popover.clone();
+                action_button.connect_clicked(move |_| {
+                    execute_for_button(&action_for_button, &entry_for_button);
+                    popover_for_button.popdown();
+                });
+                row.add_suffix(&action_button);
+
                 row.connect_activated(move |_| {
-                    execute_clone(&action_str, &entry_clone);
+                    execute_clone(&action_kind, &entry_clone);
                     popover_clone.popdown();
                 });
 
@@ -425,6 +783,12 @@ fn create_header_bar(
             (!text.is_empty()).then_some("edit-clear-symbolic"),
         );
         update_suggestions_clone(&text);
+    });
+    let update_suggestions_on_focus = update_suggestions.clone();
+    db_search.connect_has_focus_notify(move |entry| {
+        if entry.has_focus() {
+            update_suggestions_on_focus(&entry.text());
+        }
     });
     db_search.connect_icon_release(|entry, position| {
         if position == EntryIconPosition::Secondary {
@@ -509,7 +873,13 @@ fn create_header_bar(
 
     // Run query button (primary action)
     let run_button = Button::from_icon_name("media-playback-start-symbolic");
-    run_button.set_tooltip_text(Some("Run Query (Ctrl+Enter)"));
+    run_button.set_tooltip_text(Some(
+        &shortcuts::shortcut(ShortcutAction::RunQuery).tooltip(),
+    ));
+    run_button.update_property(&[
+        gtk4::accessible::Property::Label("Run query"),
+        gtk4::accessible::Property::KeyShortcuts("Control+Return"),
+    ]);
     run_button.add_css_class("suggested-action");
 
     let db_manager_run = db_tab_manager.clone();
@@ -521,7 +891,13 @@ fn create_header_bar(
 
     // New query tab button
     let new_query_button = Button::from_icon_name("tab-new-symbolic");
-    new_query_button.set_tooltip_text(Some("New Query Tab (Ctrl+T)"));
+    new_query_button.set_tooltip_text(Some(
+        &shortcuts::shortcut(ShortcutAction::NewQueryTab).tooltip(),
+    ));
+    new_query_button.update_property(&[
+        gtk4::accessible::Property::Label("New query tab"),
+        gtk4::accessible::Property::KeyShortcuts("Control+t"),
+    ]);
 
     let db_manager_clone = db_tab_manager.clone();
     new_query_button.connect_clicked(move |_| {
@@ -541,7 +917,7 @@ fn create_header_bar(
 
 fn query_preview_message(state: &QueryPreviewState) -> String {
     match state {
-        QueryPreviewState::Idle => "Search databases... (Ctrl+K)".to_string(),
+        QueryPreviewState::Idle => default_action_hint(),
         QueryPreviewState::Loading => {
             "Enter to run query - estimating rows and cost...".to_string()
         }
@@ -549,14 +925,22 @@ fn query_preview_message(state: &QueryPreviewState) -> String {
             rows,
             startup_cost,
             total_cost,
+            ..
         } => format!(
             "Enter to run query - ~{} rows - cost {:.2}..{:.2}",
             rows, startup_cost, total_cost
         ),
-        QueryPreviewState::Error(_) => {
-            "Enter to run query - estimate unavailable (hover for details)".to_string()
+        QueryPreviewState::Error(error) => {
+            format!("Enter to run query - estimate unavailable: {}", error)
         }
     }
+}
+
+fn default_action_hint() -> String {
+    format!(
+        "Search databases... ({})",
+        shortcuts::shortcut(ShortcutAction::FocusSearch).accelerator()
+    )
 }
 
 fn create_query_action_field() -> (gtk4::Overlay, gtk4::Entry, gtk4::ProgressBar) {
@@ -564,7 +948,15 @@ fn create_query_action_field() -> (gtk4::Overlay, gtk4::Entry, gtk4::ProgressBar
     overlay.set_halign(gtk4::Align::Center);
 
     let entry = gtk4::Entry::new();
-    entry.set_placeholder_text(Some("Search databases... (Ctrl+K)"));
+    entry.set_widget_name("database-search-action");
+    entry.update_property(&[
+        gtk4::accessible::Property::Label("Database search and query action"),
+        gtk4::accessible::Property::Description(
+            "Search databases and display query preview status",
+        ),
+        gtk4::accessible::Property::KeyShortcuts("Control+k"),
+    ]);
+    entry.set_placeholder_text(Some(&default_action_hint()));
     entry.set_width_chars(64);
     entry.add_css_class("search");
     entry.set_icon_from_icon_name(
@@ -603,14 +995,78 @@ mod tests {
     use super::*;
 
     #[test]
+    fn preview_chord_transitions_are_interpreted_without_a_display() {
+        let control = gtk4::gdk::ModifierType::CONTROL_MASK;
+        let shift = gtk4::gdk::ModifierType::SHIFT_MASK;
+
+        assert_eq!(
+            preview_key_pressed(gtk4::gdk::Key::Control_L, control),
+            Some(PreviewKeyAction::Begin { show_plan: false })
+        );
+        assert_eq!(
+            preview_key_pressed(gtk4::gdk::Key::Shift_L, control | shift),
+            Some(PreviewKeyAction::ShowPlan)
+        );
+        assert_eq!(
+            preview_key_pressed(gtk4::gdk::Key::Control_L, control | shift),
+            Some(PreviewKeyAction::Begin { show_plan: true })
+        );
+        assert_eq!(
+            preview_key_released(gtk4::gdk::Key::Shift_L),
+            Some(PreviewKeyAction::HidePlan)
+        );
+        assert_eq!(
+            preview_key_released(gtk4::gdk::Key::Control_L),
+            Some(PreviewKeyAction::Cancel)
+        );
+    }
+
+    #[test]
+    fn plan_scroll_keys_require_the_plan_chord_or_no_modifiers() {
+        let control = gtk4::gdk::ModifierType::CONTROL_MASK;
+        let shift = gtk4::gdk::ModifierType::SHIFT_MASK;
+
+        assert_eq!(
+            preview_key_pressed(gtk4::gdk::Key::Page_Down, control | shift),
+            Some(PreviewKeyAction::Scroll(PlanScroll::PageDown))
+        );
+        assert_eq!(
+            preview_key_pressed(gtk4::gdk::Key::Down, gtk4::gdk::ModifierType::empty()),
+            Some(PreviewKeyAction::Scroll(PlanScroll::LineDown))
+        );
+        assert_eq!(preview_key_pressed(gtk4::gdk::Key::Down, control), None);
+        assert_eq!(
+            preview_key_pressed(
+                gtk4::gdk::Key::Down,
+                control | shift | gtk4::gdk::ModifierType::ALT_MASK
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn ready_query_preview_prompts_for_execution_with_estimates() {
         let message = query_preview_message(&QueryPreviewState::Ready {
             rows: 42,
             startup_cost: 1.25,
             total_cost: 9.5,
+            plan: serde_json::json!([]),
         });
 
         assert_eq!(message, "Enter to run query - ~42 rows - cost 1.25..9.50");
+    }
+
+    #[test]
+    fn query_preview_errors_are_visible_without_a_tooltip() {
+        let message = query_preview_message(&QueryPreviewState::Error(
+            "Database is not connected".to_string(),
+        ));
+
+        assert_eq!(
+            message,
+            "Enter to run query - estimate unavailable: Database is not connected"
+        );
+        assert!(!message.contains("hover"));
     }
 
     #[gtk4::test]
@@ -648,8 +1104,29 @@ mod tests {
         clear_progress(&progress);
         assert_eq!(
             entry.placeholder_text().as_deref(),
-            Some("Search databases... (Ctrl+K)")
+            Some(default_action_hint().as_str())
         );
         window.close();
+    }
+
+    #[gtk4::test]
+    #[ignore = "requires a graphical display"]
+    fn close_query_action_closes_the_window_when_no_query_tab_remains() {
+        let statusbar = create_statusbar();
+        let manager = DatabaseTabManager::new(statusbar);
+        let window = ApplicationWindow::builder().build();
+        let search = gtk4::Entry::new();
+        let shortcuts = shortcuts::create_shortcuts_window();
+        window.present();
+        gtk4::test_widget_wait_for_draw(&window);
+
+        assert!(execute_shortcut_action(
+            ShortcutAction::CloseQueryTab,
+            &manager,
+            &search,
+            &window,
+            &shortcuts,
+        ));
+        assert!(!window.is_visible());
     }
 }

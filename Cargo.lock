@@ -262,6 +262,7 @@ dependencies = [
  "serde_json",
  "sourceview5",
  "tokio",
+ "tokio-postgres",
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",

@@ -1,7 +1,7 @@
 use adw::prelude::*;
 use adw::{ActionRow, StatusPage};
 use gtk4::prelude::*;
-use gtk4::{Box, Button, GestureClick, Label, ListBox, Orientation, ScrolledWindow, Spinner};
+use gtk4::{Box, Button, Label, ListBox, Orientation, ScrolledWindow, Spinner};
 use libadwaita as adw;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -16,7 +16,57 @@ pub enum TestStatus {
     Failed(String),
 }
 
-pub fn create_connection_manager<F>(bridge: RuntimeBridge, on_database_open: F) -> Box
+#[derive(Clone)]
+pub struct ConnectionManager {
+    container: Box,
+    list: Option<ListBox>,
+    rows: Vec<(String, ActionRow)>,
+    test_all: Option<Button>,
+}
+
+impl ConnectionManager {
+    pub fn widget(&self) -> &Box {
+        &self.container
+    }
+
+    pub fn focus_selected(&self) -> bool {
+        let Some(list) = &self.list else {
+            return false;
+        };
+        let row = list.selected_row().or_else(|| list.row_at_index(0));
+        row.is_some_and(|row| {
+            list.select_row(Some(&row));
+            row.grab_focus()
+        })
+    }
+
+    pub fn selected_row(&self) -> Option<gtk4::ListBoxRow> {
+        let list = self.list.as_ref()?;
+        list.selected_row().or_else(|| list.row_at_index(0))
+    }
+
+    pub fn focus_database(&self, name: &str) -> bool {
+        let Some(list) = &self.list else {
+            return false;
+        };
+        self.rows
+            .iter()
+            .find(|(database, _)| database == name)
+            .is_some_and(|(_, row)| {
+                list.select_row(Some(row));
+                row.grab_focus()
+            })
+    }
+
+    pub fn test_all(&self) -> bool {
+        self.test_all.as_ref().is_some_and(|button| {
+            button.emit_clicked();
+            true
+        })
+    }
+}
+
+pub fn create_connection_manager<F>(bridge: RuntimeBridge, on_database_open: F) -> ConnectionManager
 where
     F: Fn(&str) + 'static + Clone,
 {
@@ -38,25 +88,39 @@ where
         status_page.set_title("No Connections Configured");
         status_page.set_description(Some("Create a dzban.toml file with database connections"));
         container.append(&status_page);
-        return container;
+        return ConnectionManager {
+            container,
+            list: None,
+            rows: Vec::new(),
+            test_all: None,
+        };
     }
 
     // Header with Test All button
     let header = Box::new(Orientation::Horizontal, 12);
-    header.set_margin_start(12);
-    header.set_margin_end(12);
-    header.set_margin_top(12);
-    header.set_margin_bottom(6);
+    header.add_css_class("workspace-section-header");
+    header.set_margin_start(0);
+    header.set_margin_end(0);
+    header.set_margin_top(0);
+    header.set_margin_bottom(0);
+
+    let header_content = Box::new(Orientation::Horizontal, 12);
+    header_content.set_hexpand(true);
+    header_content.set_margin_start(12);
+    header_content.set_margin_end(12);
+    header_content.set_margin_top(10);
+    header_content.set_margin_bottom(10);
 
     let title = Label::new(Some("Database Connections"));
     title.add_css_class("title-2");
     title.set_halign(gtk4::Align::Start);
     title.set_hexpand(true);
-    header.append(&title);
+    header_content.append(&title);
 
     let test_all_button = Button::with_label("Test All");
     test_all_button.add_css_class("suggested-action");
-    header.append(&test_all_button);
+    header_content.append(&test_all_button);
+    header.append(&header_content);
 
     container.append(&header);
 
@@ -66,19 +130,18 @@ where
     scrolled.set_hscrollbar_policy(gtk4::PolicyType::Never);
 
     let listbox = ListBox::new();
-    listbox.add_css_class("boxed-list");
-    listbox.set_selection_mode(gtk4::SelectionMode::None);
-    listbox.set_margin_start(12);
-    listbox.set_margin_end(12);
-    listbox.set_margin_top(6);
-    listbox.set_margin_bottom(12);
+    listbox.add_css_class("workspace-list");
+    listbox.set_selection_mode(gtk4::SelectionMode::Browse);
+    listbox.set_show_separators(true);
 
     // Create rows for each database
     let mut test_buttons = Vec::new();
+    let mut rows = Vec::new();
     for db_config in &config.databases {
         let (row, test_button, status_indicator) =
             create_connection_row(db_config, on_database_open.clone());
         listbox.append(&row);
+        rows.push((db_config.name.clone(), row));
         test_buttons.push((db_config.clone(), test_button, status_indicator));
     }
 
@@ -132,7 +195,24 @@ where
     scrolled.set_child(Some(&listbox));
     container.append(&scrolled);
 
-    container
+    if let Some(row) = listbox.row_at_index(0) {
+        listbox.select_row(Some(&row));
+        listbox.connect_map(move |_| {
+            let weak_row = row.downgrade();
+            glib::idle_add_local_once(move || {
+                if let Some(row) = weak_row.upgrade() {
+                    row.grab_focus();
+                }
+            });
+        });
+    }
+
+    ConnectionManager {
+        container,
+        list: Some(listbox),
+        rows,
+        test_all: Some(test_all_button),
+    }
 }
 
 fn create_connection_row<F>(
@@ -142,7 +222,9 @@ fn create_connection_row<F>(
 where
     F: Fn(&str) + 'static,
 {
+    let on_database_open: Rc<dyn Fn(&str)> = Rc::new(on_database_open);
     let row = ActionRow::new();
+    row.set_focusable(true);
     row.set_use_markup(false);
     row.set_title(&db_config.name);
 
@@ -160,21 +242,16 @@ where
     };
     row.set_subtitle(&details);
 
-    // Add double-click gesture to open database
-    let gesture = GestureClick::new();
-    gesture.set_button(1); // Left click
     let db_name = db_config.name.clone();
-    gesture.connect_released(move |gesture, n_press, _x, _y| {
-        if n_press == 2 {
-            // Double click
-            on_database_open(&db_name);
-            gesture.set_state(gtk4::EventSequenceState::Claimed);
-        }
+    let open_database = Rc::clone(&on_database_open);
+    row.connect_activated(move |_| {
+        open_database(&db_name);
     });
-    row.add_controller(gesture);
-
-    // Make row activatable (shows hover effect)
     row.set_activatable(true);
+    row.update_property(&[
+        gtk4::accessible::Property::Label(&db_config.name),
+        gtk4::accessible::Property::Description("Open this database in a query workspace"),
+    ]);
 
     // Status indicator and test button
     let suffix_box = Box::new(Orientation::Horizontal, 8);
@@ -184,11 +261,22 @@ where
     let status_indicator = create_status_indicator(TestStatus::NotTested);
     status_box.append(&status_indicator);
 
+    let open_button = Button::with_label("Open");
+    open_button.set_valign(gtk4::Align::Center);
+    open_button.update_property(&[gtk4::accessible::Property::Description(
+        "Open this database in a query workspace",
+    )]);
+    let db_name = db_config.name.clone();
+    open_button.connect_clicked(move |_| {
+        on_database_open(&db_name);
+    });
+
     // Test button
     let test_button = Button::with_label("Test");
     test_button.set_valign(gtk4::Align::Center);
 
     suffix_box.append(&status_box);
+    suffix_box.append(&open_button);
     suffix_box.append(&test_button);
 
     row.add_suffix(&suffix_box);

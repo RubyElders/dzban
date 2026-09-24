@@ -8,7 +8,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use super::connection_state::ConnectionStateWidget;
-use super::connections;
+use super::connections::{self, ConnectionManager};
+use super::plan_inspector::{PlanScroll, PlanState};
 use super::query_state::QueryExecution;
 use super::query_tabs::QueryTabManager;
 use super::statusbar::Statusbar;
@@ -28,6 +29,7 @@ pub enum QueryPreviewState {
         rows: i64,
         startup_cost: f64,
         total_cost: f64,
+        plan: serde_json::Value,
     },
     Error(String),
 }
@@ -71,10 +73,11 @@ fn create_colored_dot_icon(css_class: &str) -> gtk4::gio::Icon {
 #[derive(Clone)]
 pub struct DatabaseTabManager {
     tab_view: TabView,
-    _tab_bar: TabBar,
+    tab_bar: TabBar,
     container: gtk4::Box,
     tabs: DatabaseTabs,
     connections_page: Rc<RefCell<Option<TabPage>>>,
+    connection_manager: Rc<RefCell<Option<ConnectionManager>>>,
     runtime_bridge: RuntimeBridge,
     db_manager: DbManager,
     statusbar: Statusbar,
@@ -93,14 +96,15 @@ impl DatabaseTabManager {
         let tab_view = TabView::new();
         tab_view.set_vexpand(true);
 
-        // Enable shortcuts (Ctrl+Tab, Ctrl+Shift+Tab, Ctrl+W, etc.)
-        tab_view.set_shortcuts(adw::TabViewShortcuts::all());
+        tab_view.set_shortcuts(adw::TabViewShortcuts::empty());
 
         // Create TabBar for the tab strip
         let tab_bar = TabBar::new();
         tab_bar.set_view(Some(&tab_view));
         tab_bar.set_autohide(false);
         tab_bar.set_expand_tabs(false);
+        tab_bar.set_focusable(true);
+        tab_bar.update_property(&[gtk4::accessible::Property::Label("Database tabs")]);
 
         container.append(&tab_bar);
         container.append(&tab_view);
@@ -110,10 +114,11 @@ impl DatabaseTabManager {
 
         let manager = Self {
             tab_view: tab_view.clone(),
-            _tab_bar: tab_bar,
+            tab_bar,
             container,
             tabs: Rc::new(RefCell::new(HashMap::new())),
             connections_page: Rc::new(RefCell::new(None)),
+            connection_manager: Rc::new(RefCell::new(None)),
             runtime_bridge,
             db_manager: DbManager::new(),
             statusbar: statusbar.clone(),
@@ -252,14 +257,16 @@ impl DatabaseTabManager {
             glib::spawn_future_local(async move {
                 let state = match rx.await {
                     Ok(Ok(result)) => extract_explain_plan(&result.rows)
-                        .and_then(|plan| extract_query_estimate(&plan))
-                        .map(
-                            |(rows, startup_cost, total_cost)| QueryPreviewState::Ready {
-                                rows,
-                                startup_cost,
-                                total_cost,
-                            },
-                        )
+                        .and_then(|plan| {
+                            extract_query_estimate(&plan).map(|(rows, startup_cost, total_cost)| {
+                                QueryPreviewState::Ready {
+                                    rows,
+                                    startup_cost,
+                                    total_cost,
+                                    plan,
+                                }
+                            })
+                        })
                         .unwrap_or_else(QueryPreviewState::Error),
                     Ok(Err(error)) => QueryPreviewState::Error(error),
                     Err(_) => QueryPreviewState::Error("EXPLAIN was cancelled".to_string()),
@@ -281,14 +288,189 @@ impl DatabaseTabManager {
         let query_manager = self.query_preview_manager.borrow_mut().take();
         if let Some(query_manager) = query_manager {
             query_manager.clear_query_highlight();
+            query_manager.hide_plan_transient();
             self.emit_query_preview(QueryPreviewState::Idle);
         }
     }
 
     fn emit_query_preview(&self, state: QueryPreviewState) {
+        if let Some(query_manager) = self.query_preview_manager.borrow().as_ref() {
+            match &state {
+                QueryPreviewState::Loading => query_manager.set_plan_preview(PlanState::Loading),
+                QueryPreviewState::Ready { plan, .. } => {
+                    query_manager.set_plan_preview(PlanState::Ready(plan.clone()));
+                }
+                QueryPreviewState::Error(error) => {
+                    query_manager.set_plan_preview(PlanState::Error(error.clone()));
+                }
+                QueryPreviewState::Idle => {}
+            }
+        }
         if let Some(callback) = self.query_preview_callback.borrow().as_ref() {
             callback(state);
         }
+    }
+
+    fn current_query_manager(&self) -> Option<QueryTabManager> {
+        let current_page = self.tab_view.selected_page()?;
+        self.tabs
+            .borrow()
+            .values()
+            .find(|(page, _, _, _)| page == &current_page)
+            .map(|(_, manager, _, _)| manager.clone())
+    }
+
+    pub fn show_query_plan(&self) -> bool {
+        let Some(manager) = self.query_preview_manager.borrow().as_ref().cloned() else {
+            return false;
+        };
+        manager.show_plan_transient();
+        true
+    }
+
+    pub fn hide_query_plan(&self) {
+        if let Some(manager) = self.query_preview_manager.borrow().as_ref() {
+            manager.hide_plan_transient();
+        }
+    }
+
+    pub fn pin_query_plan(&self) -> bool {
+        self.query_preview_manager
+            .borrow()
+            .as_ref()
+            .is_some_and(QueryTabManager::pin_plan)
+    }
+
+    pub fn close_query_plan(&self) -> bool {
+        self.current_query_manager()
+            .is_some_and(|manager| manager.close_plan())
+    }
+
+    pub fn scroll_query_plan(&self, direction: PlanScroll) -> bool {
+        self.current_query_manager()
+            .is_some_and(|manager| manager.scroll_plan(direction))
+    }
+
+    pub fn close_current_query_tab(&self) -> bool {
+        self.current_query_manager()
+            .is_some_and(|manager| manager.close_current_tab())
+    }
+
+    pub fn select_next_database_tab(&self) -> bool {
+        if self.tab_view.select_next_page() {
+            true
+        } else if self.tab_view.n_pages() > 1 {
+            self.tab_view.set_selected_page(&self.tab_view.nth_page(0));
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn focus_database_tabs(&self) -> bool {
+        self.tab_bar.grab_focus()
+    }
+
+    pub fn focus_query_tabs(&self) -> bool {
+        self.current_query_manager()
+            .is_some_and(|manager| manager.focus_tab_bar())
+    }
+
+    pub fn focus_query_editor(&self) -> bool {
+        let Some(manager) = self.current_query_manager() else {
+            return false;
+        };
+        manager.focus_current_editor();
+        true
+    }
+
+    pub fn focus_query_results(&self) -> bool {
+        self.current_query_manager()
+            .is_some_and(|manager| manager.focus_current_results())
+    }
+
+    pub fn focus_query_history(&self) -> bool {
+        self.current_query_manager()
+            .is_some_and(|manager| manager.focus_history())
+    }
+
+    pub fn show_focused_result(&self) -> bool {
+        self.current_query_manager()
+            .is_some_and(|manager| manager.show_focused_result())
+    }
+
+    pub fn pin_result_preview(&self) -> bool {
+        self.current_query_manager()
+            .is_some_and(|manager| manager.pin_result())
+    }
+
+    pub fn close_result_preview(&self) -> bool {
+        self.current_query_manager()
+            .is_some_and(|manager| manager.close_result())
+    }
+
+    pub fn select_previous_database_tab(&self) -> bool {
+        if self.tab_view.select_previous_page() {
+            true
+        } else if self.tab_view.n_pages() > 1 {
+            self.tab_view
+                .set_selected_page(&self.tab_view.nth_page(self.tab_view.n_pages() - 1));
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn select_next_query_tab(&self) -> bool {
+        self.current_query_manager()
+            .is_some_and(|manager| manager.select_next_tab())
+    }
+
+    pub fn select_previous_query_tab(&self) -> bool {
+        self.current_query_manager()
+            .is_some_and(|manager| manager.select_previous_tab())
+    }
+
+    pub fn rename_current_query_tab(&self, title: &str) -> bool {
+        self.current_query_manager()
+            .is_some_and(|manager| manager.rename_current_tab(title))
+    }
+
+    pub fn current_query_tab_title(&self) -> Option<String> {
+        self.current_query_manager()?.current_tab_title()
+    }
+
+    pub fn query_tabs(&self) -> Vec<(u32, String)> {
+        self.current_query_manager()
+            .map_or_else(Vec::new, |manager| manager.tab_titles())
+    }
+
+    pub fn select_query_tab(&self, query_num: u32) -> bool {
+        self.current_query_manager()
+            .is_some_and(|manager| manager.select_tab(query_num))
+    }
+
+    pub fn open_database_tabs(&self) -> Vec<String> {
+        let mut tabs = self
+            .tabs
+            .borrow()
+            .iter()
+            .map(|(name, (page, _, _, _))| (self.tab_view.page_position(page), name.clone()))
+            .collect::<Vec<_>>();
+        tabs.sort_by_key(|(position, _)| *position);
+        tabs.into_iter().map(|(_, name)| name).collect()
+    }
+
+    pub fn select_database_tab(&self, name: &str) -> bool {
+        let page = self
+            .tabs
+            .borrow()
+            .get(name)
+            .map(|(page, _, _, _)| page.clone());
+        page.is_some_and(|page| {
+            self.tab_view.set_selected_page(&page);
+            true
+        })
     }
 
     pub fn open_database(&self, db_name: &str) {
@@ -619,9 +801,37 @@ impl DatabaseTabManager {
 
     pub fn open_connection_manager(&self) {
         if let Some(page) = self.connections_page.borrow().as_ref() {
-            // Select the existing connection manager tab
             self.tab_view.set_selected_page(page);
         }
+        self.focus_connections();
+    }
+
+    pub fn focus_connections(&self) -> bool {
+        self.connection_manager
+            .borrow()
+            .as_ref()
+            .is_some_and(ConnectionManager::focus_selected)
+    }
+
+    pub fn focus_connection(&self, name: &str) -> bool {
+        if let Some(page) = self.connections_page.borrow().as_ref() {
+            self.tab_view.set_selected_page(page);
+        }
+        self.connection_manager
+            .borrow()
+            .as_ref()
+            .is_some_and(|manager| manager.focus_database(name))
+    }
+
+    pub fn selected_connection_row(&self) -> Option<gtk4::ListBoxRow> {
+        self.connection_manager.borrow().as_ref()?.selected_row()
+    }
+
+    pub fn test_all_connections(&self) -> bool {
+        self.connection_manager
+            .borrow()
+            .as_ref()
+            .is_some_and(ConnectionManager::test_all)
     }
 
     fn create_connections_tab(&self) {
@@ -632,7 +842,7 @@ impl DatabaseTabManager {
             db_manager.open_database(db_name);
         });
 
-        let page = self.tab_view.append(&conn_manager);
+        let page = self.tab_view.append(conn_manager.widget());
         page.set_title("Connections");
         page.set_icon(Some(&gtk4::gio::ThemedIcon::new("network-server-symbolic")));
 
@@ -640,6 +850,7 @@ impl DatabaseTabManager {
         self.tab_view.set_page_pinned(&page, true);
 
         *self.connections_page.borrow_mut() = Some(page.clone());
+        *self.connection_manager.borrow_mut() = Some(conn_manager);
         self.tab_view.set_selected_page(&page);
     }
 
