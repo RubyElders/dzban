@@ -6,6 +6,14 @@ Use `#[gtk4::test]` for tests that construct or mutate widgets. This macro initi
 
 Tests requiring a display can be marked ignored with a precise reason and run under the virtual-display workflow. Keep logic tests non-ignored.
 
+## Interaction layers
+
+Test shortcut and chord interpretation as a pure Rust state machine. Test the resulting widget state, signals, focus, and accessibility contracts with `#[gtk4::test]`. This gives deterministic behavioral coverage without a window manager or synthetic input.
+
+For a black-box test of the running application, use the maintained Dogtail routine in [dogtail-integration.md](dogtail-integration.md). Target accessible roles, labels, and descriptions rather than screen coordinates. GTK does not provide a Playwright-style application driver; its native test API is intended for in-process widget tests.
+
+Use `xdotool` only to place the real application into a state for visual inspection when a semantic driver is unavailable. A coordinate click or synthetic key event is not sufficient behavioral evidence by itself.
+
 ## Virtual display
 
 The host may already export `WAYLAND_DISPLAY`; if it is left in place, the application can open on the user's real desktop instead of Xvfb. Force X11 and use a disposable D-Bus session:
@@ -14,7 +22,7 @@ The host may already export `WAYLAND_DISPLAY`; if it is left in place, the appli
 skills/dzban-ui-testing/scripts/visual-session.sh
 ```
 
-Inside that shell:
+Inside that shell, coordinate replay may be used to reach a visual state:
 
 ```bash
 /absolute/path/to/target/debug/dzban > /tmp/dzban-ui.log 2>&1 &
