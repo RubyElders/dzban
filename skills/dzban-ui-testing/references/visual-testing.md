@@ -26,7 +26,7 @@ Inside that shell, coordinate replay may be used to reach a visual state:
 
 ```bash
 /absolute/path/to/target/debug/dzban > /tmp/dzban-ui.log 2>&1 &
-win=$(xdotool search --onlyvisible --name 'Dzban - PostgreSQL Client' | head -n1)
+win=$(xdotool search --onlyvisible --name 'Dzban' | head -n1)
 xdotool mousemove --window "$win" X Y click 1
 xdotool keydown Control_L
 import -window "$win" /tmp/loading.png
@@ -34,7 +34,7 @@ xdotool keyup Control_L
 import -window "$win" /tmp/reset.png
 ```
 
-Use a temporary working directory containing only a test `dzban.toml`; never launch a visual test from the repository root when its local file contains user credentials. Prefer the Compose PostgreSQL fixtures.
+Use a temporary working directory containing only a test `dzban.toml`; never launch a visual test from the repository root when its local file contains user credentials. Prefer the Compose database fixtures.
 
 Use `view_image` to inspect frames. ImageMagick can assert quantitative differences or unchanged geometry:
 

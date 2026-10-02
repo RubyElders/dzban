@@ -12,7 +12,7 @@ trap cleanup EXIT
 
 cd "$repo_root"
 CCACHE_DISABLE=1 cargo +1.88.0 build -p dzban-ui
-docker compose -f "$compose_file" up -d --wait postgres15
+docker compose -f "$compose_file" up -d --wait postgres15 clickhouse
 
 system_paths=$(
     /usr/bin/python3 -c 'import gi; from pathlib import Path; print(Path(gi.__file__).parent.parent)'
@@ -20,7 +20,7 @@ system_paths=$(
 if [[ -n ${DZBAN_UI_SCENARIO:-} ]]; then
     scenarios=("$DZBAN_UI_SCENARIO")
 else
-    scenarios=(empty database)
+    scenarios=(empty database clickhouse)
 fi
 
 for scenario in "${scenarios[@]}"; do

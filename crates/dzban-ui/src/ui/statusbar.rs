@@ -1,7 +1,8 @@
 use super::connection_state::ConnectionStateWidget;
-use dzban_db::DbConnection;
+use super::icons;
+use dzban_db::{DatabaseBackend, DbConnection};
 use gtk4::prelude::*;
-use gtk4::{Box, Label, Orientation, Separator};
+use gtk4::{Box, Image, Label, Orientation, Separator};
 use std::rc::Rc;
 
 struct BoundConnection {
@@ -37,6 +38,7 @@ pub struct Statusbar {
     connection_widget: ConnectionStateWidget,
     exec_time: Label,
     rows_info: Label,
+    server_icon: Image,
     server_version: Label,
     latency: Label,
     binding: Rc<ConnectionBinding>,
@@ -62,42 +64,33 @@ impl Statusbar {
         let sep1 = Separator::new(Orientation::Vertical);
         statusbar.append(&sep1);
 
-        // Query execution time
-        let exec_time = Label::new(Some("⏱️  --"));
-        exec_time.add_css_class("dim-label");
-        exec_time.add_css_class("caption");
-        statusbar.append(&exec_time);
+        let (exec_time_widget, _, exec_time) =
+            metric(icons::QUERY_TIME, "--", "Query execution time");
+        statusbar.append(&exec_time_widget);
 
         // Separator
         let sep2 = Separator::new(Orientation::Vertical);
         statusbar.append(&sep2);
 
-        // Rows affected/returned
-        let rows_info = Label::new(Some("📊 -- rows"));
-        rows_info.add_css_class("dim-label");
-        rows_info.add_css_class("caption");
-        statusbar.append(&rows_info);
+        let (rows_widget, _, rows_info) = metric(icons::RESULT_ROWS, "-- rows", "Returned rows");
+        statusbar.append(&rows_widget);
 
         // Spacer to push next items to the right
         let spacer = Box::new(Orientation::Horizontal, 0);
         spacer.set_hexpand(true);
         statusbar.append(&spacer);
 
-        // Latency
-        let latency = Label::new(Some("📡 --"));
-        latency.add_css_class("dim-label");
-        latency.add_css_class("caption");
-        statusbar.append(&latency);
+        let (latency_widget, _, latency) = metric(icons::PING, "--", "Database ping latency");
+        statusbar.append(&latency_widget);
 
         // Separator
         let sep3 = Separator::new(Orientation::Vertical);
         statusbar.append(&sep3);
 
-        // Server version
-        let server_version = Label::new(Some("--"));
-        server_version.add_css_class("dim-label");
-        server_version.add_css_class("caption");
-        statusbar.append(&server_version);
+        let (server_widget, server_icon, server_version) =
+            metric(icons::POSTGRESQL, "--", "Database server version");
+        server_icon.set_visible(false);
+        statusbar.append(&server_widget);
         container.append(&statusbar);
 
         Self {
@@ -105,6 +98,7 @@ impl Statusbar {
             connection_widget,
             exec_time,
             rows_info,
+            server_icon,
             server_version,
             latency,
             binding: Rc::new(ConnectionBinding::default()),
@@ -164,6 +158,7 @@ impl Statusbar {
 
         // Set initial values
         self.update_latency(connection.latency());
+        self.update_backend(Some(connection.backend()));
         self.update_version(connection.version().as_deref());
         self.update_connection(
             Some(&db_name),
@@ -176,6 +171,7 @@ impl Statusbar {
     pub fn unbind(&self) {
         self.clear_binding();
         self.update_connection(None, dzban_db::ConnectionState::Disconnected, None);
+        self.update_backend(None);
         self.update_version(None);
         self.update_latency(None);
         self.update_exec_time(None);
@@ -209,28 +205,44 @@ impl Statusbar {
         }
     }
 
+    fn update_backend(&self, backend: Option<DatabaseBackend>) {
+        if let Some(backend) = backend {
+            let accessible_label = match backend {
+                DatabaseBackend::Postgresql => "PostgreSQL database server",
+                DatabaseBackend::Clickhouse => "ClickHouse database server",
+            };
+            self.server_icon
+                .set_icon_name(Some(icons::database_backend(backend)));
+            self.server_icon
+                .update_property(&[gtk4::accessible::Property::Label(accessible_label)]);
+            self.server_icon.set_visible(true);
+        } else {
+            self.server_icon.set_visible(false);
+        }
+    }
+
     pub fn update_latency(&self, latency: Option<std::time::Duration>) {
         if let Some(duration) = latency {
             let formatted = format_latency(duration);
-            self.latency.set_text(&format!("📡 {}", formatted));
+            self.latency.set_text(&formatted);
         } else {
-            self.latency.set_text("📡 --");
+            self.latency.set_text("--");
         }
     }
 
     pub fn update_exec_time(&self, seconds: Option<f64>) {
         if let Some(s) = seconds {
-            self.exec_time.set_text(&format!("⏱️  {:.2}s", s));
+            self.exec_time.set_text(&format!("{:.2}s", s));
         } else {
-            self.exec_time.set_text("⏱️  --");
+            self.exec_time.set_text("--");
         }
     }
 
     pub fn update_rows(&self, count: Option<usize>) {
         if let Some(n) = count {
-            self.rows_info.set_text(&format!("📊 {} rows", n));
+            self.rows_info.set_text(&format!("{} rows", n));
         } else {
-            self.rows_info.set_text("📊 -- rows");
+            self.rows_info.set_text("-- rows");
         }
     }
 }
@@ -257,11 +269,31 @@ impl Clone for Statusbar {
             connection_widget: self.connection_widget.clone(),
             exec_time: self.exec_time.clone(),
             rows_info: self.rows_info.clone(),
+            server_icon: self.server_icon.clone(),
             server_version: self.server_version.clone(),
             latency: self.latency.clone(),
             binding: self.binding.clone(),
         }
     }
+}
+
+fn metric(icon_name: &str, text: &str, accessible_label: &str) -> (Box, Image, Label) {
+    let container = Box::new(Orientation::Horizontal, 5);
+    container.set_valign(gtk4::Align::Center);
+    container.set_tooltip_text(Some(accessible_label));
+
+    let icon = Image::from_icon_name(icon_name);
+    icon.set_pixel_size(16);
+    icon.add_css_class("dim-label");
+    icon.update_property(&[gtk4::accessible::Property::Label(accessible_label)]);
+    container.append(&icon);
+
+    let label = Label::new(Some(text));
+    label.add_css_class("dim-label");
+    label.add_css_class("caption");
+    container.append(&label);
+
+    (container, icon, label)
 }
 
 pub fn create_statusbar() -> Statusbar {
@@ -331,5 +363,39 @@ mod tests {
             ),
             "reporting: password authentication failed"
         );
+    }
+
+    #[test]
+    fn database_backends_have_distinct_footer_icons() {
+        assert_eq!(
+            icons::database_backend(DatabaseBackend::Postgresql),
+            "dzban-postgresql"
+        );
+        assert_eq!(
+            icons::database_backend(DatabaseBackend::Clickhouse),
+            "dzban-clickhouse"
+        );
+    }
+
+    #[gtk4::test]
+    #[ignore = "requires a graphical display"]
+    fn footer_switches_the_server_icon_with_the_backend() {
+        let statusbar = Statusbar::new();
+
+        statusbar.update_backend(Some(DatabaseBackend::Postgresql));
+        assert_eq!(
+            statusbar.server_icon.icon_name().as_deref(),
+            Some(icons::POSTGRESQL)
+        );
+        assert!(statusbar.server_icon.is_visible());
+
+        statusbar.update_backend(Some(DatabaseBackend::Clickhouse));
+        assert_eq!(
+            statusbar.server_icon.icon_name().as_deref(),
+            Some(icons::CLICKHOUSE)
+        );
+
+        statusbar.update_backend(None);
+        assert!(!statusbar.server_icon.is_visible());
     }
 }

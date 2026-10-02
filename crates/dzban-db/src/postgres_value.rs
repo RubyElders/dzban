@@ -1,6 +1,6 @@
-use dzban_db::Row;
 use std::error::Error;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use tokio_postgres::Row;
 use tokio_postgres::types::{FromSql, Kind, Type};
 
 struct RawValue(Vec<u8>);
@@ -15,7 +15,7 @@ impl<'a> FromSql<'a> for RawValue {
     }
 }
 
-pub(super) fn display_value(row: &Row, index: usize) -> String {
+pub(crate) fn display_value(row: &Row, index: usize) -> String {
     if let Ok(value) = row.try_get::<_, Option<String>>(index) {
         return value.unwrap_or_else(|| "NULL".to_string());
     }
@@ -71,6 +71,10 @@ pub(super) fn display_value(row: &Row, index: usize) -> String {
         Ok(None) => "NULL".to_string(),
         Err(_) => format!("Unable to display {} value", type_.name()),
     }
+}
+
+pub(crate) fn is_null(row: &Row, index: usize) -> bool {
+    matches!(row.try_get::<_, Option<RawValue>>(index), Ok(None))
 }
 
 fn format_raw(type_: &Type, raw: &[u8]) -> String {

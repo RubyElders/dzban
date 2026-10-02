@@ -6,7 +6,7 @@ Run the real application through AT-SPI for screen-level workflows:
 skills/dzban-ui-testing/scripts/run-dogtail-integration.sh
 ```
 
-The runner builds Dzban, starts the PostgreSQL 15 Compose fixture, runs each scenario in a private headless Mutter/D-Bus/AT-SPI session, and tears everything down. Dogtail is pinned in the test script's PEP 723 metadata and resolved by `uv`. PyGObject comes from the distribution because it binds to native GTK and AT-SPI libraries.
+The runner builds Dzban, starts the PostgreSQL 15 and ClickHouse Compose fixtures, runs each scenario in a private headless Mutter/D-Bus/AT-SPI session, and tears everything down. Dogtail is pinned in the test script's PEP 723 metadata and resolved by `uv`. PyGObject comes from the distribution because it binds to native GTK and AT-SPI libraries.
 
 Keep these invariants:
 

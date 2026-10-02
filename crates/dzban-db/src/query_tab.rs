@@ -322,7 +322,7 @@ impl DbQueryTab {
             glib::MainContext::ref_thread_default().spawn_local(async move {
                 match receiver.await {
                     Ok(Ok(result)) => {
-                        let rows = result.rows.len() as i64;
+                        let rows = result.result_set.rows.len() as i64;
                         let duration_ms = result.duration.as_millis() as i64;
                         tab.set_is_executing(false);
                         tab.set_result_count(rows);

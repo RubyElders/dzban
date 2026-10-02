@@ -3,6 +3,8 @@ use adw::{Application, ApplicationWindow, HeaderBar, Toast, ToastOverlay, Toolba
 use gtk4::prelude::*;
 use libadwaita as adw;
 
+use crate::APP_NAME;
+
 use super::db_tabs::{DatabaseTabManager, QueryPreviewState};
 use super::plan_inspector::PlanScroll;
 use super::shortcuts;
@@ -76,7 +78,7 @@ pub fn build_ui(app: &Application) {
         .application(app)
         .default_width(1400)
         .default_height(900)
-        .title("Dzban - PostgreSQL Client")
+        .title(APP_NAME)
         .build();
 
     // Use ToolbarView for modern header/content/bottom layout (v1_4+)
@@ -384,6 +386,9 @@ fn install_styles() {
             background-color: @error_color;
         }
         .query-history-row .history-row-action {
+            min-width: 20px;
+            min-height: 20px;
+            padding: 0;
             opacity: 0;
             transition: opacity 140ms ease;
         }
@@ -921,15 +926,24 @@ fn query_preview_message(state: &QueryPreviewState) -> String {
         QueryPreviewState::Loading => {
             "Enter to run query - estimating rows and cost...".to_string()
         }
-        QueryPreviewState::Ready {
-            rows,
-            startup_cost,
-            total_cost,
-            ..
-        } => format!(
-            "Enter to run query - ~{} rows - cost {:.2}..{:.2}",
-            rows, startup_cost, total_cost
-        ),
+        QueryPreviewState::Ready { plan } => match (
+            plan.estimate.rows,
+            plan.estimate.startup_cost,
+            plan.estimate.total_cost,
+            plan.estimate.parts,
+            plan.estimate.marks,
+        ) {
+            (Some(rows), Some(startup), Some(total), _, _) => {
+                format!("Enter to run query - ~{rows} rows - cost {startup:.2}..{total:.2}")
+            }
+            (Some(rows), _, _, Some(parts), Some(marks)) => {
+                format!("Enter to run query - ~{rows} rows - {parts} parts - {marks} marks")
+            }
+            (Some(rows), _, _, _, _) => {
+                format!("Enter to run query - ~{rows} rows")
+            }
+            _ => "Enter to run query - plan ready".to_string(),
+        },
         QueryPreviewState::Error(error) => {
             format!("Enter to run query - estimate unavailable: {}", error)
         }
@@ -1047,13 +1061,39 @@ mod tests {
     #[test]
     fn ready_query_preview_prompts_for_execution_with_estimates() {
         let message = query_preview_message(&QueryPreviewState::Ready {
-            rows: 42,
-            startup_cost: 1.25,
-            total_cost: 9.5,
-            plan: serde_json::json!([]),
+            plan: dzban_db::QueryPlan {
+                backend: dzban_db::DatabaseBackend::Postgresql,
+                document: serde_json::json!([]),
+                estimate: dzban_db::QueryEstimate {
+                    rows: Some(42),
+                    startup_cost: Some(1.25),
+                    total_cost: Some(9.5),
+                    parts: None,
+                    marks: None,
+                },
+            },
         });
 
         assert_eq!(message, "Enter to run query - ~42 rows - cost 1.25..9.50");
+    }
+
+    #[test]
+    fn clickhouse_preview_shows_scan_estimates_without_fake_cost() {
+        let message = query_preview_message(&QueryPreviewState::Ready {
+            plan: dzban_db::QueryPlan {
+                backend: dzban_db::DatabaseBackend::Clickhouse,
+                document: serde_json::json!({}),
+                estimate: dzban_db::QueryEstimate {
+                    rows: Some(42),
+                    startup_cost: None,
+                    total_cost: None,
+                    parts: Some(2),
+                    marks: Some(7),
+                },
+            },
+        });
+
+        assert_eq!(message, "Enter to run query - ~42 rows - 2 parts - 7 marks");
     }
 
     #[test]

@@ -1,11 +1,12 @@
 use glib::prelude::*;
 use glib::subclass::prelude::*;
 use std::cell::{Cell, OnceCell, RefCell};
-use std::time::Duration;
 use tracing::{debug, error, info, instrument, trace, warn};
 
+use crate::config::{DatabaseBackend, DatabaseConfig};
 use crate::internal_connection::InternalConnection;
 use crate::runtime_bridge::RuntimeBridge;
+use crate::{QueryPlan, QueryResult};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, glib::Enum)]
 #[enum_type(name = "DzbanConnectionState")]
@@ -15,11 +16,6 @@ pub enum ConnectionState {
     Connecting = 1,
     Connected = 2,
     Error = 3,
-}
-
-pub struct QueryResult {
-    pub rows: Vec<tokio_postgres::Row>,
-    pub duration: Duration,
 }
 
 mod imp {
@@ -37,6 +33,7 @@ mod imp {
         pub active_query_count: Cell<u32>,
 
         pub(super) runtime_bridge: OnceCell<RuntimeBridge>,
+        pub(super) database_config: OnceCell<DatabaseConfig>,
         pub(super) db_connection: RefCell<Option<InternalConnection>>,
     }
 
@@ -52,6 +49,7 @@ mod imp {
                 query_running: Cell::new(false),
                 active_query_count: Cell::new(0),
                 runtime_bridge: OnceCell::new(),
+                database_config: OnceCell::new(),
                 db_connection: RefCell::new(None),
             }
         }
@@ -158,6 +156,19 @@ glib::wrapper! {
 
 impl DbConnection {
     pub fn new(connection_string: String) -> Self {
+        let config = DatabaseConfig::from_connection_string(&connection_string);
+        Self::build(connection_string, config)
+    }
+
+    pub fn from_config(config: DatabaseConfig) -> Self {
+        let connection_string = match config.backend {
+            DatabaseBackend::Postgresql => config.connection_string(),
+            DatabaseBackend::Clickhouse => config.url.clone().unwrap_or_default(),
+        };
+        Self::build(connection_string, config)
+    }
+
+    fn build(connection_string: String, config: DatabaseConfig) -> Self {
         let obj: Self = glib::Object::builder()
             .property("connection-string", connection_string)
             .build();
@@ -167,8 +178,20 @@ impl DbConnection {
             .runtime_bridge
             .set(bridge)
             .expect("RuntimeBridge already initialized");
+        obj.imp()
+            .database_config
+            .set(config)
+            .expect("DatabaseConfig already initialized");
 
         obj
+    }
+
+    pub fn backend(&self) -> DatabaseBackend {
+        self.imp()
+            .database_config
+            .get()
+            .map(|config| config.backend)
+            .unwrap_or_default()
     }
 
     pub fn connection_string(&self) -> String {
@@ -267,16 +290,21 @@ impl DbConnection {
         info!("Starting connection...");
         self.set_state(ConnectionState::Connecting);
 
-        let conn_string = self.connection_string();
         let this = self.clone();
 
         let bridge = self
             .imp()
             .runtime_bridge
             .get()
-            .expect("RuntimeBridge not initialized");
+            .expect("RuntimeBridge not initialized")
+            .clone();
 
-        let config = crate::DatabaseConfig::from_connection_string(&conn_string);
+        let config = self
+            .imp()
+            .database_config
+            .get()
+            .cloned()
+            .unwrap_or_else(|| DatabaseConfig::from_connection_string(&self.connection_string()));
 
         let rx = bridge.connect(config);
 
@@ -285,8 +313,8 @@ impl DbConnection {
                 Ok(Ok(db_conn)) => {
                     info!("Connected successfully");
 
-                    match db_conn.get_version().await {
-                        Ok(version) => {
+                    match bridge.version(db_conn.clone()).await {
+                        Ok(Ok(version)) => {
                             let version_short = version
                                 .split_whitespace()
                                 .take(2)
@@ -294,9 +322,10 @@ impl DbConnection {
                                 .join(" ");
                             this.set_version(Some(version_short));
                         }
-                        Err(e) => {
-                            warn!("Failed to get PostgreSQL version: {}", e);
+                        Ok(Err(e)) => {
+                            warn!("Failed to get database version: {}", e);
                         }
+                        Err(_) => warn!("Database version request was dropped"),
                     }
 
                     this.imp().db_connection.replace(Some(db_conn));
@@ -435,13 +464,16 @@ impl DbConnection {
                 Err(_) => Err("Query cancelled".to_string()),
             };
             let result = match result {
-                Ok(rows) => {
+                Ok(result_set) => {
                     let duration = start.elapsed();
-                    let row_count = rows.len() as i64;
+                    let row_count = result_set.rows.len() as i64;
                     let duration_ms = duration.as_millis() as i64;
                     this.finish_query();
                     this.emit_by_name::<()>("query-finished", &[&row_count, &duration_ms]);
-                    Ok(QueryResult { rows, duration })
+                    Ok(QueryResult {
+                        result_set,
+                        duration,
+                    })
                 }
                 Err(error) => {
                     this.finish_query();
@@ -453,6 +485,31 @@ impl DbConnection {
             let _ = tx.send(result);
         });
 
+        rx
+    }
+
+    pub fn explain_query(
+        &self,
+        query: String,
+    ) -> tokio::sync::oneshot::Receiver<Result<QueryPlan, String>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let Some(db_conn) = self.imp().db_connection.borrow().clone() else {
+            let _ = tx.send(Err("Not connected".to_string()));
+            return rx;
+        };
+        let bridge = self
+            .imp()
+            .runtime_bridge
+            .get()
+            .expect("RuntimeBridge not initialized")
+            .clone();
+        glib::MainContext::ref_thread_default().spawn_local(async move {
+            let result = bridge
+                .explain(db_conn, query)
+                .await
+                .unwrap_or_else(|_| Err("Plan request was dropped".to_string()));
+            let _ = tx.send(result);
+        });
         rx
     }
 

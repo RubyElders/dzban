@@ -1,4 +1,4 @@
-use dzban_db::{DatabaseConfig, RuntimeBridge};
+use dzban_db::{DatabaseBackend, DatabaseConfig, RuntimeBridge};
 use std::time::Duration;
 
 #[test]
@@ -10,11 +10,13 @@ fn test_runtime_bridge_connect() {
 
     let config = DatabaseConfig {
         name: "test_pg15".to_string(),
+        backend: DatabaseBackend::Postgresql,
         host: Some("localhost".to_string()),
         port: Some(5415),
         user: "testuser".to_string(),
         password: Some("testpass".to_string()),
         database: "testdb".to_string(),
+        url: None,
     };
 
     let rx = bridge.connect(config);
@@ -47,11 +49,13 @@ fn test_runtime_bridge_ping() {
 
     let config = DatabaseConfig {
         name: "test_pg15".to_string(),
+        backend: DatabaseBackend::Postgresql,
         host: Some("localhost".to_string()),
         port: Some(5415),
         user: "testuser".to_string(),
         password: Some("testpass".to_string()),
         database: "testdb".to_string(),
+        url: None,
     };
 
     let rx = bridge.connect(config);
@@ -86,11 +90,13 @@ fn test_runtime_bridge_query() {
 
     let config = DatabaseConfig {
         name: "test_pg15".to_string(),
+        backend: DatabaseBackend::Postgresql,
         host: Some("localhost".to_string()),
         port: Some(5415),
         user: "testuser".to_string(),
         password: Some("testpass".to_string()),
         database: "testdb".to_string(),
+        url: None,
     };
 
     let rx = bridge.connect(config);
@@ -125,11 +131,13 @@ fn test_runtime_bridge_invalid_connection() {
 
     let config = DatabaseConfig {
         name: "invalid".to_string(),
+        backend: DatabaseBackend::Postgresql,
         host: Some("invalid-host-does-not-exist".to_string()),
         port: Some(5432),
         user: "user".to_string(),
         password: Some("pass".to_string()),
         database: "db".to_string(),
+        url: None,
     };
 
     let rx = bridge.connect(config);
@@ -163,11 +171,13 @@ fn test_runtime_bridge_test_connection() {
 
     let config = DatabaseConfig {
         name: "test_pg16".to_string(),
+        backend: DatabaseBackend::Postgresql,
         host: Some("localhost".to_string()),
         port: Some(5416),
         user: "user16".to_string(),
         password: Some("pass16".to_string()),
         database: "proddb".to_string(),
+        url: None,
     };
 
     let rx = bridge.test_connection(config);

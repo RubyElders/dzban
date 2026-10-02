@@ -3,6 +3,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, instrument, warn};
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DatabaseBackend {
+    #[default]
+    Postgresql,
+    Clickhouse,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -12,15 +20,22 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatabaseConfig {
     pub name: String,
+    #[serde(default)]
+    pub backend: DatabaseBackend,
     pub host: Option<String>,
     pub port: Option<u16>,
     pub user: String,
     pub database: String,
     pub password: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
 impl DatabaseConfig {
     pub fn connection_string(&self) -> String {
+        if self.backend == DatabaseBackend::Clickhouse {
+            return self.url.clone().unwrap_or_default();
+        }
         let mut parts = vec![
             format!("user={}", self.user),
             format!("dbname={}", self.database),
@@ -39,6 +54,39 @@ impl DatabaseConfig {
         }
 
         parts.join(" ")
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        match self.backend {
+            DatabaseBackend::Postgresql => Ok(()),
+            DatabaseBackend::Clickhouse => match self.url.as_deref() {
+                Some(url) => {
+                    let parsed = reqwest::Url::parse(url).map_err(|error| {
+                        format!(
+                            "ClickHouse connection '{}' has an invalid URL: {error}",
+                            self.name
+                        )
+                    })?;
+                    if !matches!(parsed.scheme(), "http" | "https") {
+                        return Err(format!(
+                            "ClickHouse connection '{}' must use an http:// or https:// URL",
+                            self.name
+                        ));
+                    }
+                    if !parsed.username().is_empty() || parsed.password().is_some() {
+                        return Err(format!(
+                            "ClickHouse connection '{}' must keep credentials in user and password fields",
+                            self.name
+                        ));
+                    }
+                    Ok(())
+                }
+                None => Err(format!(
+                    "ClickHouse connection '{}' requires a URL",
+                    self.name
+                )),
+            },
+        }
     }
 
     /// Parse a PostgreSQL connection string into DatabaseConfig
@@ -65,11 +113,13 @@ impl DatabaseConfig {
 
         Self {
             name: database.clone(),
+            backend: DatabaseBackend::Postgresql,
             host,
             port,
             user,
             database,
             password,
+            url: None,
         }
     }
 }
@@ -112,7 +162,12 @@ impl Config {
         let content = fs::read_to_string(path)
             .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
 
-        toml::from_str(&content).map_err(|e| format!("Failed to parse TOML: {}", e))
+        let config: Self =
+            toml::from_str(&content).map_err(|e| format!("Failed to parse TOML: {}", e))?;
+        for database in &config.databases {
+            database.validate()?;
+        }
+        Ok(config)
     }
 
     #[instrument]

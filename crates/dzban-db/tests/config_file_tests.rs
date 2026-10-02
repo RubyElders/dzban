@@ -1,4 +1,4 @@
-use dzban_db::Config;
+use dzban_db::{Config, DatabaseBackend};
 use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -51,4 +51,52 @@ fn reports_a_missing_config_file() {
     let error = Config::load_from_path(&path).unwrap_err();
 
     assert!(error.contains("Failed to read"));
+}
+
+#[test]
+fn loads_clickhouse_http_configuration() {
+    let path = temp_config_path("clickhouse");
+    fs::write(
+        &path,
+        r#"
+[[databases]]
+name = "analytics"
+backend = "clickhouse"
+url = "https://clickhouse.example.test:8443"
+user = "reader"
+database = "events"
+"#,
+    )
+    .unwrap();
+
+    let config = Config::load_from_path(&path).unwrap();
+    fs::remove_file(path).unwrap();
+
+    assert_eq!(config.databases[0].backend, DatabaseBackend::Clickhouse);
+    assert_eq!(
+        config.databases[0].url.as_deref(),
+        Some("https://clickhouse.example.test:8443")
+    );
+}
+
+#[test]
+fn rejects_clickhouse_without_an_http_url() {
+    let path = temp_config_path("invalid-clickhouse");
+    fs::write(
+        &path,
+        r#"
+[[databases]]
+name = "analytics"
+backend = "clickhouse"
+url = "clickhouse://localhost:9000"
+user = "reader"
+database = "events"
+"#,
+    )
+    .unwrap();
+
+    let error = Config::load_from_path(&path).unwrap_err();
+    fs::remove_file(path).unwrap();
+
+    assert!(error.contains("must use an http:// or https:// URL"));
 }

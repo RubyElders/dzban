@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Dzban
+GenericName=Database Client
+Comment=Explore and query PostgreSQL and ClickHouse databases
+Exec="@LAUNCHER@"
+TryExec=@LAUNCHER@
+Path=@WORKING_DIRECTORY@
+Icon=com.fuga.dzban
+Terminal=false
+Categories=Development;Database;
+Keywords=PostgreSQL;ClickHouse;SQL;Database;Query;
+StartupNotify=true
+StartupWMClass=com.fuga.dzban

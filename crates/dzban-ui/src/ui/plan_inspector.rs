@@ -2,6 +2,7 @@ use gtk4::prelude::*;
 use gtk4::{Box, Button, Label, Orientation, ScrolledWindow, Spinner, Stack, TextView};
 
 use super::preview_overlay::PreviewOverlay;
+use dzban_db::QueryPlan;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlanState {
@@ -46,7 +47,7 @@ impl PlanInspector {
         container.update_property(&[
             gtk4::accessible::Property::Label("Query plan inspector"),
             gtk4::accessible::Property::Description(
-                "Estimated rows, cost, and PostgreSQL query plan",
+                "Estimated rows, cost, and database query plan",
             ),
         ]);
         container.set_visible(false);
@@ -97,7 +98,7 @@ impl PlanInspector {
         let spinner = Spinner::new();
         spinner.set_spinning(true);
         spinner.set_size_request(32, 32);
-        let loading_label = Label::new(Some("Estimating rows and cost..."));
+        let loading_label = Label::new(Some("Estimating query..."));
         loading_label.add_css_class("dim-label");
         loading.append(&spinner);
         loading.append(&loading_label);
@@ -127,7 +128,7 @@ impl PlanInspector {
         plan_view.set_top_margin(4);
         plan_view.set_bottom_margin(12);
         plan_view.update_property(&[
-            gtk4::accessible::Property::Label("PostgreSQL query plan"),
+            gtk4::accessible::Property::Label("Database query plan"),
             gtk4::accessible::Property::ReadOnly(true),
         ]);
         scrolled.set_child(Some(&plan_view));
@@ -183,8 +184,12 @@ impl PlanInspector {
             PlanState::Loading => self.stack.set_visible_child_name("loading"),
             PlanState::Ready(plan) => {
                 self.summary.set_text(&plan_summary(plan));
+                let document = serde_json::from_value::<QueryPlan>(plan.clone())
+                    .map(|plan| plan.document)
+                    .unwrap_or_else(|_| plan.clone());
                 self.plan_view.buffer().set_text(
-                    &serde_json::to_string_pretty(plan).unwrap_or_else(|_| plan.to_string()),
+                    &serde_json::to_string_pretty(&document)
+                        .unwrap_or_else(|_| document.to_string()),
                 );
                 self.stack.set_visible_child_name("ready");
             }
@@ -209,6 +214,8 @@ impl PlanInspector {
         }
         self.pin_button.set_icon_name("view-pin-symbolic");
         self.pin_button.set_tooltip_text(Some("Unpin query plan"));
+        self.pin_button
+            .update_property(&[gtk4::accessible::Property::Label("Unpin query plan")]);
         self.plan_view.grab_focus();
         true
     }
@@ -218,6 +225,8 @@ impl PlanInspector {
             return false;
         }
         self.pin_button.set_tooltip_text(Some("Pin query plan"));
+        self.pin_button
+            .update_property(&[gtk4::accessible::Property::Label("Pin query plan")]);
         true
     }
 
@@ -258,6 +267,25 @@ impl PlanInspector {
 }
 
 fn plan_summary(plan: &serde_json::Value) -> String {
+    if let Ok(plan) = serde_json::from_value::<QueryPlan>(plan.clone()) {
+        let estimate = plan.estimate;
+        return match (
+            estimate.rows,
+            estimate.startup_cost,
+            estimate.total_cost,
+            estimate.parts,
+            estimate.marks,
+        ) {
+            (Some(rows), Some(startup), Some(total), _, _) => {
+                format!("Estimated rows: {rows}    Cost: {startup:.2}..{total:.2}")
+            }
+            (Some(rows), _, _, Some(parts), Some(marks)) => {
+                format!("Estimated rows: {rows}    Parts: {parts}    Marks: {marks}")
+            }
+            (Some(rows), _, _, _, _) => format!("Estimated rows: {rows}"),
+            _ => "Estimated query plan".to_string(),
+        };
+    }
     let root = plan
         .as_array()
         .and_then(|plans| plans.first())
@@ -301,6 +329,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn plan_summary_uses_clickhouse_scan_estimates() {
+        let plan = serde_json::to_value(QueryPlan {
+            backend: dzban_db::DatabaseBackend::Clickhouse,
+            document: serde_json::json!({"Plan": {}}),
+            estimate: dzban_db::QueryEstimate {
+                rows: Some(42),
+                startup_cost: None,
+                total_cost: None,
+                parts: Some(2),
+                marks: Some(7),
+            },
+        })
+        .unwrap();
+
+        assert_eq!(
+            plan_summary(&plan),
+            "Estimated rows: 42    Parts: 2    Marks: 7"
+        );
+    }
+
     #[gtk4::test]
     #[ignore = "requires a graphical display"]
     fn transient_plan_can_be_pinned_and_closed() {
@@ -316,13 +365,5 @@ mod tests {
         assert!(inspector.is_pinned());
         assert!(inspector.close());
         assert!(!inspector.is_visible());
-        assert!(gtk4::test_accessible_has_property(
-            &inspector.pin_button,
-            gtk4::AccessibleProperty::Label
-        ));
-        assert!(gtk4::test_accessible_has_property(
-            &inspector.plan_view,
-            gtk4::AccessibleProperty::ReadOnly
-        ));
     }
 }

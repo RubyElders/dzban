@@ -12,7 +12,7 @@ Do not claim UI behavior works from compilation or property assertions alone. Us
 3. Put keyboard and chord interpretation in a pure state machine and test it without a display. Use GTK tests for focus, accessible properties, and widget reactions.
 4. When an external black-box interaction test is useful, prefer an AT-SPI driver such as Dogtail and stable accessible names. Do not make screen coordinates the behavioral assertion.
 5. For theme painting, animation, popovers, or layout stability, run the real application in a virtual display and inspect captured frames. Coordinate replay is only an aid for reaching visual states.
-6. When the UI depends on query behavior, combine the UI run with the disposable PostgreSQL environment from `skills/dzban-testing`.
+6. When the UI depends on query behavior, combine the UI run with the disposable database environment from `skills/dzban-testing`.
 
 Read [references/dogtail-integration.md](references/dogtail-integration.md) before adding or changing a screen-level workflow. Run the maintained suite with `scripts/run-dogtail-integration.sh`.
 

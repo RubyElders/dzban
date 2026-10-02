@@ -1,6 +1,6 @@
 ---
 name: dzban-testing
-description: Build and test Dzban across Rust unit tests and disposable PostgreSQL integration services. Use when changing database, configuration, query execution, persistence, or cross-crate behavior in this repository.
+description: Build and test Dzban across Rust unit tests and disposable PostgreSQL and ClickHouse integration services. Use when changing database, configuration, query execution, persistence, or cross-crate behavior in this repository.
 ---
 
 # Dzban Testing

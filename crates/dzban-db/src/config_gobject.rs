@@ -3,6 +3,7 @@ use glib::subclass::prelude::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+use crate::DatabaseConfig;
 use crate::connection_gobject::ConnectionState;
 use crate::connection_gobject::DbConnection;
 use crate::query_tab::DbQueryTab;
@@ -18,6 +19,22 @@ impl DbConfig {
     /// * `config_name` - Unique name for this configuration (e.g., "Production", "Staging")
     /// * `connection_string` - PostgreSQL connection string for this config
     pub fn new(config_name: String, connection_string: String) -> Self {
+        let mut database_config = DatabaseConfig::from_connection_string(&connection_string);
+        database_config.name = config_name.clone();
+        Self::build(config_name, connection_string, database_config)
+    }
+
+    pub fn from_database_config(database_config: DatabaseConfig) -> Self {
+        let config_name = database_config.name.clone();
+        let connection_string = database_config.connection_string();
+        Self::build(config_name, connection_string, database_config)
+    }
+
+    fn build(
+        config_name: String,
+        connection_string: String,
+        database_config: DatabaseConfig,
+    ) -> Self {
         let obj: Self = glib::Object::builder()
             .property("config-name", config_name.clone())
             .property("connection-string", connection_string.clone())
@@ -25,7 +42,11 @@ impl DbConfig {
             .property("active-tab-index", -1i32)
             .build();
 
-        let connection = DbConnection::new(connection_string);
+        let connection = if database_config.backend == crate::DatabaseBackend::Postgresql {
+            DbConnection::new(connection_string)
+        } else {
+            DbConnection::from_config(database_config)
+        };
         let config = obj.clone();
         connection.connect_closure(
             "state-changed",

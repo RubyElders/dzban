@@ -3,6 +3,7 @@ use glib::subclass::prelude::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+use crate::DatabaseConfig;
 use crate::config_gobject::DbConfig;
 use crate::connection_gobject::ConnectionState;
 
@@ -36,13 +37,20 @@ impl DbManager {
     /// Add a new database configuration
     /// Returns true if added successfully, false if name already exists
     pub fn add_config(&self, config_name: String, connection_string: String) -> bool {
+        let mut database_config = DatabaseConfig::from_connection_string(&connection_string);
+        database_config.name = config_name;
+        self.add_database_config(database_config)
+    }
+
+    pub fn add_database_config(&self, database_config: DatabaseConfig) -> bool {
+        let config_name = database_config.name.clone();
         let configs = self.imp().configs.borrow();
         if configs.contains_key(&config_name) {
             return false;
         }
         drop(configs);
 
-        let config = DbConfig::new(config_name.clone(), connection_string);
+        let config = DbConfig::from_database_config(database_config);
 
         self.connect_config_signals(&config);
 

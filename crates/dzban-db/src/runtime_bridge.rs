@@ -12,6 +12,7 @@ use tracing::{debug, error, info, trace};
 
 use crate::config::DatabaseConfig;
 use crate::internal_connection::InternalConnection;
+use crate::{QueryPlan, ResultSet};
 
 /// A bridge that runs Tokio tasks from non-Tokio contexts (like GTK/GLib)
 #[derive(Clone, Debug)]
@@ -49,7 +50,13 @@ impl RuntimeBridge {
         self.runtime.spawn(async move {
             debug!("Bridge: Running connect on Tokio runtime");
 
-            let mut conn = InternalConnection::new(db_config);
+            let conn = match InternalConnection::new(db_config) {
+                Ok(conn) => conn,
+                Err(error) => {
+                    let _ = tx.send(Err(error));
+                    return;
+                }
+            };
 
             let result = conn.connect().await;
 
@@ -117,10 +124,10 @@ impl RuntimeBridge {
 
         self.runtime.spawn(async move {
             debug!("Bridge: Running query on Tokio runtime");
-            let result = conn.execute_query(&query).await;
+            let result = conn.execute_query_rows(&query).await;
             match result {
-                Ok(row_count) => {
-                    let _ = tx.send(Ok((row_count, conn)));
+                Ok(result_set) => {
+                    let _ = tx.send(Ok((result_set.rows.len() as u64, conn)));
                 }
                 Err(e) => {
                     let _ = tx.send(Err(e));
@@ -135,7 +142,7 @@ impl RuntimeBridge {
         &self,
         conn: InternalConnection,
         query: String,
-    ) -> oneshot::Receiver<Result<Vec<tokio_postgres::Row>, String>> {
+    ) -> oneshot::Receiver<Result<ResultSet, String>> {
         let (tx, rx) = oneshot::channel();
 
         self.runtime.spawn(async move {
@@ -147,10 +154,32 @@ impl RuntimeBridge {
         rx
     }
 
+    pub fn explain(
+        &self,
+        conn: InternalConnection,
+        query: String,
+    ) -> oneshot::Receiver<Result<QueryPlan, String>> {
+        let (tx, rx) = oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let _ = tx.send(conn.explain(&query).await);
+        });
+
+        rx
+    }
+
     pub fn cancel_query(&self, conn: InternalConnection) -> oneshot::Receiver<Result<(), String>> {
         let (tx, rx) = oneshot::channel();
         self.runtime.spawn(async move {
             let _ = tx.send(conn.cancel_query().await);
+        });
+        rx
+    }
+
+    pub fn version(&self, conn: InternalConnection) -> oneshot::Receiver<Result<String, String>> {
+        let (tx, rx) = oneshot::channel();
+        self.runtime.spawn(async move {
+            let _ = tx.send(conn.get_version().await);
         });
         rx
     }

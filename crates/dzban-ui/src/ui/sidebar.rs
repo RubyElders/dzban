@@ -1,5 +1,5 @@
 use gtk4::prelude::*;
-use gtk4::{Box, Label, ListBox, ListBoxRow, Orientation, ScrolledWindow};
+use gtk4::{Box, Label, ListBox, ListBoxRow, Orientation, Overlay, ScrolledWindow};
 use libadwaita as adw;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -189,6 +189,8 @@ impl QueryHistory {
             }
         }
         details.append(&metadata);
+        let details_overlay = Overlay::new();
+        details_overlay.set_child(Some(&details));
 
         let entry = Rc::new(entry.clone());
         if matches!(
@@ -210,7 +212,9 @@ impl QueryHistory {
             explain_button.add_css_class("flat");
             explain_button.add_css_class("circular");
             explain_button.add_css_class("history-row-action");
-            details.append(&explain_button);
+            explain_button.set_halign(gtk4::Align::End);
+            metadata.set_margin_end(24);
+            details_overlay.add_overlay(&explain_button);
 
             let callback = self.plan_callback.clone();
             let entry_for_explain = Rc::clone(&entry);
@@ -237,7 +241,7 @@ impl QueryHistory {
             });
             explain_button.add_controller(hover);
         }
-        content.append(&details);
+        content.append(&details_overlay);
         row.set_child(Some(&content));
 
         let callback = self.open_callback.clone();
@@ -285,6 +289,20 @@ fn format_timestamp(timestamp: u64) -> String {
 mod tests {
     use super::*;
 
+    fn history_for_widget_test() -> QueryHistory {
+        let container = Box::new(Orientation::Vertical, 0);
+        let listbox = ListBox::new();
+        container.append(&listbox);
+        QueryHistory {
+            container,
+            listbox,
+            open_callback: Rc::new(RefCell::new(None)),
+            plan_callback: Rc::new(RefCell::new(None)),
+            store: Rc::new(RefCell::new(None)),
+            entry_count: Rc::new(Cell::new(0)),
+        }
+    }
+
     #[test]
     fn query_titles_collapse_whitespace() {
         assert_eq!(
@@ -306,5 +324,40 @@ mod tests {
     #[test]
     fn timestamps_are_displayable() {
         assert_ne!(format_timestamp(0), "Unknown time");
+    }
+
+    #[gtk4::test]
+    #[ignore = "requires a graphical display"]
+    fn successful_and_failed_history_rows_have_the_same_height() {
+        let history = history_for_widget_test();
+        history.render_entry(&QueryHistoryEntry {
+            sql: "SELECT successful_query".to_string(),
+            executed_at: 0,
+            outcome: QueryHistoryOutcome::Success {
+                duration_ms: 42,
+                rows: 1,
+                result: None,
+                explain: Some(serde_json::json!({})),
+                explain_error: None,
+            },
+        });
+        history.render_entry(&QueryHistoryEntry {
+            sql: "SELECT failed_query".to_string(),
+            executed_at: 0,
+            outcome: QueryHistoryOutcome::Failure {
+                error: "column does not exist".to_string(),
+            },
+        });
+
+        let window = gtk4::Window::new();
+        window.set_default_size(360, 240);
+        window.set_child(Some(history.widget()));
+        window.present();
+        gtk4::test_widget_wait_for_draw(history.widget());
+
+        let failed = history.listbox.row_at_index(0).unwrap();
+        let successful = history.listbox.row_at_index(1).unwrap();
+        assert_eq!(successful.height(), failed.height());
+        window.close();
     }
 }

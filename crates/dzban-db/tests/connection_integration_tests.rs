@@ -1,4 +1,4 @@
-use dzban_db::{ConnectionState, DbConnection};
+use dzban_db::{ConnectionState, DbConnection, ResultCell};
 use glib::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -37,10 +37,20 @@ async fn row_query_reports_rows_timing_and_state() {
     assert!(connection.query_running());
     let result = receiver.await.unwrap().unwrap();
 
-    assert_eq!(result.rows.len(), 3);
+    assert_eq!(result.result_set.rows.len(), 3);
     assert!(!connection.query_running());
     assert_eq!(connection.last_error(), "");
     assert_eq!(finished.borrow().as_ref().unwrap().0, 3);
+
+    let nulls = connection
+        .execute_query_rows("SELECT 'NULL'::text, NULL::text".to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        nulls.result_set.rows[0],
+        vec![ResultCell::Text("NULL".to_string()), ResultCell::Null]
+    );
     connection.disconnect();
 }
 

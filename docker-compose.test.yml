@@ -14,7 +14,7 @@ services:
       test: ["CMD-SHELL", "pg_isready -U testuser -d testdb"]
       interval: 2s
       timeout: 3s
-      retries: 5
+      retries: 15
     networks:
       - dzban-test
 
@@ -33,7 +33,7 @@ services:
       test: ["CMD-SHELL", "pg_isready -U user16 -d proddb"]
       interval: 2s
       timeout: 3s
-      retries: 5
+      retries: 15
     networks:
       - dzban-test
 
@@ -52,7 +52,7 @@ services:
       test: ["CMD-SHELL", "pg_isready -U admin -d devdb"]
       interval: 2s
       timeout: 3s
-      retries: 5
+      retries: 15
     networks:
       - dzban-test
 
@@ -73,7 +73,30 @@ services:
       test: ["CMD-SHELL", "pg_isready -U slowuser -d slowdb"]
       interval: 2s
       timeout: 3s
-      retries: 5
+      retries: 15
+    networks:
+      - dzban-test
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8-alpine
+    container_name: dzban-test-clickhouse
+    environment:
+      CLICKHOUSE_USER: dzban
+      CLICKHOUSE_PASSWORD: dzban-test
+      CLICKHOUSE_DB: dzban_test
+    ports:
+      - "58123:8123"
+    volumes:
+      - ./crates/dzban-db/tests/fixtures/init-clickhouse.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "clickhouse-client --user dzban --password dzban-test --database dzban_test --query 'SELECT 1'",
+        ]
+      interval: 2s
+      timeout: 3s
+      retries: 15
     networks:
       - dzban-test
 

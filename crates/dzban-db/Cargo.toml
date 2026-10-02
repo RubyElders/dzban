@@ -15,7 +15,11 @@ tokio.workspace = true
 tokio-postgres.workspace = true
 tokio-postgres-rustls.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 toml.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+uuid.workspace = true
 
 # Logging
 tracing.workspace = true

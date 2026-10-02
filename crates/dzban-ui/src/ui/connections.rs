@@ -1,12 +1,13 @@
+use super::icons;
 use adw::prelude::*;
 use adw::{ActionRow, StatusPage};
 use gtk4::prelude::*;
-use gtk4::{Box, Button, Label, ListBox, Orientation, ScrolledWindow, Spinner};
+use gtk4::{Box, Button, Image, Label, ListBox, Orientation, ScrolledWindow, Spinner};
 use libadwaita as adw;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use dzban_db::{Config, DatabaseConfig, RuntimeBridge};
+use dzban_db::{Config, DatabaseBackend, DatabaseConfig, RuntimeBridge};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TestStatus {
@@ -228,17 +229,39 @@ where
     row.set_use_markup(false);
     row.set_title(&db_config.name);
 
+    let backend_icon = Image::from_icon_name(icons::database_backend(db_config.backend));
+    backend_icon.set_pixel_size(24);
+    backend_icon.set_valign(gtk4::Align::Center);
+    backend_icon.set_tooltip_text(Some(icons::database_backend_label(db_config.backend)));
+    backend_icon.update_property(&[gtk4::accessible::Property::Label(
+        icons::database_backend_label(db_config.backend),
+    )]);
+    row.add_prefix(&backend_icon);
+
     // Build subtitle with connection details
-    let details = if let Some(host) = &db_config.host {
-        format!(
-            "{}@{}:{}/{}",
-            db_config.user,
-            host,
-            db_config.port.unwrap_or(5432),
-            db_config.database
-        )
-    } else {
-        format!("{}@unix/{}", db_config.user, db_config.database)
+    let details = match db_config.backend {
+        DatabaseBackend::Postgresql => {
+            if let Some(host) = &db_config.host {
+                format!(
+                    "PostgreSQL - {}@{}:{}/{}",
+                    db_config.user,
+                    host,
+                    db_config.port.unwrap_or(5432),
+                    db_config.database
+                )
+            } else {
+                format!(
+                    "PostgreSQL - {}@unix/{}",
+                    db_config.user, db_config.database
+                )
+            }
+        }
+        DatabaseBackend::Clickhouse => {
+            format!(
+                "ClickHouse HTTP - {}@{}",
+                db_config.user, db_config.database
+            )
+        }
     };
     row.set_subtitle(&details);
 

@@ -15,7 +15,7 @@ from dogtail.hermetic.session import HermeticSession, dump_tree, missing_binarie
 from dogtail.logging import logging_class
 
 
-APP_NAME = "dzban"
+APP_NAME = "Dzban"
 MISSING_BINARIES = missing_binaries()
 logging_class.logger.setLevel(logging.WARNING)
 warnings.filterwarnings(
@@ -112,6 +112,7 @@ password = "testpass"
 
         wait_for_node(application, "Database Connections")
         wait_for_node(application, "Integration PostgreSQL")
+        wait_for_node(application, "PostgreSQL database backend")
         wait_for_node(application, "Open", "button").do_action_named("click")
         wait_for_node(application, "Query History")
 
@@ -137,6 +138,10 @@ password = "testpass"
         wait_for_node(application, "Test All Connections")
         wait_for_node(application, "No Results")
         wait_for_node_containing(application, "PostgreSQL", timeout=15)
+        wait_for_node(application, "Query execution time")
+        wait_for_node(application, "Returned rows")
+        wait_for_node(application, "Database ping latency")
+        wait_for_node(application, "PostgreSQL database server")
         wait_for_node(application, "New query tab", "button").do_action_named("click")
         action_field.text = "query tab"
         wait_for_node(
@@ -172,7 +177,8 @@ password = "testpass"
         plan_button.do_action_named("click")
 
         wait_for_node(application, "Query Plan")
-        wait_for_node(application, "PostgreSQL query plan")
+        wait_for_node(application, "Database query plan")
+        wait_for_node(application, "Unpin query plan", "button")
         wait_for_node(application, "Close query plan", "button").do_action_named("click")
 
         editor.text = "SELECT * FROM dzban_missing_table"
@@ -186,11 +192,56 @@ password = "testpass"
         ).do_action_named("click")
         wait_for_node(application, "Database Connections")
 
+    def test_clickhouse_results_errors_history_and_plan(self):
+        application = self.launch(
+            """
+[[databases]]
+name = "Integration ClickHouse"
+backend = "clickhouse"
+url = "http://127.0.0.1:58123"
+user = "dzban"
+database = "dzban_test"
+password = "dzban-test"
+""".strip()
+        )
+
+        wait_for_node(application, "Integration ClickHouse")
+        wait_for_node(application, "ClickHouse database backend")
+        wait_for_node(application, "Open", "button").do_action_named("click")
+        wait_for_node_containing(application, "25.", timeout=15)
+        wait_for_node(application, "Query execution time")
+        wait_for_node(application, "Returned rows")
+        wait_for_node(application, "Database ping latency")
+        wait_for_node(application, "ClickHouse database server")
+        editor = wait_for_node(application, "SQL query editor")
+        editor.text = "SELECT id, name, occurred_at FROM events ORDER BY id"
+        wait_for_node(application, "Run query", "button").do_action_named("click")
+
+        wait_for_node_containing(application, "3 rows", timeout=15)
+        wait_for_node(application, "connected", timeout=15)
+        wait_for_node(application, "2026-09-24 10:00:00.123", timeout=15)
+        wait_for_node(
+            application, "SELECT id, name, occurred_at FROM events ORDER BY id", timeout=15
+        )
+        wait_for_node(application, "Show saved query plan", "button").do_action_named(
+            "click"
+        )
+        wait_for_node(application, "Query Plan")
+        wait_for_node(application, "Database query plan")
+        wait_for_node(application, "Unpin query plan", "button")
+        wait_for_node(application, "Close query plan", "button").do_action_named("click")
+
+        editor.text = "SELECT * FROM missing_clickhouse_table"
+        wait_for_node(application, "Run query", "button").do_action_named("click")
+        wait_for_node(application, "Query Failed", timeout=15)
+        wait_for_node_containing(application, "missing_clickhouse_table", timeout=15)
+
 
 if __name__ == "__main__":
     scenarios = {
         "empty": "test_empty_connections_and_shortcuts_screen",
         "database": "test_query_results_history_and_saved_plan",
+        "clickhouse": "test_clickhouse_results_errors_history_and_plan",
     }
     scenario = os.environ.get("DZBAN_UI_SCENARIO")
     if scenario not in scenarios:

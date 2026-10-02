@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/com/fuga/dzban/icons">
+    <file>scalable/status/dzban-postgresql.svg</file>
+    <file>scalable/status/dzban-clickhouse.svg</file>
+    <file>scalable/status/dzban-query-time-symbolic.svg</file>
+    <file>scalable/status/dzban-result-rows-symbolic.svg</file>
+    <file>scalable/status/dzban-ping-symbolic.svg</file>
+  </gresource>
+</gresources>

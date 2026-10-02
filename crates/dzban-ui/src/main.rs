@@ -6,8 +6,12 @@ use libadwaita as adw;
 use tracing_subscriber::{EnvFilter, fmt};
 
 const APP_ID: &str = "com.fuga.dzban";
+pub(crate) const APP_NAME: &str = "Dzban";
 
 fn main() {
+    gtk4::glib::set_prgname(Some(APP_NAME));
+    gtk4::glib::set_application_name(APP_NAME);
+
     // Initialize logging
     // Use RUST_LOG environment variable or default to showing debug logs for dzban
     fmt()
@@ -20,10 +24,11 @@ fn main() {
         .with_line_number(true)
         .init();
 
-    tracing::info!("Starting Dzban PostgreSQL Client");
+    tracing::info!("Starting {APP_NAME}");
 
     // Initialize Adwaita
     adw::init().expect("Failed to initialize Adwaita");
+    ui::icons::register();
 
     // Create application
     let app = Application::builder().application_id(APP_ID).build();

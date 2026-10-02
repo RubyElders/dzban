@@ -20,9 +20,8 @@ use super::preview_overlay::{PreviewRelease, preview_release};
 use super::query_history::{QueryHistoryEntry, QueryHistoryOutcome, QueryResultSnapshot};
 use super::query_state::QueryStateManager;
 use super::result_inspector::ResultInspector;
-use super::result_value::display_value;
 use super::sidebar::{HistoryPlanAction, QueryHistory};
-use dzban_db::Row;
+use dzban_db::ResultSet;
 
 const MAX_RESULT_COLUMN_WIDTH: i32 = 360;
 const RESULT_CELL_HORIZONTAL_SPACE: i32 = 16;
@@ -337,8 +336,12 @@ impl QueryTabManager {
         }
     }
 
-    pub fn display_results_for(&self, query_num: u32, rows: Vec<Row>) -> QueryResultSnapshot {
-        let result = result_snapshot(&rows);
+    pub fn display_results_for(
+        &self,
+        query_num: u32,
+        result_set: ResultSet,
+    ) -> QueryResultSnapshot {
+        let result = result_snapshot(&result_set);
         self.display_result_snapshot_for(query_num, &result);
         bounded_result_snapshot(&result)
     }
@@ -774,9 +777,7 @@ fn create_query_editor_pane() -> (Box, SourceView, ScrolledWindow) {
     sql_editor.set_widget_name("sql-query-editor");
     sql_editor.update_property(&[
         gtk4::accessible::Property::Label("SQL query editor"),
-        gtk4::accessible::Property::Description(
-            "Write PostgreSQL statements to preview or execute",
-        ),
+        gtk4::accessible::Property::Description("Write SQL statements to preview or execute"),
         gtk4::accessible::Property::MultiLine(true),
     ]);
 
@@ -874,30 +875,25 @@ fn create_error_page(error: &str) -> adw::StatusPage {
 const MAX_HISTORY_RESULT_ROWS: usize = 200;
 const MAX_HISTORY_RESULT_BYTES: usize = 1_000_000;
 
-fn result_snapshot(rows: &[Row]) -> QueryResultSnapshot {
-    let columns = rows
-        .first()
-        .map(|row| {
-            row.columns()
-                .iter()
-                .map(|column| column.name().to_string())
-                .collect()
-        })
-        .unwrap_or_default();
-    let data = rows
+fn result_snapshot(result_set: &ResultSet) -> QueryResultSnapshot {
+    let columns = result_set
+        .columns
+        .iter()
+        .map(|column| column.name.clone())
+        .collect();
+    let data = result_set
+        .rows
         .iter()
         .map(|row| {
-            row.columns()
-                .iter()
-                .enumerate()
-                .map(|(index, _)| display_value(row, index))
+            row.iter()
+                .map(|value| value.display().to_string())
                 .collect()
         })
         .collect();
     QueryResultSnapshot {
         columns,
         rows: data,
-        total_rows: rows.len(),
+        total_rows: result_set.rows.len(),
     }
 }
 

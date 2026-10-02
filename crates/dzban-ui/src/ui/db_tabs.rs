@@ -13,7 +13,7 @@ use super::plan_inspector::{PlanScroll, PlanState};
 use super::query_state::QueryExecution;
 use super::query_tabs::QueryTabManager;
 use super::statusbar::Statusbar;
-use dzban_db::{Config, ConnectionState, DbConfig, DbManager, RuntimeBridge};
+use dzban_db::{Config, ConnectionState, DbConfig, DbManager, QueryPlan, RuntimeBridge};
 
 type DatabaseTab = (TabPage, QueryTabManager, DbConfig, ConnectionStateWidget);
 type DatabaseTabs = Rc<RefCell<HashMap<String, DatabaseTab>>>;
@@ -25,12 +25,7 @@ const QUERY_PREVIEW_DELAY: Duration = Duration::from_millis(250);
 pub enum QueryPreviewState {
     Idle,
     Loading,
-    Ready {
-        rows: i64,
-        startup_cost: f64,
-        total_cost: f64,
-        plan: serde_json::Value,
-    },
+    Ready { plan: QueryPlan },
     Error(String),
 }
 
@@ -245,29 +240,11 @@ impl DatabaseTabManager {
                 ));
                 return;
             }
-            let Some(explain_sql) = explain_statement(&sql) else {
-                manager.emit_query_preview(QueryPreviewState::Error(
-                    "Current statement is already EXPLAIN".to_string(),
-                ));
-                return;
-            };
-
             let manager_for_result = manager.clone();
-            let rx = connection.execute_query_rows(explain_sql);
+            let rx = connection.explain_query(sql);
             glib::spawn_future_local(async move {
                 let state = match rx.await {
-                    Ok(Ok(result)) => extract_explain_plan(&result.rows)
-                        .and_then(|plan| {
-                            extract_query_estimate(&plan).map(|(rows, startup_cost, total_cost)| {
-                                QueryPreviewState::Ready {
-                                    rows,
-                                    startup_cost,
-                                    total_cost,
-                                    plan,
-                                }
-                            })
-                        })
-                        .unwrap_or_else(QueryPreviewState::Error),
+                    Ok(Ok(plan)) => QueryPreviewState::Ready { plan },
                     Ok(Err(error)) => QueryPreviewState::Error(error),
                     Err(_) => QueryPreviewState::Error("EXPLAIN was cancelled".to_string()),
                 };
@@ -297,8 +274,10 @@ impl DatabaseTabManager {
         if let Some(query_manager) = self.query_preview_manager.borrow().as_ref() {
             match &state {
                 QueryPreviewState::Loading => query_manager.set_plan_preview(PlanState::Loading),
-                QueryPreviewState::Ready { plan, .. } => {
-                    query_manager.set_plan_preview(PlanState::Ready(plan.clone()));
+                QueryPreviewState::Ready { plan } => {
+                    query_manager.set_plan_preview(PlanState::Ready(
+                        serde_json::to_value(plan).unwrap_or_default(),
+                    ));
                 }
                 QueryPreviewState::Error(error) => {
                     query_manager.set_plan_preview(PlanState::Error(error.clone()));
@@ -493,10 +472,7 @@ impl DatabaseTabManager {
                 config.and_then(|c| c.databases.iter().find(|db| db.name == db_name).cloned());
 
             if let Some(db_config) = db_config {
-                if !self
-                    .db_manager
-                    .add_config(db_name.to_string(), db_config.connection_string())
-                {
+                if !self.db_manager.add_database_config(db_config) {
                     return;
                 }
                 let config = self
@@ -660,17 +636,13 @@ impl DatabaseTabManager {
                             match rx.await {
                                 Ok(Ok(result)) => {
                                     execution.finish();
-                                    let row_count = result.rows.len();
+                                    let row_count = result.result_set.rows.len();
                                     let duration = result.duration;
-                                    let explain_sql = explain_statement(&history_sql);
-                                    let embedded_plan = if explain_sql.is_none() {
-                                        extract_explain_plan(&result.rows).ok()
-                                    } else {
-                                        None
-                                    };
                                     tracing::info!("Query returned {} rows", row_count);
-                                    let stored_result = query_manager
-                                        .display_results_for(execution.query_num(), result.rows);
+                                    let stored_result = query_manager.display_results_for(
+                                        execution.query_num(),
+                                        result.result_set,
+                                    );
                                     if tab_view.selected_page().as_ref() == Some(&database_page)
                                         && query_manager.is_query_selected(execution.query_num())
                                     {
@@ -678,35 +650,15 @@ impl DatabaseTabManager {
                                         statusbar.update_exec_time(Some(duration.as_secs_f64()));
                                     }
 
-                                    let (explain, explain_error) = match explain_sql {
-                                        Some(explain_sql) => {
-                                            match connection.execute_query_rows(explain_sql).await {
-                                                Ok(Ok(explain_result)) => {
-                                                    match extract_explain_plan(&explain_result.rows) {
-                                                        Ok(plan) => (Some(plan), None),
-                                                        Err(error) => (None, Some(error)),
-                                                    }
-                                                }
-                                                Ok(Err(error)) => (None, Some(error)),
-                                                Err(_) => (
-                                                    None,
-                                                    Some("EXPLAIN request was cancelled".to_string()),
-                                                ),
-                                            }
-                                        }
-                                        None => embedded_plan.map_or_else(
-                                            || {
-                                                (
-                                                    None,
-                                                    Some(
-                                                        "The existing EXPLAIN did not return a JSON plan"
-                                                            .to_string(),
-                                                    ),
-                                                )
-                                            },
-                                            |plan| (Some(plan), None),
-                                        ),
-                                    };
+                                    let (explain, explain_error) =
+                                        match connection.explain_query(history_sql.clone()).await {
+                                            Ok(Ok(plan)) => (serde_json::to_value(plan).ok(), None),
+                                            Ok(Err(error)) => (None, Some(error)),
+                                            Err(_) => (
+                                                None,
+                                                Some("EXPLAIN request was cancelled".to_string()),
+                                            ),
+                                        };
                                     query_manager.display_explain_for(
                                         execution.query_num(),
                                         output_generation,
@@ -861,82 +813,5 @@ impl DatabaseTabManager {
         } else {
             Vec::new()
         }
-    }
-}
-
-fn explain_statement(sql: &str) -> Option<String> {
-    let sql = sql.trim();
-    if sql
-        .split_whitespace()
-        .next()
-        .is_some_and(|keyword| keyword.eq_ignore_ascii_case("EXPLAIN"))
-    {
-        None
-    } else {
-        Some(format!("EXPLAIN (FORMAT JSON) {}", sql))
-    }
-}
-
-fn extract_explain_plan(rows: &[dzban_db::Row]) -> Result<serde_json::Value, String> {
-    rows.first()
-        .ok_or_else(|| "EXPLAIN returned no rows".to_string())?
-        .try_get::<_, serde_json::Value>(0)
-        .map_err(|error| format!("EXPLAIN returned an invalid JSON plan: {}", error))
-}
-
-fn extract_query_estimate(plan: &serde_json::Value) -> Result<(i64, f64, f64), String> {
-    let plan = plan
-        .as_array()
-        .and_then(|plans| plans.first())
-        .and_then(|root| root.get("Plan"))
-        .ok_or_else(|| "EXPLAIN returned no query plan".to_string())?;
-    let rows = plan
-        .get("Plan Rows")
-        .and_then(serde_json::Value::as_i64)
-        .ok_or_else(|| "EXPLAIN returned no row estimate".to_string())?;
-    let startup_cost = plan
-        .get("Startup Cost")
-        .and_then(serde_json::Value::as_f64)
-        .ok_or_else(|| "EXPLAIN returned no startup cost".to_string())?;
-    let total_cost = plan
-        .get("Total Cost")
-        .and_then(serde_json::Value::as_f64)
-        .ok_or_else(|| "EXPLAIN returned no total cost".to_string())?;
-    Ok((rows, startup_cost, total_cost))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{explain_statement, extract_query_estimate};
-
-    #[test]
-    fn explain_is_plain_and_json_formatted() {
-        assert_eq!(
-            explain_statement("select * from users"),
-            Some("EXPLAIN (FORMAT JSON) select * from users".to_string())
-        );
-        assert!(
-            !explain_statement("select * from users")
-                .unwrap()
-                .contains("ANALYZE")
-        );
-    }
-
-    #[test]
-    fn existing_explain_is_not_wrapped() {
-        assert_eq!(explain_statement("  explain select 1"), None);
-    }
-
-    #[test]
-    fn query_estimate_uses_the_root_plan() {
-        let plan = serde_json::json!([{
-            "Plan": {
-                "Plan Rows": 42,
-                "Startup Cost": 1.25,
-                "Total Cost": 9.5
-            }
-        }]);
-
-        assert_eq!(extract_query_estimate(&plan), Ok((42, 1.25, 9.5)));
     }
 }
