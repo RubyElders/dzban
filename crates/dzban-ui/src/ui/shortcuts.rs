@@ -328,12 +328,11 @@ fn init_shortcuts() -> Vec<Shortcut> {
             "Highlight the current statement and estimate its rows and cost",
             "Query",
         ),
-        key(
+        chord(
             ShortcutAction::PeekPlan,
-            gdk::Key::space,
-            control | shift,
+            "Ctrl+Shift+Space",
             "Show Query Plan",
-            "Open and keep the detailed estimated plan",
+            "Tap Space to keep the plan open, or hold Space to preview until release",
             "Query",
         ),
         keys(
@@ -358,8 +357,8 @@ fn init_shortcuts() -> Vec<Shortcut> {
             ShortcutAction::ClosePlan,
             gdk::Key::Escape,
             gdk::ModifierType::empty(),
-            "Close Query Plan",
-            "Close a pinned query plan inspector",
+            "Cancel Query or Close Preview",
+            "Cancel an active query, otherwise close the plan or result preview",
             "Query",
         ),
         key(

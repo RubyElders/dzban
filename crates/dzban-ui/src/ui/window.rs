@@ -5,25 +5,11 @@ use libadwaita as adw;
 
 use crate::APP_NAME;
 
-use super::db_tabs::{DatabaseTabManager, QueryActionState};
+use super::db_tabs::DatabaseTabManager;
 use super::plan_inspector::PlanScroll;
 use super::shortcuts;
 use super::shortcuts::ShortcutAction;
 use super::statusbar::create_statusbar;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PreviewKeyAction {
-    Begin,
-    Cancel,
-    Scroll(PlanScroll),
-}
-
-fn relevant_modifiers(modifiers: gtk4::gdk::ModifierType) -> gtk4::gdk::ModifierType {
-    modifiers
-        & (gtk4::gdk::ModifierType::CONTROL_MASK
-            | gtk4::gdk::ModifierType::SHIFT_MASK
-            | gtk4::gdk::ModifierType::ALT_MASK)
-}
 
 fn plan_scroll(key: gtk4::gdk::Key) -> Option<PlanScroll> {
     match key {
@@ -35,35 +21,14 @@ fn plan_scroll(key: gtk4::gdk::Key) -> Option<PlanScroll> {
     }
 }
 
-fn preview_key_pressed(
-    key: gtk4::gdk::Key,
-    modifiers: gtk4::gdk::ModifierType,
-) -> Option<PreviewKeyAction> {
-    let modifiers = relevant_modifiers(modifiers);
-    let chord = gtk4::gdk::ModifierType::CONTROL_MASK | gtk4::gdk::ModifierType::SHIFT_MASK;
-    let control_pressed = key == gtk4::gdk::Key::Control_L || key == gtk4::gdk::Key::Control_R;
-    let shift_pressed = key == gtk4::gdk::Key::Shift_L || key == gtk4::gdk::Key::Shift_R;
-    if (control_pressed && (modifiers == gtk4::gdk::ModifierType::SHIFT_MASK || modifiers == chord))
-        || (shift_pressed
-            && (modifiers == gtk4::gdk::ModifierType::CONTROL_MASK || modifiers == chord))
-    {
-        return Some(PreviewKeyAction::Begin);
-    }
-    if modifiers == chord || modifiers.is_empty() {
-        return plan_scroll(key).map(PreviewKeyAction::Scroll);
-    }
-    None
-}
-
-fn preview_key_released(key: gtk4::gdk::Key) -> Option<PreviewKeyAction> {
-    if key == gtk4::gdk::Key::Shift_L
-        || key == gtk4::gdk::Key::Shift_R
-        || key == gtk4::gdk::Key::Control_L
-        || key == gtk4::gdk::Key::Control_R
-    {
-        Some(PreviewKeyAction::Cancel)
-    } else {
-        None
+fn input_key(key: gtk4::gdk::Key) -> Option<dzban_db::InputKey> {
+    match key {
+        gtk4::gdk::Key::Escape => Some(dzban_db::InputKey::Escape),
+        gtk4::gdk::Key::Control_L | gtk4::gdk::Key::Control_R => Some(dzban_db::InputKey::Control),
+        gtk4::gdk::Key::Shift_L | gtk4::gdk::Key::Shift_R => Some(dzban_db::InputKey::Shift),
+        gtk4::gdk::Key::space => Some(dzban_db::InputKey::Space),
+        gtk4::gdk::Key::Return | gtk4::gdk::Key::KP_Enter => Some(dzban_db::InputKey::Enter),
+        _ => None,
     }
 }
 
@@ -101,27 +66,36 @@ pub fn build_ui(app: &Application) {
     let query_preview_controller = gtk4::EventControllerKey::new();
     query_preview_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
     let db_manager_for_preview = db_tab_manager.clone();
-    query_preview_controller.connect_key_pressed(move |_, key, _, modifiers| {
-        match preview_key_pressed(key, modifiers) {
-            Some(PreviewKeyAction::Begin) => {
-                db_manager_for_preview.begin_query_preview();
-            }
-            Some(PreviewKeyAction::Scroll(direction))
-                if db_manager_for_preview.scroll_query_plan(direction) =>
-            {
-                return gtk4::glib::Propagation::Stop;
-            }
-            _ => {}
+    let input_clock = std::rc::Rc::new(std::time::Instant::now());
+    let press_clock = input_clock.clone();
+    query_preview_controller.connect_key_pressed(move |_, key, _, _| {
+        if let Some(key) = input_key(key)
+            && db_manager_for_preview
+                .handle_input_pressed(key, press_clock.elapsed().as_millis() as u64)
+        {
+            return gtk4::glib::Propagation::Stop;
+        }
+        if let Some(direction) = plan_scroll(key)
+            && db_manager_for_preview.scroll_query_plan(direction)
+        {
+            return gtk4::glib::Propagation::Stop;
         }
         gtk4::glib::Propagation::Proceed
     });
     let db_manager_for_preview = db_tab_manager.clone();
     query_preview_controller.connect_key_released(move |_, key, _, _| {
-        if let Some(PreviewKeyAction::Cancel) = preview_key_released(key) {
-            db_manager_for_preview.finish_query_preview_chord();
+        if let Some(key) = input_key(key) {
+            db_manager_for_preview
+                .handle_input_released(key, input_clock.elapsed().as_millis() as u64);
         }
     });
     window.add_controller(query_preview_controller);
+    let db_manager_for_focus = db_tab_manager.clone();
+    window.connect_is_active_notify(move |window| {
+        if !window.is_active() {
+            db_manager_for_focus.reset_input();
+        }
+    });
 
     // Setup keyboard shortcuts using unified system
     let search_entry_for_shortcuts = search_entry.clone();
@@ -228,7 +202,7 @@ fn execute_shortcut_action(
             true
         }
         ShortcutAction::StopQuery => {
-            db_manager.cancel_current_query();
+            db_manager.request_cancel_current_query();
             true
         }
         ShortcutAction::PreviewQuery => {
@@ -309,13 +283,27 @@ fn install_styles() {
     provider.load_from_string(
         "entry.query-action-field {
             min-height: 36px;
-            border-color: transparent;
-            background-color: transparent;
-            box-shadow: none;
+            border: 1px solid alpha(@window_fg_color, 0.22);
+            border-radius: 9px;
+            background-color: alpha(@view_bg_color, 0.88);
+            box-shadow: 0 1px 3px alpha(black, 0.12);
         }
         entry.query-action-field:focus {
-            border-color: alpha(@accent_color, 0.55);
-            background-color: alpha(@view_bg_color, 0.82);
+            border-color: alpha(@accent_color, 0.75);
+            background-color: @view_bg_color;
+        }
+        #query-action-control.guidance entry.query-action-field,
+        #query-action-control.ready entry.query-action-field {
+            border-color: alpha(@accent_color, 0.75);
+            background-color: alpha(@accent_bg_color, 0.12);
+        }
+        #query-action-control.progress entry.query-action-field {
+            border-color: alpha(@accent_color, 0.85);
+            background-color: alpha(@accent_bg_color, 0.16);
+        }
+        #query-action-control.error entry.query-action-field {
+            border-color: alpha(@error_color, 0.75);
+            background-color: alpha(@error_color, 0.10);
         }
         progressbar.query-action-progress {
             min-width: 0;
@@ -431,6 +419,7 @@ fn create_header_bar(
     sidebar_toggle.set_tooltip_text(Some(
         &shortcuts::shortcut(ShortcutAction::ToggleSidebar).tooltip(),
     ));
+    sidebar_toggle.update_property(&[gtk4::accessible::Property::Label("Toggle query history")]);
 
     // Wire up sidebar toggle
     let db_manager_clone = db_tab_manager.clone();
@@ -453,20 +442,27 @@ fn create_header_bar(
     let search_for_preview = db_search.clone();
     let progress_for_preview = progress_bar.clone();
     let pulse_timer_for_preview = Rc::clone(&pulse_timer);
-    db_tab_manager.set_query_action_callback(move |state| {
+    let search_container_for_state = search_container.clone();
+    db_tab_manager.set_app_state_callback(move |state| {
         if let Some(timer) = pulse_timer_for_preview.borrow_mut().take() {
             timer.remove();
         }
 
         search_for_preview.set_placeholder_text(Some(&query_action_message(&state)));
-        match &state {
-            QueryActionState::Loading
-            | QueryActionState::Running
-            | QueryActionState::SavingPlan => {
-                let tooltip = match &state {
-                    QueryActionState::Loading => "Release Ctrl+Shift to dismiss",
-                    QueryActionState::Running => "Query is running",
-                    QueryActionState::SavingPlan => "Saving the estimated query plan",
+        for class in ["guidance", "progress", "ready", "error"] {
+            search_container_for_state.remove_css_class(class);
+        }
+        match state.action_hint() {
+            dzban_db::ActionHint::Estimating
+            | dzban_db::ActionHint::Planning
+            | dzban_db::ActionHint::Running(_)
+            | dzban_db::ActionHint::Canceling(_) => {
+                search_container_for_state.add_css_class("progress");
+                let tooltip = match state.action_hint() {
+                    dzban_db::ActionHint::Estimating => "Release Ctrl+Shift to dismiss",
+                    dzban_db::ActionHint::Planning => "Estimating the query before execution",
+                    dzban_db::ActionHint::Running(_) => "Query is running in the background",
+                    dzban_db::ActionHint::Canceling(_) => "Canceling the running query",
                     _ => unreachable!(),
                 };
                 search_for_preview.set_tooltip_text(Some(tooltip));
@@ -484,11 +480,22 @@ fn create_header_bar(
                     },
                 ));
             }
-            QueryActionState::Error(error) => {
-                search_for_preview.set_tooltip_text(Some(error));
+            dzban_db::ActionHint::EstimateError(error) => {
+                search_container_for_state.add_css_class("error");
+                search_for_preview.set_tooltip_text(Some(&error));
                 clear_progress(&progress_for_preview);
             }
-            QueryActionState::Idle | QueryActionState::Ready { .. } => {
+            dzban_db::ActionHint::EstimateReady(_) => {
+                search_container_for_state.add_css_class("ready");
+                search_for_preview.set_tooltip_text(None);
+                clear_progress(&progress_for_preview);
+            }
+            dzban_db::ActionHint::ControlGuide => {
+                search_container_for_state.add_css_class("guidance");
+                search_for_preview.set_tooltip_text(Some("Ctrl is held"));
+                clear_progress(&progress_for_preview);
+            }
+            dzban_db::ActionHint::Default => {
                 search_for_preview.set_tooltip_text(None);
                 clear_progress(&progress_for_preview);
             }
@@ -894,13 +901,13 @@ fn create_header_bar(
     run_button.add_css_class("suggested-action");
 
     let run_button_for_operation = run_button.clone();
-    db_tab_manager.set_query_availability_callback(move |available| {
-        run_button_for_operation.set_sensitive(available);
+    db_tab_manager.set_app_state_callback(move |state| {
+        render_primary_action(&run_button_for_operation, state.primary_action());
     });
 
     let db_manager_run = db_tab_manager.clone();
     run_button.connect_clicked(move |_| {
-        db_manager_run.run_current_query();
+        db_manager_run.activate_primary_action();
     });
 
     header.pack_end(&run_button);
@@ -964,39 +971,81 @@ fn create_header_bar(
     (header, db_search)
 }
 
-fn query_action_message(state: &QueryActionState) -> String {
-    match state {
-        QueryActionState::Idle => default_action_hint(),
-        QueryActionState::Loading => {
+fn query_action_message(state: &dzban_db::AppState) -> String {
+    match state.action_hint() {
+        dzban_db::ActionHint::Default => default_action_hint(),
+        dzban_db::ActionHint::ControlGuide => {
+            "Enter: run - Shift: estimate - Shift+Enter: estimate and run".to_string()
+        }
+        dzban_db::ActionHint::Estimating => {
             "Enter to run - Space for plan - estimating rows and cost...".to_string()
         }
-        QueryActionState::Ready { plan } => match (
-            plan.estimate.rows,
-            plan.estimate.startup_cost,
-            plan.estimate.total_cost,
-            plan.estimate.parts,
-            plan.estimate.marks,
-        ) {
-            (Some(rows), Some(startup), Some(total), _, _) => {
-                format!(
-                    "Enter to run - Space for plan - ~{rows} rows - cost {startup:.2}..{total:.2}"
-                )
-            }
-            (Some(rows), _, _, Some(parts), Some(marks)) => {
-                format!(
-                    "Enter to run - Space for plan - ~{rows} rows - {parts} parts - {marks} marks"
-                )
-            }
-            (Some(rows), _, _, _, _) => {
-                format!("Enter to run - Space for plan - ~{rows} rows")
-            }
-            _ => "Enter to run - Space for plan - estimate ready".to_string(),
-        },
-        QueryActionState::Running => "Running query...".to_string(),
-        QueryActionState::SavingPlan => "Query complete - saving estimated plan...".to_string(),
-        QueryActionState::Error(error) => {
+        dzban_db::ActionHint::EstimateReady(plan) => {
+            format!("Enter to run - Space for plan - {}", plan_estimate(&plan))
+        }
+        dzban_db::ActionHint::Planning => "Estimating query before execution...".to_string(),
+        dzban_db::ActionHint::Running(Some(plan)) => {
+            format!("Running query - {}", plan_estimate(&plan))
+        }
+        dzban_db::ActionHint::Running(None) => "Running query...".to_string(),
+        dzban_db::ActionHint::Canceling(Some(plan)) => {
+            format!("Stopping query - {}", plan_estimate(&plan))
+        }
+        dzban_db::ActionHint::Canceling(None) => "Stopping query...".to_string(),
+        dzban_db::ActionHint::EstimateError(error) => {
             format!("Enter to run - estimate unavailable: {}", error)
         }
+    }
+}
+
+fn render_primary_action(button: &gtk4::Button, action: dzban_db::PrimaryAction) {
+    use dzban_db::PrimaryAction;
+    let (icon, label, sensitive, shortcut) = match action {
+        PrimaryAction::Run => (
+            "media-playback-start-symbolic",
+            "Run query",
+            true,
+            "Control+Return Control+Shift+Return",
+        ),
+        PrimaryAction::Unavailable => (
+            "media-playback-start-symbolic",
+            "Run query",
+            false,
+            "Control+Return Control+Shift+Return",
+        ),
+        PrimaryAction::Stop => (
+            "media-playback-stop-symbolic",
+            "Stop query",
+            true,
+            "Escape Control+period",
+        ),
+        PrimaryAction::Stopping => ("media-playback-stop-symbolic", "Stopping query", false, ""),
+    };
+    button.set_icon_name(icon);
+    button.set_sensitive(sensitive);
+    button.set_tooltip_text(Some(label));
+    button.update_property(&[
+        gtk4::accessible::Property::Label(label),
+        gtk4::accessible::Property::KeyShortcuts(shortcut),
+    ]);
+}
+
+fn plan_estimate(plan: &dzban_db::QueryPlan) -> String {
+    match (
+        plan.estimate.rows,
+        plan.estimate.startup_cost,
+        plan.estimate.total_cost,
+        plan.estimate.parts,
+        plan.estimate.marks,
+    ) {
+        (Some(rows), Some(startup), Some(total), _, _) => {
+            format!("~{rows} rows - cost {startup:.2}..{total:.2}")
+        }
+        (Some(rows), _, _, Some(parts), Some(marks)) => {
+            format!("~{rows} rows - {parts} parts - {marks} marks")
+        }
+        (Some(rows), _, _, _, _) => format!("~{rows} rows"),
+        _ => "estimate ready".to_string(),
     }
 }
 
@@ -1010,7 +1059,7 @@ fn default_action_hint() -> String {
 fn create_query_action_field() -> (gtk4::Overlay, gtk4::Entry, gtk4::ProgressBar) {
     let overlay = gtk4::Overlay::new();
     overlay.set_halign(gtk4::Align::Center);
-    overlay.set_width_request(440);
+    overlay.set_width_request(600);
     overlay.set_overflow(gtk4::Overflow::Hidden);
     overlay.set_widget_name("query-action-control");
 
@@ -1022,7 +1071,7 @@ fn create_query_action_field() -> (gtk4::Overlay, gtk4::Entry, gtk4::ProgressBar
         gtk4::accessible::Property::KeyShortcuts("Control+k"),
     ]);
     entry.set_placeholder_text(Some(&default_action_hint()));
-    entry.set_width_chars(50);
+    entry.set_width_request(600);
     gtk4::prelude::EntryExt::set_alignment(&entry, 0.5);
     entry.add_css_class("query-action-field");
     entry.connect_has_focus_notify(|entry| {
@@ -1068,75 +1117,101 @@ fn setup_toasts(toast_overlay: &ToastOverlay) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn preview_chord_transitions_are_interpreted_without_a_display() {
-        let control = gtk4::gdk::ModifierType::CONTROL_MASK;
-        let shift = gtk4::gdk::ModifierType::SHIFT_MASK;
-
+    #[gtk4::test]
+    #[ignore = "requires a graphical display"]
+    fn primary_button_changes_from_run_to_stop_and_back() {
+        let button = gtk4::Button::new();
+        let mut state = dzban_db::AppState::default();
+        state.transition(dzban_db::AppEvent::QueryAvailabilityChanged(true));
+        render_primary_action(&button, state.primary_action());
         assert_eq!(
-            preview_key_pressed(gtk4::gdk::Key::Control_L, control),
-            None
+            button.icon_name().as_deref(),
+            Some("media-playback-start-symbolic")
         );
+        assert!(button.is_sensitive());
+        state.transition(dzban_db::AppEvent::QueryPlanning);
+        state.transition(dzban_db::AppEvent::QueryAvailabilityChanged(false));
+        render_primary_action(&button, state.primary_action());
         assert_eq!(
-            preview_key_pressed(gtk4::gdk::Key::Shift_L, control),
-            Some(PreviewKeyAction::Begin)
+            button.icon_name().as_deref(),
+            Some("media-playback-stop-symbolic")
         );
+        assert!(button.is_sensitive());
+        state.transition(dzban_db::AppEvent::QueryCanceling);
+        render_primary_action(&button, state.primary_action());
+        assert!(!button.is_sensitive());
+        state.transition(dzban_db::AppEvent::QueryFinished);
+        state.transition(dzban_db::AppEvent::QueryAvailabilityChanged(true));
+        render_primary_action(&button, state.primary_action());
         assert_eq!(
-            preview_key_pressed(gtk4::gdk::Key::Control_L, shift),
-            Some(PreviewKeyAction::Begin)
+            button.icon_name().as_deref(),
+            Some("media-playback-start-symbolic")
         );
-        assert_eq!(
-            preview_key_pressed(gtk4::gdk::Key::Shift_L, control | shift),
-            Some(PreviewKeyAction::Begin)
-        );
-        assert_eq!(
-            preview_key_released(gtk4::gdk::Key::Shift_L),
-            Some(PreviewKeyAction::Cancel)
-        );
-        assert_eq!(
-            preview_key_released(gtk4::gdk::Key::Control_L),
-            Some(PreviewKeyAction::Cancel)
-        );
+        assert!(button.is_sensitive());
     }
 
     #[test]
-    fn plan_scroll_keys_require_the_plan_chord_or_no_modifiers() {
-        let control = gtk4::gdk::ModifierType::CONTROL_MASK;
-        let shift = gtk4::gdk::ModifierType::SHIFT_MASK;
+    fn keyboard_adapter_maps_interaction_keys() {
+        assert_eq!(
+            input_key(gtk4::gdk::Key::Escape),
+            Some(dzban_db::InputKey::Escape)
+        );
+        assert_eq!(
+            input_key(gtk4::gdk::Key::Control_L),
+            Some(dzban_db::InputKey::Control)
+        );
+        assert_eq!(
+            input_key(gtk4::gdk::Key::Shift_R),
+            Some(dzban_db::InputKey::Shift)
+        );
+        assert_eq!(
+            input_key(gtk4::gdk::Key::space),
+            Some(dzban_db::InputKey::Space)
+        );
+        assert_eq!(
+            input_key(gtk4::gdk::Key::Return),
+            Some(dzban_db::InputKey::Enter)
+        );
+        assert_eq!(input_key(gtk4::gdk::Key::Down), None);
+    }
 
+    #[test]
+    fn plan_scroll_keys_are_mapped_without_frontend_state() {
         assert_eq!(
-            preview_key_pressed(gtk4::gdk::Key::Page_Down, control | shift),
-            Some(PreviewKeyAction::Scroll(PlanScroll::PageDown))
+            plan_scroll(gtk4::gdk::Key::Page_Down),
+            Some(PlanScroll::PageDown)
         );
         assert_eq!(
-            preview_key_pressed(gtk4::gdk::Key::Down, gtk4::gdk::ModifierType::empty()),
-            Some(PreviewKeyAction::Scroll(PlanScroll::LineDown))
+            plan_scroll(gtk4::gdk::Key::Down),
+            Some(PlanScroll::LineDown)
         );
-        assert_eq!(preview_key_pressed(gtk4::gdk::Key::Down, control), None);
-        assert_eq!(
-            preview_key_pressed(
-                gtk4::gdk::Key::Down,
-                control | shift | gtk4::gdk::ModifierType::ALT_MASK
-            ),
-            None
-        );
+        assert_eq!(plan_scroll(gtk4::gdk::Key::space), None);
     }
 
     #[test]
     fn ready_query_preview_prompts_for_execution_with_estimates() {
-        let message = query_action_message(&QueryActionState::Ready {
-            plan: dzban_db::QueryPlan {
-                backend: dzban_db::DatabaseBackend::Postgresql,
-                document: serde_json::json!([]),
-                estimate: dzban_db::QueryEstimate {
-                    rows: Some(42),
-                    startup_cost: Some(1.25),
-                    total_cost: Some(9.5),
-                    parts: None,
-                    marks: None,
-                },
-            },
+        let mut state = dzban_db::AppState::default();
+        state.transition(dzban_db::AppEvent::QueryAvailabilityChanged(true));
+        state.transition(dzban_db::AppEvent::KeyPressed {
+            key: dzban_db::InputKey::Control,
+            at_ms: 0,
         });
+        state.transition(dzban_db::AppEvent::KeyPressed {
+            key: dzban_db::InputKey::Shift,
+            at_ms: 1,
+        });
+        state.transition(dzban_db::AppEvent::PreviewReady(dzban_db::QueryPlan {
+            backend: dzban_db::DatabaseBackend::Postgresql,
+            document: serde_json::json!([]),
+            estimate: dzban_db::QueryEstimate {
+                rows: Some(42),
+                startup_cost: Some(1.25),
+                total_cost: Some(9.5),
+                parts: None,
+                marks: None,
+            },
+        }));
+        let message = query_action_message(&state);
 
         assert_eq!(
             message,
@@ -1146,19 +1221,28 @@ mod tests {
 
     #[test]
     fn clickhouse_preview_shows_scan_estimates_without_fake_cost() {
-        let message = query_action_message(&QueryActionState::Ready {
-            plan: dzban_db::QueryPlan {
-                backend: dzban_db::DatabaseBackend::Clickhouse,
-                document: serde_json::json!({}),
-                estimate: dzban_db::QueryEstimate {
-                    rows: Some(42),
-                    startup_cost: None,
-                    total_cost: None,
-                    parts: Some(2),
-                    marks: Some(7),
-                },
-            },
+        let mut state = dzban_db::AppState::default();
+        state.transition(dzban_db::AppEvent::QueryAvailabilityChanged(true));
+        state.transition(dzban_db::AppEvent::KeyPressed {
+            key: dzban_db::InputKey::Control,
+            at_ms: 0,
         });
+        state.transition(dzban_db::AppEvent::KeyPressed {
+            key: dzban_db::InputKey::Shift,
+            at_ms: 1,
+        });
+        state.transition(dzban_db::AppEvent::PreviewReady(dzban_db::QueryPlan {
+            backend: dzban_db::DatabaseBackend::Clickhouse,
+            document: serde_json::json!({}),
+            estimate: dzban_db::QueryEstimate {
+                rows: Some(42),
+                startup_cost: None,
+                total_cost: None,
+                parts: Some(2),
+                marks: Some(7),
+            },
+        }));
+        let message = query_action_message(&state);
 
         assert_eq!(
             message,
@@ -1167,22 +1251,57 @@ mod tests {
     }
 
     #[test]
-    fn running_query_and_plan_storage_are_distinct_states() {
+    fn submitted_query_reports_planning_then_running_estimates() {
         assert_eq!(
-            query_action_message(&QueryActionState::Running),
-            "Running query..."
+            query_action_message(&dzban_db::AppState {
+                execution: dzban_db::QueryExecutionState::Planning,
+                ..Default::default()
+            }),
+            "Estimating query before execution..."
         );
         assert_eq!(
-            query_action_message(&QueryActionState::SavingPlan),
-            "Query complete - saving estimated plan..."
+            query_action_message(&dzban_db::AppState {
+                execution: dzban_db::QueryExecutionState::Running { plan: None },
+                ..Default::default()
+            }),
+            "Running query..."
+        );
+        let plan = dzban_db::QueryPlan {
+            backend: dzban_db::DatabaseBackend::Postgresql,
+            document: serde_json::json!([]),
+            estimate: dzban_db::QueryEstimate {
+                rows: Some(33508),
+                startup_cost: Some(0.0),
+                total_cost: Some(7829.08),
+                parts: None,
+                marks: None,
+            },
+        };
+        assert_eq!(
+            query_action_message(&dzban_db::AppState {
+                execution: dzban_db::QueryExecutionState::Running { plan: Some(plan) },
+                ..Default::default()
+            }),
+            "Running query - ~33508 rows - cost 0.00..7829.08"
         );
     }
 
     #[test]
     fn query_preview_errors_are_visible_without_a_tooltip() {
-        let message = query_action_message(&QueryActionState::Error(
+        let mut state = dzban_db::AppState::default();
+        state.transition(dzban_db::AppEvent::QueryAvailabilityChanged(true));
+        state.transition(dzban_db::AppEvent::KeyPressed {
+            key: dzban_db::InputKey::Control,
+            at_ms: 0,
+        });
+        state.transition(dzban_db::AppEvent::KeyPressed {
+            key: dzban_db::InputKey::Shift,
+            at_ms: 1,
+        });
+        state.transition(dzban_db::AppEvent::PreviewFailed(
             "Database is not connected".to_string(),
         ));
+        let message = query_action_message(&state);
 
         assert_eq!(
             message,

@@ -18,7 +18,7 @@ async fn connected_connection() -> DbConnection {
 }
 
 #[glib::async_test]
-#[ignore]
+#[ignore = "requires the PostgreSQL service from docker-compose.test.yml"]
 async fn row_query_reports_rows_timing_and_state() {
     let connection = connected_connection().await;
     let finished = Rc::new(RefCell::new(None));
@@ -55,7 +55,7 @@ async fn row_query_reports_rows_timing_and_state() {
 }
 
 #[glib::async_test]
-#[ignore]
+#[ignore = "requires the PostgreSQL service from docker-compose.test.yml"]
 async fn running_query_can_be_cancelled() {
     let connection = connected_connection().await;
     let query_receiver = connection.execute_query_rows("SELECT pg_sleep(10)".to_string());
@@ -76,6 +76,25 @@ async fn running_query_can_be_cancelled() {
 
 #[glib::async_test]
 #[ignore = "requires the PostgreSQL service from docker-compose.test.yml"]
+async fn planned_query_can_be_cancelled() {
+    let connection = connected_connection().await;
+    let (query_receiver, plan_receiver) = connection
+        .execute_query_rows_with_explain("SELECT pg_sleep(10)".to_string())
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_millis(100);
+    while Instant::now() < deadline {
+        glib::timeout_future(Duration::from_millis(10)).await;
+    }
+
+    assert!(connection.cancel_query().await.unwrap().is_ok());
+    assert!(plan_receiver.await.unwrap().is_ok());
+    assert!(query_receiver.await.unwrap().is_err());
+    assert_eq!(connection.operation(), ConnectionOperation::Idle);
+    connection.disconnect();
+}
+
+#[glib::async_test]
+#[ignore = "requires the PostgreSQL service from docker-compose.test.yml"]
 async fn one_connection_rejects_overlapping_queries_explains_and_pings() {
     let connection = connected_connection().await;
     let operations = Rc::new(RefCell::new(Vec::new()));
@@ -91,7 +110,7 @@ async fn one_connection_rejects_overlapping_queries_explains_and_pings() {
         .execute_query_rows_with_explain("SELECT pg_sleep(0.2), generate_series(1, 3)".to_string())
         .unwrap();
 
-    assert_eq!(connection.operation(), ConnectionOperation::Query);
+    assert_eq!(connection.operation(), ConnectionOperation::PlanningQuery);
     assert!(!connection.operation_available());
     assert!(connection.query_running());
     let duplicate = connection
@@ -107,18 +126,18 @@ async fn one_connection_rejects_overlapping_queries_explains_and_pings() {
     connection.ping();
     assert_eq!(connection.ping_count(), initial_ping_count);
 
+    assert!(plan_receiver.await.unwrap().is_ok());
+    assert_eq!(connection.operation(), ConnectionOperation::Query);
     let result = query_receiver.await.unwrap().unwrap();
     assert_eq!(result.result_set.rows.len(), 3);
-    assert_eq!(connection.operation(), ConnectionOperation::SavingPlan);
-    assert!(plan_receiver.await.unwrap().is_ok());
     assert_eq!(connection.operation(), ConnectionOperation::Idle);
     assert!(connection.operation_available());
     assert!(!connection.query_running());
     assert_eq!(
         *operations.borrow(),
         vec![
+            ConnectionOperation::PlanningQuery,
             ConnectionOperation::Query,
-            ConnectionOperation::SavingPlan,
             ConnectionOperation::Idle,
         ]
     );

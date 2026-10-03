@@ -1,5 +1,6 @@
 use dzban_db::{
-    ConnectionState, DatabaseBackend, DatabaseConfig, DbConnection, ResultCell, RuntimeBridge,
+    ConnectionOperation, ConnectionState, DatabaseBackend, DatabaseConfig, DbConnection,
+    ResultCell, RuntimeBridge,
 };
 use std::time::{Duration, Instant};
 
@@ -103,5 +104,27 @@ async fn running_clickhouse_query_can_be_cancelled() {
         "{error}"
     );
     assert!(!connection.query_running());
+    connection.disconnect();
+}
+
+#[glib::async_test]
+#[ignore = "requires the ClickHouse service from docker-compose.test.yml"]
+async fn planned_clickhouse_query_can_be_cancelled() {
+    let connection = connected_connection().await;
+    let (query, plan) = connection
+        .execute_query_rows_with_explain(
+            "SELECT sleepEachRow(1) FROM numbers(20) SETTINGS max_block_size = 1".to_string(),
+        )
+        .unwrap();
+    glib::timeout_future(Duration::from_millis(250)).await;
+
+    connection.cancel_query().await.unwrap().unwrap();
+    assert!(plan.await.unwrap().is_ok());
+    let error = query.await.unwrap().unwrap_err();
+    assert!(
+        error.contains("cancel") || error.contains("killed"),
+        "{error}"
+    );
+    assert_eq!(connection.operation(), ConnectionOperation::Idle);
     connection.disconnect();
 }

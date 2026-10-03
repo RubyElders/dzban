@@ -182,7 +182,7 @@ impl QueryHistory {
                     row.set_tooltip_text(Some(error));
                 }
             }
-            QueryHistoryOutcome::Failure { error } => {
+            QueryHistoryOutcome::Failure { error, .. } => {
                 status_marker.add_css_class("error");
                 metadata.set_text(&format!("{}  |  Failed  |  {}", executed_at, error));
                 row.set_tooltip_text(Some(error));
@@ -196,6 +196,9 @@ impl QueryHistory {
         if matches!(
             &entry.outcome,
             QueryHistoryOutcome::Success {
+                explain: Some(_),
+                ..
+            } | QueryHistoryOutcome::Failure {
                 explain: Some(_),
                 ..
             }
@@ -346,6 +349,8 @@ mod tests {
             executed_at: 0,
             outcome: QueryHistoryOutcome::Failure {
                 error: "column does not exist".to_string(),
+                explain: Some(serde_json::json!({})),
+                explain_error: None,
             },
         });
 

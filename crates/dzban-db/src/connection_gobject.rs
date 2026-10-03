@@ -18,12 +18,12 @@ pub enum ConnectionOperation {
     Ping = 1,
     Explain = 2,
     Query = 3,
-    SavingPlan = 4,
+    PlanningQuery = 4,
 }
 
 impl ConnectionOperation {
     pub fn is_query(self) -> bool {
-        matches!(self, Self::Query | Self::SavingPlan)
+        matches!(self, Self::Query | Self::PlanningQuery)
     }
 }
 
@@ -50,6 +50,7 @@ mod imp {
         pub last_error: RefCell<String>,
         pub operation: Cell<ConnectionOperation>,
         pub operation_generation: Cell<u64>,
+        pub cancelled_generation: Cell<Option<u64>>,
 
         pub(super) runtime_bridge: OnceCell<RuntimeBridge>,
         pub(super) database_config: OnceCell<DatabaseConfig>,
@@ -67,6 +68,7 @@ mod imp {
                 last_error: RefCell::new(String::new()),
                 operation: Cell::new(ConnectionOperation::Idle),
                 operation_generation: Cell::new(0),
+                cancelled_generation: Cell::new(None),
                 runtime_bridge: OnceCell::new(),
                 database_config: OnceCell::new(),
                 db_connection: RefCell::new(None),
@@ -193,6 +195,12 @@ impl OperationLease {
         if let Some(connection) = self.connection.upgrade() {
             connection.transition_operation(self.generation, operation);
         }
+    }
+
+    fn cancellation_requested(&self) -> bool {
+        self.connection.upgrade().is_some_and(|connection| {
+            connection.imp().cancelled_generation.get() == Some(self.generation)
+        })
     }
 }
 
@@ -352,6 +360,7 @@ impl DbConnection {
         }
         let generation = self.imp().operation_generation.get().wrapping_add(1);
         self.imp().operation_generation.set(generation);
+        self.imp().cancelled_generation.set(None);
         self.set_operation(operation);
         Ok(OperationLease {
             connection: self.downgrade(),
@@ -367,12 +376,20 @@ impl DbConnection {
 
     fn finish_operation(&self, generation: u64) {
         if self.imp().operation_generation.get() == generation {
+            self.imp().cancelled_generation.set(None);
             self.set_operation(ConnectionOperation::Idle);
         }
     }
 
     fn begin_query(&self, query: &str) -> Result<OperationLease, String> {
         let lease = self.try_begin_operation(ConnectionOperation::Query)?;
+        self.set_last_error(String::new());
+        self.emit_by_name::<()>("query-started", &[&query]);
+        Ok(lease)
+    }
+
+    fn begin_planned_query(&self, query: &str) -> Result<OperationLease, String> {
+        let lease = self.try_begin_operation(ConnectionOperation::PlanningQuery)?;
         self.set_last_error(String::new());
         self.emit_by_name::<()>("query-started", &[&query]);
         Ok(lease)
@@ -467,6 +484,7 @@ impl DbConnection {
         self.imp()
             .operation_generation
             .set(self.imp().operation_generation.get().wrapping_add(1));
+        self.imp().cancelled_generation.set(None);
         self.set_state(ConnectionState::Disconnected);
         self.set_operation(ConnectionOperation::Idle);
         self.set_version(None);
@@ -611,7 +629,7 @@ impl DbConnection {
             self.emit_by_name::<()>("query-error", &[&error]);
             return Err(error);
         };
-        let operation = self.begin_query(&query)?;
+        let operation = self.begin_planned_query(&query)?;
 
         let bridge = self
             .imp()
@@ -621,9 +639,25 @@ impl DbConnection {
             .clone();
         let this = self.clone();
         glib::MainContext::ref_thread_default().spawn_local(async move {
+            let plan = bridge
+                .explain(db_conn.clone(), query.clone())
+                .await
+                .unwrap_or_else(|_| Err("Plan request was dropped".to_string()));
+            let cancellation_requested = operation.cancellation_requested();
+            let _ = plan_tx.send(plan);
+            if cancellation_requested {
+                let error = "Query cancelled".to_string();
+                drop(operation);
+                this.set_last_error(error.clone());
+                this.emit_by_name::<()>("query-error", &[&error]);
+                let _ = query_tx.send(Err(error));
+                return;
+            }
+
+            operation.transition(ConnectionOperation::Query);
             let start = std::time::Instant::now();
             let result = bridge
-                .execute_query_rows(db_conn.clone(), query.clone())
+                .execute_query_rows(db_conn, query)
                 .await
                 .unwrap_or_else(|_| Err("Query cancelled".to_string()));
             match result {
@@ -632,25 +666,17 @@ impl DbConnection {
                     let row_count = result_set.rows.len() as i64;
                     let duration_ms = duration.as_millis() as i64;
                     this.emit_by_name::<()>("query-finished", &[&row_count, &duration_ms]);
-                    operation.transition(ConnectionOperation::SavingPlan);
+                    drop(operation);
                     let _ = query_tx.send(Ok(QueryResult {
                         result_set,
                         duration,
                     }));
-
-                    let plan = bridge
-                        .explain(db_conn, query)
-                        .await
-                        .unwrap_or_else(|_| Err("Plan request was dropped".to_string()));
-                    drop(operation);
-                    let _ = plan_tx.send(plan);
                 }
                 Err(error) => {
                     drop(operation);
                     this.set_last_error(error.clone());
                     this.emit_by_name::<()>("query-error", &[&error]);
                     let _ = query_tx.send(Err(error));
-                    let _ = plan_tx.send(Err("Query did not complete".to_string()));
                 }
             }
         });
@@ -684,6 +710,11 @@ impl DbConnection {
 
     pub fn cancel_query(&self) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        if self.operation().is_query() {
+            self.imp()
+                .cancelled_generation
+                .set(Some(self.imp().operation_generation.get()));
+        }
         let Some(db_conn) = self.imp().db_connection.borrow().clone() else {
             let _ = tx.send(Err("Not connected".to_string()));
             return rx;

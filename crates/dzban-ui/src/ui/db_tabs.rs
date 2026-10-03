@@ -15,13 +15,13 @@ use super::query_state::QueryExecution;
 use super::query_tabs::QueryTabManager;
 use super::statusbar::Statusbar;
 use dzban_db::{
-    Config, ConnectionOperation, ConnectionState, DbConfig, DbManager, QueryPlan, RuntimeBridge,
+    AppCommand, AppEvent, AppState, Config, ConnectionOperation, ConnectionState, DbConfig,
+    DbManager, InputKey, PlanPreviewState, RuntimeBridge,
 };
 
 type DatabaseTab = (TabPage, QueryTabManager, DbConfig, ConnectionStateWidget);
 type DatabaseTabs = Rc<RefCell<HashMap<String, DatabaseTab>>>;
-type QueryActionCallback = Rc<dyn Fn(QueryActionState)>;
-type QueryAvailabilityCallback = Rc<dyn Fn(bool)>;
+type AppStateCallback = Rc<dyn Fn(AppState)>;
 
 struct SuccessfulQuery {
     duration: Duration,
@@ -29,25 +29,75 @@ struct SuccessfulQuery {
     result: QueryResultSnapshot,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan_widget(widget: &gtk4::Widget) -> Option<gtk4::Widget> {
+        if widget.widget_name() == "query-plan-inspector" {
+            return Some(widget.clone());
+        }
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            if let Some(found) = plan_widget(&current) {
+                return Some(found);
+            }
+            child = current.next_sibling();
+        }
+        None
+    }
+
+    #[gtk4::test]
+    #[ignore = "requires a graphical display"]
+    fn preview_adapter_hides_holds_and_pins_taps() {
+        let manager = DatabaseTabManager::new(super::super::statusbar::create_statusbar());
+        let queries = QueryTabManager::new("preview-adapter-test");
+        queries.new_query_tab();
+        let widget = plan_widget(queries.get_widget().upcast_ref()).unwrap();
+        manager.handle_input_pressed(InputKey::Control, 0);
+        manager.handle_input_pressed(InputKey::Shift, 1);
+        *manager.query_preview_manager.borrow_mut() = Some(queries.clone());
+        manager.dispatch(AppEvent::PreviewReady(dzban_db::QueryPlan {
+            backend: dzban_db::DatabaseBackend::Postgresql,
+            document: serde_json::json!([]),
+            estimate: dzban_db::QueryEstimate::default(),
+        }));
+        assert!(manager.handle_input_pressed(InputKey::Space, 10));
+        assert!(widget.is_visible());
+        assert!(manager.handle_input_pressed(InputKey::Space, 500));
+        manager.handle_input_released(InputKey::Space, 600);
+        assert!(!widget.is_visible());
+
+        *manager.query_preview_manager.borrow_mut() = Some(queries);
+        manager.dispatch(AppEvent::PreviewReady(dzban_db::QueryPlan {
+            backend: dzban_db::DatabaseBackend::Postgresql,
+            document: serde_json::json!([]),
+            estimate: dzban_db::QueryEstimate::default(),
+        }));
+        assert!(manager.handle_input_pressed(InputKey::Space, 700));
+        manager.handle_input_released(InputKey::Space, 750);
+        manager.handle_input_released(InputKey::Shift, 760);
+        manager.handle_input_released(InputKey::Control, 770);
+        assert!(widget.is_visible());
+        manager.dispatch(AppEvent::QueryPlanning);
+        assert!(!widget.is_visible());
+    }
+}
+
+enum CompletedQuery {
+    Success(SuccessfulQuery),
+    Failure(String),
+}
+
 struct PendingQueryHistory {
     sql: Option<String>,
-    success: Option<SuccessfulQuery>,
+    outcome: Option<CompletedQuery>,
     explain_ready: bool,
     explain: Option<serde_json::Value>,
     explain_error: Option<String>,
 }
 
 const QUERY_PREVIEW_DELAY: Duration = Duration::from_millis(250);
-
-#[derive(Clone, Debug)]
-pub enum QueryActionState {
-    Idle,
-    Loading,
-    Ready { plan: QueryPlan },
-    Running,
-    SavingPlan,
-    Error(String),
-}
 
 fn record_completed_query(
     pending: &Rc<RefCell<PendingQueryHistory>>,
@@ -58,7 +108,7 @@ fn record_completed_query(
         if !pending.explain_ready {
             return;
         }
-        let Some(success) = pending.success.take() else {
+        let Some(outcome) = pending.outcome.take() else {
             return;
         };
         let Some(sql) = pending.sql.take() else {
@@ -66,20 +116,25 @@ fn record_completed_query(
         };
         Some((
             sql,
-            success,
+            outcome,
             pending.explain.take(),
             pending.explain_error.take(),
         ))
     };
-    if let Some((sql, success, explain, explain_error)) = completed {
-        query_manager.record_query_success(
-            sql,
-            success.duration,
-            success.rows,
-            success.result,
-            explain,
-            explain_error,
-        );
+    if let Some((sql, outcome, explain, explain_error)) = completed {
+        match outcome {
+            CompletedQuery::Success(success) => query_manager.record_query_success(
+                sql,
+                success.duration,
+                success.rows,
+                success.result,
+                explain,
+                explain_error,
+            ),
+            CompletedQuery::Failure(error) => {
+                query_manager.record_query_failure(sql, error, explain, explain_error)
+            }
+        }
     }
 }
 
@@ -130,8 +185,8 @@ pub struct DatabaseTabManager {
     runtime_bridge: RuntimeBridge,
     db_manager: DbManager,
     statusbar: Statusbar,
-    query_action_callback: Rc<RefCell<Option<QueryActionCallback>>>,
-    query_availability_callback: Rc<RefCell<Option<QueryAvailabilityCallback>>>,
+    app_state: Rc<RefCell<AppState>>,
+    app_state_callbacks: Rc<RefCell<Vec<AppStateCallback>>>,
     query_preview_generation: Rc<Cell<u64>>,
     query_preview_timer: Rc<RefCell<Option<glib::SourceId>>>,
     query_preview_manager: Rc<RefCell<Option<QueryTabManager>>>,
@@ -172,8 +227,8 @@ impl DatabaseTabManager {
             runtime_bridge,
             db_manager: DbManager::new(),
             statusbar: statusbar.clone(),
-            query_action_callback: Rc::new(RefCell::new(None)),
-            query_availability_callback: Rc::new(RefCell::new(None)),
+            app_state: Rc::new(RefCell::new(AppState::default())),
+            app_state_callbacks: Rc::new(RefCell::new(Vec::new())),
             query_preview_generation: Rc::new(Cell::new(0)),
             query_preview_timer: Rc::new(RefCell::new(None)),
             query_preview_manager: Rc::new(RefCell::new(None)),
@@ -223,26 +278,27 @@ impl DatabaseTabManager {
                     let tabs = manager_clone.tabs.borrow();
                     tabs.iter()
                         .find(|(_, (tab_page, _, _, _))| tab_page == &page)
-                        .map(|(name, (_, _, config, _))| (name.clone(), config.connection()))
+                        .map(|(name, (_, query_manager, config, _))| {
+                            (name.clone(), query_manager.clone(), config.connection())
+                        })
                 };
 
-                if let Some((name, connection)) = connection {
+                if let Some((name, query_manager, connection)) = connection {
                     manager_clone
                         .statusbar
                         .bind_to_connection(&name, &connection);
                     let operation = connection.operation();
                     manager_clone.emit_query_availability(connection.operation_available());
                     match operation {
-                        ConnectionOperation::Query => {
-                            manager_clone.emit_query_action(QueryActionState::Running)
+                        ConnectionOperation::PlanningQuery => {
+                            manager_clone.dispatch(AppEvent::QueryPlanning)
                         }
-                        ConnectionOperation::SavingPlan => {
-                            manager_clone.emit_query_action(QueryActionState::SavingPlan)
-                        }
+                        ConnectionOperation::Query => manager_clone
+                            .dispatch(AppEvent::QueryRunning(query_manager.running_plan())),
                         ConnectionOperation::Idle
                         | ConnectionOperation::Ping
                         | ConnectionOperation::Explain => {
-                            manager_clone.emit_query_action(QueryActionState::Idle)
+                            manager_clone.dispatch(AppEvent::QueryFinished)
                         }
                     }
                     return;
@@ -272,22 +328,14 @@ impl DatabaseTabManager {
         &self.container
     }
 
-    pub fn set_query_action_callback<F>(&self, callback: F)
+    pub fn set_app_state_callback<F>(&self, callback: F)
     where
-        F: Fn(QueryActionState) + 'static,
+        F: Fn(AppState) + 'static,
     {
-        *self.query_action_callback.borrow_mut() = Some(Rc::new(callback));
-    }
-
-    pub fn set_query_availability_callback<F>(&self, callback: F)
-    where
-        F: Fn(bool) + 'static,
-    {
-        *self.query_availability_callback.borrow_mut() = Some(Rc::new(callback));
-        let available = self
-            .current_connection()
-            .is_some_and(|connection| connection.operation_available());
-        self.emit_query_availability(available);
+        self.app_state_callbacks
+            .borrow_mut()
+            .push(Rc::new(callback));
+        self.emit_app_state();
     }
 
     pub fn begin_query_preview(&self) {
@@ -303,7 +351,11 @@ impl DatabaseTabManager {
         let Some((query_manager, connection)) = preview_target else {
             return;
         };
-        self.cancel_query_preview();
+        if self.query_preview_timer.borrow().is_some()
+            || self.query_preview_manager.borrow().is_some()
+        {
+            return;
+        }
         let Some((_, sql, _)) = query_manager.current_query() else {
             return;
         };
@@ -318,7 +370,7 @@ impl DatabaseTabManager {
                 return;
             }
             if connection.state() != ConnectionState::Connected {
-                manager.emit_query_action(QueryActionState::Error(
+                manager.dispatch(AppEvent::PreviewFailed(
                     "Database is not connected".to_string(),
                 ));
                 return;
@@ -330,16 +382,16 @@ impl DatabaseTabManager {
                 return;
             }
             *manager.query_preview_manager.borrow_mut() = Some(query_manager);
-            manager.emit_query_action(QueryActionState::Loading);
+            manager.dispatch(AppEvent::PreviewLoading);
             let manager_for_result = manager.clone();
             glib::spawn_future_local(async move {
-                let state = match rx.await {
-                    Ok(Ok(plan)) => QueryActionState::Ready { plan },
-                    Ok(Err(error)) => QueryActionState::Error(error),
-                    Err(_) => QueryActionState::Error("EXPLAIN was cancelled".to_string()),
+                let event = match rx.await {
+                    Ok(Ok(plan)) => AppEvent::PreviewReady(plan),
+                    Ok(Err(error)) => AppEvent::PreviewFailed(error),
+                    Err(_) => AppEvent::PreviewFailed("EXPLAIN was cancelled".to_string()),
                 };
                 if manager_for_result.query_preview_generation.get() == generation {
-                    manager_for_result.emit_query_action(state);
+                    manager_for_result.dispatch(event);
                 }
             });
         });
@@ -355,61 +407,101 @@ impl DatabaseTabManager {
         let query_manager = self.query_preview_manager.borrow_mut().take();
         if let Some(query_manager) = query_manager {
             query_manager.clear_query_highlight();
-            query_manager.hide_plan_transient();
-            self.emit_query_action(QueryActionState::Idle);
+            query_manager.close_plan();
         }
+        self.dispatch(AppEvent::PreviewCancelled);
     }
 
-    pub fn finish_query_preview_chord(&self) {
-        let pinned = self
-            .query_preview_manager
-            .borrow()
-            .as_ref()
-            .is_some_and(QueryTabManager::is_plan_pinned);
-        if pinned {
-            if let Some(query_manager) = self.query_preview_manager.borrow().as_ref() {
-                query_manager.clear_query_highlight();
-            }
-        } else {
-            self.cancel_query_preview();
-        }
-    }
-
-    fn emit_query_action(&self, state: QueryActionState) {
-        if let Some(query_manager) = self.query_preview_manager.borrow().as_ref() {
-            match &state {
-                QueryActionState::Loading => query_manager.set_plan_preview(PlanState::Loading),
-                QueryActionState::Ready { plan } => {
+    fn dispatch(&self, event: AppEvent) {
+        let update_plan = matches!(
+            event,
+            AppEvent::PreviewLoading | AppEvent::PreviewReady(_) | AppEvent::PreviewFailed(_)
+        );
+        let commands = self.app_state.borrow_mut().transition(event);
+        let preview = self.app_state.borrow().preview.clone();
+        if update_plan && let Some(query_manager) = self.query_preview_manager.borrow().as_ref() {
+            match &preview {
+                PlanPreviewState::Scheduled | PlanPreviewState::Loading => {
+                    query_manager.set_plan_preview(PlanState::Loading)
+                }
+                PlanPreviewState::Ready(plan) => {
                     query_manager.set_plan_preview(PlanState::Ready(
                         serde_json::to_value(plan).unwrap_or_default(),
                     ));
                 }
-                QueryActionState::Error(error) => {
+                PlanPreviewState::Error(error) => {
                     query_manager.set_plan_preview(PlanState::Error(error.clone()));
                 }
-                QueryActionState::Idle
-                | QueryActionState::Running
-                | QueryActionState::SavingPlan => {}
+                PlanPreviewState::Empty => {}
             }
         }
-        if let Some(callback) = self.query_action_callback.borrow().as_ref() {
-            callback(state);
+        self.emit_app_state();
+        for command in commands {
+            self.execute_app_command(command);
         }
+    }
+
+    fn emit_app_state(&self) {
+        let state = self.app_state.borrow().clone();
+        for callback in self.app_state_callbacks.borrow().iter() {
+            callback(state.clone());
+        }
+    }
+
+    fn execute_app_command(&self, command: AppCommand) {
+        match command {
+            AppCommand::BeginPreview => self.begin_query_preview(),
+            AppCommand::CancelPreview => self.cancel_query_preview(),
+            AppCommand::ShowPlan => {
+                self.show_query_plan();
+            }
+            AppCommand::HidePlan => {
+                if let Some(manager) = self.query_preview_manager.borrow().as_ref() {
+                    manager.close_plan();
+                }
+            }
+            AppCommand::PinPlan => {
+                self.pin_query_plan();
+            }
+            AppCommand::RunQuery => self.run_current_query(),
+            AppCommand::CancelQuery => self.cancel_current_query(),
+        }
+    }
+
+    pub fn handle_input_pressed(&self, key: InputKey, at_ms: u64) -> bool {
+        let commands = self
+            .app_state
+            .borrow_mut()
+            .transition(AppEvent::KeyPressed { key, at_ms });
+        let handled = self.app_state.borrow().captures_key(key);
+        self.emit_app_state();
+        for command in commands {
+            self.execute_app_command(command);
+        }
+        handled
+    }
+
+    pub fn handle_input_released(&self, key: InputKey, at_ms: u64) {
+        let commands = self
+            .app_state
+            .borrow_mut()
+            .transition(AppEvent::KeyReleased { key, at_ms });
+        self.emit_app_state();
+        for command in commands {
+            self.execute_app_command(command);
+        }
+    }
+
+    pub fn reset_input(&self) {
+        self.dispatch(AppEvent::KeyboardReset);
+    }
+
+    pub fn activate_primary_action(&self) {
+        self.dispatch(AppEvent::PrimaryActionRequested);
     }
 
     fn emit_query_availability(&self, available: bool) {
-        if let Some(callback) = self.query_availability_callback.borrow().as_ref() {
-            callback(available);
-        }
-    }
-
-    fn current_connection(&self) -> Option<dzban_db::DbConnection> {
-        let current_page = self.tab_view.selected_page()?;
-        self.tabs
-            .borrow()
-            .values()
-            .find(|(page, _, _, _)| page == &current_page)
-            .map(|(_, _, config, _)| config.connection())
+        self.dispatch(AppEvent::QueryAvailabilityChanged(available));
     }
 
     fn current_query_manager(&self) -> Option<QueryTabManager> {
@@ -619,7 +711,12 @@ impl DatabaseTabManager {
 
                 self.tabs.borrow_mut().insert(
                     db_name.to_string(),
-                    (page.clone(), query_manager, config, state_widget.clone()),
+                    (
+                        page.clone(),
+                        query_manager.clone(),
+                        config,
+                        state_widget.clone(),
+                    ),
                 );
 
                 if self.tab_view.selected_page().as_ref() == Some(&page) {
@@ -662,29 +759,30 @@ impl DatabaseTabManager {
 
                 let manager_for_operation = self.clone();
                 let page_for_operation = page.clone();
+                let query_manager_for_operation = query_manager.clone();
                 let previous_operation = Rc::new(Cell::new(connection.operation()));
                 connection.connect_notify_local(Some("operation"), move |connection, _| {
+                    let operation = connection.operation();
+                    let previous = previous_operation.replace(operation);
                     if manager_for_operation.tab_view.selected_page().as_ref()
                         != Some(&page_for_operation)
                     {
                         return;
                     }
-                    let operation = connection.operation();
-                    let previous = previous_operation.replace(operation);
                     match operation {
-                        ConnectionOperation::Query => {
-                            manager_for_operation.emit_query_action(QueryActionState::Running)
+                        ConnectionOperation::PlanningQuery => {
+                            manager_for_operation.dispatch(AppEvent::QueryPlanning)
                         }
-                        ConnectionOperation::SavingPlan => {
-                            manager_for_operation.emit_query_action(QueryActionState::SavingPlan)
-                        }
+                        ConnectionOperation::Query => manager_for_operation.dispatch(
+                            AppEvent::QueryRunning(query_manager_for_operation.running_plan()),
+                        ),
                         ConnectionOperation::Idle
                             if matches!(
                                 previous,
-                                ConnectionOperation::Query | ConnectionOperation::SavingPlan
+                                ConnectionOperation::Query | ConnectionOperation::PlanningQuery
                             ) =>
                         {
-                            manager_for_operation.emit_query_action(QueryActionState::Idle)
+                            manager_for_operation.dispatch(AppEvent::QueryFinished)
                         }
                         ConnectionOperation::Idle
                         | ConnectionOperation::Ping
@@ -783,6 +881,8 @@ impl DatabaseTabManager {
 
     /// Execute the query in the currently active query tab
     pub fn run_current_query(&self) {
+        self.close_query_plan();
+        self.cancel_query_preview();
         let Some(current_page) = self.tab_view.selected_page() else {
             return;
         };
@@ -811,9 +911,12 @@ impl DatabaseTabManager {
 
         let statusbar = self.statusbar.clone();
         let tab_view = self.tab_view.clone();
+        let manager_for_plan = self.clone();
+        let database_page_for_plan = database_page.clone();
+        let connection_for_plan = connection.clone();
         let pending = Rc::new(RefCell::new(PendingQueryHistory {
             sql: Some(sql),
-            success: None,
+            outcome: None,
             explain_ready: false,
             explain: None,
             explain_error: None,
@@ -836,43 +939,49 @@ impl DatabaseTabManager {
                         statusbar.update_rows(Some(row_count));
                         statusbar.update_exec_time(Some(duration.as_secs_f64()));
                     }
-                    pending_for_query.borrow_mut().success = Some(SuccessfulQuery {
-                        duration,
-                        rows: row_count,
-                        result: stored_result,
-                    });
+                    pending_for_query.borrow_mut().outcome =
+                        Some(CompletedQuery::Success(SuccessfulQuery {
+                            duration,
+                            rows: row_count,
+                            result: stored_result,
+                        }));
                     record_completed_query(&pending_for_query, &query_manager_for_result);
                 }
                 Ok(Err(error)) => {
                     tracing::error!("Query failed: {}", error);
                     query_manager_for_result.display_error_for(execution.query_num(), &error);
-                    if let Some(sql) = pending_for_query.borrow_mut().sql.take() {
-                        query_manager_for_result.record_query_failure(sql, error);
-                    }
+                    pending_for_query.borrow_mut().outcome = Some(CompletedQuery::Failure(error));
+                    record_completed_query(&pending_for_query, &query_manager_for_result);
                 }
                 Err(_) => {
                     let error = "Query execution was cancelled";
                     tracing::error!("{}", error);
                     query_manager_for_result.display_error_for(execution.query_num(), error);
-                    if let Some(sql) = pending_for_query.borrow_mut().sql.take() {
-                        query_manager_for_result.record_query_failure(sql, error.to_string());
-                    }
+                    pending_for_query.borrow_mut().outcome =
+                        Some(CompletedQuery::Failure(error.to_string()));
+                    record_completed_query(&pending_for_query, &query_manager_for_result);
                 }
             }
         });
 
         gtk4::glib::spawn_future_local(async move {
-            let (explain, explain_error) = match explain_rx.await {
-                Ok(Ok(plan)) => (serde_json::to_value(plan).ok(), None),
+            let (plan, explain_error) = match explain_rx.await {
+                Ok(Ok(plan)) => (Some(plan), None),
                 Ok(Err(error)) => (None, Some(error)),
                 Err(_) => (None, Some("EXPLAIN request was cancelled".to_string())),
             };
             query_manager.display_explain_for(
                 query_num,
                 output_generation,
-                explain.as_ref(),
+                plan.as_ref(),
                 explain_error.as_deref(),
             );
+            if manager_for_plan.tab_view.selected_page().as_ref() == Some(&database_page_for_plan)
+                && connection_for_plan.operation() == ConnectionOperation::Query
+            {
+                manager_for_plan.dispatch(AppEvent::QueryRunning(plan.clone()));
+            }
+            let explain = plan.and_then(|plan| serde_json::to_value(plan).ok());
             {
                 let mut pending = pending.borrow_mut();
                 pending.explain_ready = true;
@@ -883,38 +992,48 @@ impl DatabaseTabManager {
         });
     }
 
-    pub fn cancel_current_query(&self) {
+    pub fn request_cancel_current_query(&self) {
+        self.dispatch(AppEvent::CancelRequested);
+    }
+
+    fn cancel_current_query(&self) {
         let Some(current_page) = self.tab_view.selected_page() else {
             return;
         };
-        let tabs = self.tabs.borrow();
-        let Some((_, query_manager, config, _)) =
-            tabs.values().find(|(page, _, _, _)| page == &current_page)
+        let Some((query_manager, connection)) = self
+            .tabs
+            .borrow()
+            .values()
+            .find(|(page, _, _, _)| page == &current_page)
+            .map(|(_, manager, config, _)| (manager.clone(), config.connection()))
         else {
             return;
         };
-        let Some((_, _, state_manager)) = query_manager.current_query() else {
+        let Some((_, state_manager)) = query_manager.running_query() else {
             return;
         };
         if !state_manager.cancel() {
             return;
         }
-        let connection = config.connection();
+        self.dispatch(AppEvent::QueryCanceling);
         if connection.state() != ConnectionState::Connected {
             state_manager.finish();
+            self.dispatch(AppEvent::QueryFinished);
             return;
         }
-        let connection = connection.clone();
+        let manager = self.clone();
         gtk4::glib::spawn_future_local(async move {
             match connection.cancel_query().await {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
                     tracing::error!("Failed to cancel query: {}", error);
                     state_manager.cancel_failed();
+                    manager.dispatch(AppEvent::QueryRunning(query_manager.running_plan()));
                 }
                 Err(_) => {
                     tracing::error!("Cancellation request was dropped");
                     state_manager.cancel_failed();
+                    manager.dispatch(AppEvent::QueryRunning(query_manager.running_plan()));
                 }
             }
         });

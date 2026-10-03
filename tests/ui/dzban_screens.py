@@ -52,6 +52,15 @@ def wait_for_node_containing(root, text, timeout=10):
     raise AssertionError(f"Did not find text containing {text!r}:\n{dump_tree(root)}")
 
 
+def wait_for_node_to_disappear(root, name, timeout=10):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not root.find_children(lambda node: node.name == name):
+            return
+        time.sleep(0.1)
+    raise AssertionError(f"{name!r} remained visible:\n{dump_tree(root)}")
+
+
 @unittest.skipIf(MISSING_BINARIES, f"missing: {', '.join(MISSING_BINARIES)}")
 class DzbanScreens(unittest.TestCase):
     @classmethod
@@ -60,6 +69,9 @@ class DzbanScreens(unittest.TestCase):
         cls.original_directory = Path.cwd()
         cls.session = HermeticSession(virtual_monitor="1440x900")
         cls.session.boot()
+        input_backend = cls.session.install_input()
+        input_backend.connectMonitor()
+        time.sleep(0.3)
 
     @classmethod
     def tearDownClass(cls):
@@ -83,7 +95,10 @@ class DzbanScreens(unittest.TestCase):
         )
         self.addCleanup(process.wait, 5)
         self.addCleanup(process.terminate)
-        return self.session.wait_for_app(APP_NAME)
+        application = self.session.wait_for_app(APP_NAME)
+        from gi.repository import Atspi
+        application.set_cache_mask(Atspi.Cache.NONE)
+        return application
 
     def test_empty_connections_and_shortcuts_screen(self):
         application = self.launch()
@@ -114,6 +129,11 @@ password = "testpass"
         wait_for_node(application, "Integration PostgreSQL")
         wait_for_node(application, "PostgreSQL database backend")
         wait_for_node(application, "Open", "button").do_action_named("click")
+        wait_for_node(application, "Query History")
+        history_toggle = wait_for_node(application, "Toggle query history", "button")
+        history_toggle.do_action_named("click")
+        wait_for_node_to_disappear(application, "Query History")
+        history_toggle.do_action_named("click")
         wait_for_node(application, "Query History")
 
         action_field = wait_for_node(
@@ -157,19 +177,68 @@ password = "testpass"
         wait_for_node(application, "Analysis")
 
         editor = wait_for_node(application, "SQL query editor")
-        slow_query = (
-            "SELECT value FROM generate_series(1, 3) value, "
-            "LATERAL (SELECT pg_sleep(3)) delay"
-        )
+        editor.text = "SELECT 1 AS preview_value"
+        editor.grab_focus()
+        from dogtail import rawinput
+        for key in ("Control_L", "Shift_L", "space"):
+            self.addCleanup(rawinput.release_key, key)
+        from dogtail.config import config as dogtail_config
+        dogtail_config.action_delay = 0.02
+        dogtail_config.typing_delay = 0.02
+        rawinput.hold_key("Control_L")
+        rawinput.hold_key("Shift_L")
+        time.sleep(0.5)
+        rawinput.hold_key("space")
+        wait_for_node(application, "Query Plan")
+        time.sleep(0.4)
+        rawinput.release_key("space")
+        wait_for_node_to_disappear(application, "Query Plan")
+        rawinput.release_key("Shift_L")
+        rawinput.release_key("Control_L")
+
+        rawinput.hold_key("Control_L")
+        rawinput.hold_key("Shift_L")
+        time.sleep(0.5)
+        rawinput.press_key("space")
+        rawinput.release_key("Shift_L")
+        rawinput.release_key("Control_L")
+        wait_for_node(application, "Query Plan")
+        wait_for_node(application, "Unpin query plan", "button")
+        slow_query = "SELECT pg_sleep(10), 1 AS value"
         editor.text = slow_query
         run_button = wait_for_node(application, "Run query", "button")
         run_button.do_action_named("click")
+        wait_for_node_to_disappear(application, "Query Plan")
         wait_for_node(application, "Running Query", timeout=15)
-        self.assertFalse(run_button.sensitive)
-        run_button.do_action_named("click")
-        wait_for_node_containing(application, "3 rows", timeout=15)
+        stop_button = wait_for_node(application, "Stop query", "button")
+        self.assertTrue(stop_button.sensitive)
+
+        action_field.text = "query tab"
+        wait_for_node(
+            application, "Run action: Query tab: Query 1", "button"
+        ).do_action_named("click")
+        wait_for_node(application, "No Results")
+        stop_button.do_action_named("click")
+        action_field.text = "query tab"
+        wait_for_node(
+            application, "Run action: Query tab: Analysis", "button"
+        ).do_action_named("click")
+        wait_for_node(application, "Query Failed", timeout=15)
         wait_for_node(application, slow_query, timeout=15)
         self.assertTrue(run_button.sensitive)
+        wait_for_node(
+            application, "Show saved query plan", "button", timeout=15
+        ).do_action_named("click")
+        wait_for_node(application, "Query Plan")
+        wait_for_node(application, "Close query plan", "button").do_action_named("click")
+
+        editor.text = slow_query
+        wait_for_node(application, "Run query", "button").do_action_named("click")
+        wait_for_node(application, "Running Query", timeout=15)
+        editor.grab_focus()
+        rawinput.press_key("Escape")
+        wait_for_node(application, "Query Failed", timeout=15)
+        self.assertTrue(wait_for_node(application, "Run query", "button").sensitive)
 
         editor.text = "SELECT 1 AS answer"
         wait_for_node(application, "Run query", "button").do_action_named("click")

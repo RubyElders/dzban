@@ -23,7 +23,7 @@ use super::result_inspector::ResultInspector;
 use super::sidebar::{HistoryPlanAction, QueryHistory};
 
 type EmptyCallback = Rc<dyn Fn()>;
-use dzban_db::ResultSet;
+use dzban_db::{QueryPlan, ResultSet};
 
 const MAX_RESULT_COLUMN_WIDTH: i32 = 360;
 const RESULT_CELL_HORIZONTAL_SPACE: i32 = 16;
@@ -36,6 +36,7 @@ struct QueryTab {
     editor: SourceView,
     results_scroll: ScrolledWindow,
     state_manager: QueryStateManager,
+    running_plan: RefCell<Option<QueryPlan>>,
     output_generation: Cell<u64>,
     result_scroll_position: Cell<Option<ResultScrollPosition>>,
     result_scroll_restore_pending: Rc<Cell<bool>>,
@@ -145,7 +146,7 @@ impl QueryTabManager {
                         Some(&result_inspector),
                     )));
                 }
-                QueryHistoryOutcome::Failure { error } => {
+                QueryHistoryOutcome::Failure { error, .. } => {
                     tab.results_scroll
                         .set_child(Some(&create_error_page(error)));
                 }
@@ -155,12 +156,16 @@ impl QueryTabManager {
 
         let plan_inspector = manager.plan_inspector.clone();
         manager.history.set_plan_callback(move |entry, action| {
-            let QueryHistoryOutcome::Success {
-                explain: Some(plan),
-                ..
-            } = &entry.outcome
-            else {
-                return;
+            let plan = match &entry.outcome {
+                QueryHistoryOutcome::Success {
+                    explain: Some(plan),
+                    ..
+                }
+                | QueryHistoryOutcome::Failure {
+                    explain: Some(plan),
+                    ..
+                } => plan,
+                _ => return,
             };
             match action {
                 HistoryPlanAction::ShowTransient => {
@@ -173,16 +178,21 @@ impl QueryTabManager {
 
         let weak_tabs = Rc::downgrade(&manager.tabs);
         let empty_callback = manager.empty_callback.clone();
-        manager.tab_view.connect_close_page(move |_view, page| {
+        manager.tab_view.connect_close_page(move |view, page| {
             if let Some(tabs) = weak_tabs.upgrade() {
-                let query_num = tabs
-                    .borrow()
-                    .iter()
-                    .find(|(_, tab)| tab.page == *page)
-                    .map(|(query_num, _)| *query_num);
-                if let Some(query_num) = query_num {
-                    tabs.borrow_mut().remove(&query_num);
-                }
+                let query_num = {
+                    let tabs = tabs.borrow();
+                    let Some((query_num, tab)) = tabs.iter().find(|(_, tab)| tab.page == *page)
+                    else {
+                        return glib::Propagation::Proceed;
+                    };
+                    if tab.state_manager.is_active() {
+                        view.close_page_finish(page, false);
+                        return glib::Propagation::Stop;
+                    }
+                    *query_num
+                };
+                tabs.borrow_mut().remove(&query_num);
                 if tabs.borrow().is_empty()
                     && let Some(callback) = empty_callback.borrow().as_ref()
                 {
@@ -227,6 +237,7 @@ impl QueryTabManager {
                 editor: editor.clone(),
                 results_scroll,
                 state_manager,
+                running_plan: RefCell::new(None),
                 output_generation: Cell::new(0),
                 result_scroll_position: Cell::new(None),
                 result_scroll_restore_pending: Rc::new(Cell::new(false)),
@@ -298,6 +309,22 @@ impl QueryTabManager {
             .to_string();
         let query = extract_query_at_cursor(&full_text, cursor_iter.offset() as usize)?.0;
         Some((query_num, query, tab.state_manager.clone()))
+    }
+
+    pub fn running_query(&self) -> Option<(u32, QueryStateManager)> {
+        self.tabs
+            .borrow()
+            .iter()
+            .find(|(_, tab)| tab.state_manager.is_active())
+            .map(|(query_num, tab)| (*query_num, tab.state_manager.clone()))
+    }
+
+    pub fn running_plan(&self) -> Option<QueryPlan> {
+        self.tabs
+            .borrow()
+            .values()
+            .find(|tab| tab.state_manager.is_active())
+            .and_then(|tab| tab.running_plan.borrow().clone())
     }
 
     pub fn highlight_current_query(&self) -> Option<String> {
@@ -375,22 +402,25 @@ impl QueryTabManager {
         &self,
         query_num: u32,
         output_generation: u64,
-        explain: Option<&serde_json::Value>,
+        plan: Option<&QueryPlan>,
         explain_error: Option<&str>,
     ) {
-        let is_current = self
-            .tabs
-            .borrow()
+        let tabs = self.tabs.borrow();
+        let Some(tab) = tabs
             .get(&query_num)
             .filter(|tab| tab.output_generation.get() == output_generation)
-            .is_some()
-            && self.is_query_selected(query_num);
-        if !is_current {
+        else {
+            return;
+        };
+        tab.running_plan.replace(plan.cloned());
+        drop(tabs);
+        if !self.is_query_selected(query_num) {
             return;
         }
-        if let Some(explain) = explain {
-            self.plan_inspector
-                .set_state(&PlanState::Ready(explain.clone()));
+        if let Some(plan) = plan {
+            self.plan_inspector.set_state(&PlanState::Ready(
+                serde_json::to_value(plan).unwrap_or_default(),
+            ));
         } else if let Some(error) = explain_error {
             self.plan_inspector
                 .set_state(&PlanState::Error(error.to_string()));
@@ -424,8 +454,19 @@ impl QueryTabManager {
         ));
     }
 
-    pub fn record_query_failure(&self, sql: String, error: String) {
-        self.history.add(QueryHistoryEntry::failure(sql, error));
+    pub fn record_query_failure(
+        &self,
+        sql: String,
+        error: String,
+        explain: Option<serde_json::Value>,
+        explain_error: Option<String>,
+    ) {
+        self.history.add(QueryHistoryEntry::failure(
+            sql,
+            error,
+            explain,
+            explain_error,
+        ));
     }
 
     /// Show loading state in results area
@@ -438,8 +479,10 @@ impl QueryTabManager {
             }
             let output_generation = tab.output_generation.get().wrapping_add(1);
             tab.output_generation.set(output_generation);
+            tab.running_plan.replace(None);
             let loading_page = adw::StatusPage::new();
             loading_page.set_widget_name("query-running-status");
+            loading_page.add_css_class("compact");
             loading_page.set_icon_name(Some("content-loading-symbolic"));
             loading_page.set_title("Running Query");
             loading_page.set_description(Some("Waiting for results"));
@@ -447,9 +490,23 @@ impl QueryTabManager {
             spinner.set_spinning(true);
             spinner.set_size_request(48, 48);
             loading_page.set_child(Some(&spinner));
-            if !has_results {
-                tab.results_scroll.set_child(Some(&loading_page));
-            }
+            self.result_inspector.close();
+            tab.results_scroll.set_child(Some(&loading_page));
+            let horizontal = tab.results_scroll.hadjustment();
+            let vertical = tab.results_scroll.vadjustment();
+            horizontal.set_value(horizontal.lower());
+            vertical.set_value(vertical.lower());
+            let scroll = tab.results_scroll.clone();
+            let loading_page_for_idle = loading_page.clone();
+            glib::idle_add_local_once(move || {
+                if scroll.child().as_ref() != Some(loading_page_for_idle.upcast_ref()) {
+                    return;
+                }
+                let horizontal = scroll.hadjustment();
+                let vertical = scroll.vadjustment();
+                horizontal.set_value(horizontal.lower());
+                vertical.set_value(vertical.lower());
+            });
             Some(output_generation)
         } else {
             None
@@ -572,16 +629,8 @@ impl QueryTabManager {
         self.plan_inspector.show_transient();
     }
 
-    pub fn hide_plan_transient(&self) {
-        self.plan_inspector.hide_transient();
-    }
-
     pub fn pin_plan(&self) -> bool {
         self.plan_inspector.pin()
-    }
-
-    pub fn is_plan_pinned(&self) -> bool {
-        self.plan_inspector.is_pinned()
     }
 
     pub fn close_plan(&self) -> bool {
@@ -1247,10 +1296,23 @@ mod tests {
 
     #[gtk4::test]
     #[ignore = "requires a graphical display"]
-    fn running_query_status_does_not_duplicate_plan_estimates() {
+    fn running_query_replaces_stale_results_with_progress() {
         let manager = QueryTabManager::new("running-status-test");
         manager.new_query_tab();
+        let window = gtk4::Window::new();
+        window.set_default_size(1200, 800);
+        window.set_child(Some(manager.get_widget()));
+        window.present();
+        manager.display_result_snapshot_for(
+            1,
+            &QueryResultSnapshot {
+                columns: vec!["value".to_string()],
+                rows: vec![vec!["stale".to_string()]],
+                total_rows: 1,
+            },
+        );
         manager.show_loading_for(1).unwrap();
+        gtk4::test_widget_wait_for_draw(manager.get_widget());
 
         let results_scroll = manager
             .tabs
@@ -1260,8 +1322,37 @@ mod tests {
             .results_scroll
             .clone();
         let status = find_status_page(results_scroll.upcast_ref()).unwrap();
+        assert!(find_result_view(results_scroll.upcast_ref()).is_none());
         assert_eq!(status.title(), "Running Query");
         assert_eq!(status.description().as_deref(), Some("Waiting for results"));
+        assert_eq!(results_scroll.hadjustment().value(), 0.0);
+        assert_eq!(results_scroll.vadjustment().value(), 0.0);
+        let vertical = results_scroll.vadjustment();
+        assert!(vertical.upper() <= vertical.page_size());
+        window.close();
+    }
+
+    #[gtk4::test]
+    #[ignore = "requires a graphical display"]
+    fn running_query_remains_addressable_after_selecting_another_tab() {
+        let manager = QueryTabManager::new("background-query-test");
+        manager.new_query_tab();
+        manager.tabs.borrow().get(&1).unwrap().state_manager.start();
+        manager.new_query_tab();
+
+        assert!(manager.is_query_selected(2));
+        assert_eq!(manager.running_query().unwrap().0, 1);
+    }
+
+    #[gtk4::test]
+    #[ignore = "requires a graphical display"]
+    fn query_history_sidebar_can_be_hidden_and_restored() {
+        let manager = QueryTabManager::new("sidebar-toggle-test");
+        assert!(manager.is_sidebar_visible());
+        manager.toggle_sidebar();
+        assert!(!manager.is_sidebar_visible());
+        manager.toggle_sidebar();
+        assert!(manager.is_sidebar_visible());
     }
 
     #[gtk4::test]
@@ -1421,8 +1512,11 @@ mod tests {
 
         for rerun in 1..=3 {
             manager.show_loading_for(1).unwrap();
-            assert!(find_result_view(scroll.upcast_ref()).is_some());
-            assert_eq!(result_scroll_position(&scroll), expected);
+            assert!(find_result_view(scroll.upcast_ref()).is_none());
+            assert!(find_status_page(scroll.upcast_ref()).is_some());
+            while glib::MainContext::default().iteration(false) {}
+            assert_eq!(scroll.hadjustment().value(), scroll.hadjustment().lower());
+            assert_eq!(scroll.vadjustment().value(), scroll.vadjustment().lower());
 
             manager.display_result_snapshot_for(1, &result);
             gtk4::test_widget_wait_for_draw(manager.get_widget());
@@ -1606,5 +1700,21 @@ mod tests {
         manager.new_query_tab();
         assert!(manager.close_current_tab());
         assert!(!manager.close_current_tab());
+    }
+
+    #[gtk4::test]
+    #[ignore = "requires a graphical display"]
+    fn running_query_tab_stays_open_until_the_operation_finishes() {
+        let manager = QueryTabManager::new("running-tab-close-test");
+        manager.new_query_tab();
+        let state = manager.tabs.borrow().get(&1).unwrap().state_manager.clone();
+        state.start();
+
+        assert!(manager.close_current_tab());
+        assert_eq!(manager.tab_count(), 1);
+
+        state.finish();
+        assert!(manager.close_current_tab());
+        assert_eq!(manager.tab_count(), 0);
     }
 }

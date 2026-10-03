@@ -73,6 +73,10 @@ impl QueryStateManager {
             *state = QueryState::Running;
         }
     }
+
+    pub fn is_active(&self) -> bool {
+        *self.state.lock().unwrap() != QueryState::Idle
+    }
 }
 
 impl Default for QueryStateManager {
@@ -111,5 +115,16 @@ mod tests {
         assert_eq!(execution.query_num(), 1);
         assert!(!first.cancel());
         assert!(second.cancel());
+    }
+
+    #[test]
+    fn cancel_remains_available_while_the_query_is_not_selected() {
+        let background = QueryStateManager::new();
+        let selected = QueryStateManager::new();
+        background.start();
+
+        assert!(background.is_active());
+        assert!(!selected.is_active());
+        assert!(background.cancel());
     }
 }

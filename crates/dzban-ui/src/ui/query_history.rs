@@ -27,6 +27,10 @@ pub enum QueryHistoryOutcome {
     },
     Failure {
         error: String,
+        #[serde(default)]
+        explain: Option<serde_json::Value>,
+        #[serde(default)]
+        explain_error: Option<String>,
     },
 }
 
@@ -59,11 +63,20 @@ impl QueryHistoryEntry {
         }
     }
 
-    pub fn failure(sql: String, error: String) -> Self {
+    pub fn failure(
+        sql: String,
+        error: String,
+        explain: Option<serde_json::Value>,
+        explain_error: Option<String>,
+    ) -> Self {
         Self {
             sql,
             executed_at: timestamp(),
-            outcome: QueryHistoryOutcome::Failure { error },
+            outcome: QueryHistoryOutcome::Failure {
+                error,
+                explain,
+                explain_error,
+            },
         }
     }
 }
@@ -253,6 +266,8 @@ mod tests {
             .add(QueryHistoryEntry::failure(
                 "select broken".to_string(),
                 "syntax error".to_string(),
+                Some(serde_json::json!([{"Plan": {"Node Type": "Result"}}])),
+                None,
             ))
             .unwrap();
 
@@ -267,6 +282,10 @@ mod tests {
             panic!("expected successful history entry");
         };
         assert_eq!(result.as_ref().unwrap().rows, [["1"]]);
+        assert!(explain.is_some());
+        let QueryHistoryOutcome::Failure { explain, .. } = &loaded.entries()[0].outcome else {
+            panic!("expected failed history entry");
+        };
         assert!(explain.is_some());
 
         #[cfg(unix)]
