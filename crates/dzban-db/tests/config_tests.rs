@@ -483,9 +483,9 @@ async fn test_dbconfig_connect_all_tabs() {
 }
 
 #[glib::async_test]
-#[ignore]
-async fn test_dbconfig_parallel_queries() {
-    println!("Test: DbConfig tabs can execute queries in parallel");
+#[ignore = "requires the PostgreSQL service from docker-compose.test.yml"]
+async fn test_dbconfig_rejects_overlapping_tab_queries() {
+    println!("Test: DbConfig rejects concurrent queries on its shared connection");
 
     let config = DbConfig::new(
         "Test Config".to_string(),
@@ -513,12 +513,22 @@ async fn test_dbconfig_parallel_queries() {
 
     let query_count = Rc::new(RefCell::new(0));
     let query_count_clone = query_count.clone();
+    let error_count = Rc::new(RefCell::new(0));
+    let error_count_clone = error_count.clone();
 
     config.connect_closure(
         "query-finished",
         false,
         glib::closure_local!(move |_config: &DbConfig, _rows: i64, _duration: i64| {
             *query_count_clone.borrow_mut() += 1;
+        }),
+    );
+    config.connect_closure(
+        "query-error",
+        false,
+        glib::closure_local!(move |_config: &DbConfig, error: String| {
+            assert_eq!(error, "Connection is busy");
+            *error_count_clone.borrow_mut() += 1;
         }),
     );
 
@@ -532,17 +542,15 @@ async fn test_dbconfig_parallel_queries() {
     tab2.execute_query();
 
     let start = std::time::Instant::now();
-    while *query_count.borrow() < 2 && start.elapsed().as_secs() < 10 {
+    while (*query_count.borrow() < 1 || *error_count.borrow() < 1) && start.elapsed().as_secs() < 10
+    {
         glib::timeout_future(std::time::Duration::from_millis(10)).await;
     }
 
-    assert_eq!(*query_count.borrow(), 2);
+    assert_eq!(*query_count.borrow(), 1);
+    assert_eq!(*error_count.borrow(), 1);
     assert_eq!(tab1.result_count(), 3);
-    assert_eq!(tab2.result_count(), 4);
-
-    println!("✅ Parallel queries executed successfully");
-    println!("   Tab 1 (users): {} rows", tab1.result_count());
-    println!("   Tab 2 (posts): {} rows", tab2.result_count());
+    assert_eq!(tab2.result_count(), 0);
 
     config.disconnect_all();
     config.close();

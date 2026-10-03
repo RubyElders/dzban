@@ -1,4 +1,4 @@
-use dzban_db::connection_gobject::{ConnectionState, DbConnection};
+use dzban_db::connection_gobject::{ConnectionOperation, ConnectionState, DbConnection};
 use glib::prelude::*;
 
 #[test]
@@ -13,6 +13,8 @@ fn test_gobject_properties() {
     assert_eq!(conn.version(), None);
     assert_eq!(conn.ping_count(), 0);
     assert_eq!(conn.last_error(), "");
+    assert_eq!(conn.operation(), ConnectionOperation::Idle);
+    assert!(!conn.operation_available());
     assert!(!conn.query_running());
 
     println!("✅ All properties readable");
@@ -26,6 +28,12 @@ fn test_gobject_property_via_generic_api() {
 
     let state: ConnectionState = conn.property("state");
     assert_eq!(state, ConnectionState::Disconnected);
+
+    let operation: ConnectionOperation = conn.property("operation");
+    assert_eq!(operation, ConnectionOperation::Idle);
+
+    let operation_available: bool = conn.property("operation-available");
+    assert!(!operation_available);
 
     let latency: i64 = conn.property("latency-micros");
     assert_eq!(latency, -1);
@@ -124,6 +132,8 @@ fn test_default_values() {
     assert_eq!(conn.version(), None);
     assert_eq!(conn.ping_count(), 0);
     assert_eq!(conn.last_error(), "");
+    assert_eq!(conn.operation(), ConnectionOperation::Idle);
+    assert!(!conn.operation_available());
     assert!(!conn.query_running());
 
     println!("✅ Default values correct");

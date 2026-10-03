@@ -56,6 +56,7 @@ async fn clickhouse_query_error_and_plan_work_through_the_public_connection() {
 
     let plan = connection
         .explain_query("SELECT * FROM events WHERE id > 1".to_string())
+        .unwrap()
         .await
         .unwrap()
         .unwrap();

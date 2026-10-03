@@ -21,6 +21,8 @@ use super::query_history::{QueryHistoryEntry, QueryHistoryOutcome, QueryResultSn
 use super::query_state::QueryStateManager;
 use super::result_inspector::ResultInspector;
 use super::sidebar::{HistoryPlanAction, QueryHistory};
+
+type EmptyCallback = Rc<dyn Fn()>;
 use dzban_db::ResultSet;
 
 const MAX_RESULT_COLUMN_WIDTH: i32 = 360;
@@ -56,6 +58,7 @@ pub struct QueryTabManager {
     history: QueryHistory,
     plan_inspector: PlanInspector,
     result_inspector: ResultInspector,
+    empty_callback: Rc<RefCell<Option<EmptyCallback>>>,
 }
 
 impl QueryTabManager {
@@ -110,6 +113,7 @@ impl QueryTabManager {
             history,
             plan_inspector,
             result_inspector,
+            empty_callback: Rc::new(RefCell::new(None)),
         };
 
         let weak_tab_view = manager.tab_view.downgrade();
@@ -168,6 +172,7 @@ impl QueryTabManager {
         });
 
         let weak_tabs = Rc::downgrade(&manager.tabs);
+        let empty_callback = manager.empty_callback.clone();
         manager.tab_view.connect_close_page(move |_view, page| {
             if let Some(tabs) = weak_tabs.upgrade() {
                 let query_num = tabs
@@ -177,6 +182,11 @@ impl QueryTabManager {
                     .map(|(query_num, _)| *query_num);
                 if let Some(query_num) = query_num {
                     tabs.borrow_mut().remove(&query_num);
+                }
+                if tabs.borrow().is_empty()
+                    && let Some(callback) = empty_callback.borrow().as_ref()
+                {
+                    callback();
                 }
             }
             glib::Propagation::Proceed
@@ -429,9 +439,10 @@ impl QueryTabManager {
             let output_generation = tab.output_generation.get().wrapping_add(1);
             tab.output_generation.set(output_generation);
             let loading_page = adw::StatusPage::new();
+            loading_page.set_widget_name("query-running-status");
             loading_page.set_icon_name(Some("content-loading-symbolic"));
-            loading_page.set_title("Running Query...");
-            loading_page.set_description(Some("Please wait"));
+            loading_page.set_title("Running Query");
+            loading_page.set_description(Some("Waiting for results"));
             let spinner = gtk4::Spinner::new();
             spinner.set_spinning(true);
             spinner.set_size_request(48, 48);
@@ -460,6 +471,17 @@ impl QueryTabManager {
         };
         self.tab_view.close_page(&page);
         true
+    }
+
+    pub fn tab_count(&self) -> i32 {
+        self.tab_view.n_pages()
+    }
+
+    pub fn set_empty_callback<F>(&self, callback: F)
+    where
+        F: Fn() + 'static,
+    {
+        *self.empty_callback.borrow_mut() = Some(Rc::new(callback));
     }
 
     pub fn select_next_tab(&self) -> bool {
@@ -558,6 +580,10 @@ impl QueryTabManager {
         self.plan_inspector.pin()
     }
 
+    pub fn is_plan_pinned(&self) -> bool {
+        self.plan_inspector.is_pinned()
+    }
+
     pub fn close_plan(&self) -> bool {
         let closed = self.plan_inspector.close();
         if closed {
@@ -645,6 +671,22 @@ fn find_result_view(root: &gtk4::Widget) -> Option<ColumnView> {
     while let Some(widget) = widgets.pop() {
         if let Some(column_view) = widget.downcast_ref::<ColumnView>() {
             return Some(column_view.clone());
+        }
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            child = current.next_sibling();
+            widgets.push(current);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+fn find_status_page(root: &gtk4::Widget) -> Option<adw::StatusPage> {
+    let mut widgets = vec![root.clone()];
+    while let Some(widget) = widgets.pop() {
+        if let Some(status_page) = widget.downcast_ref::<adw::StatusPage>() {
+            return Some(status_page.clone());
         }
         let mut child = widget.first_child();
         while let Some(current) = child {
@@ -1201,6 +1243,25 @@ mod tests {
         let preview = result_cell_preview(&"ž".repeat(MAX_RESULT_CELL_PREVIEW_CHARS + 1));
         assert_eq!(preview.chars().count(), MAX_RESULT_CELL_PREVIEW_CHARS);
         assert!(preview.ends_with("..."));
+    }
+
+    #[gtk4::test]
+    #[ignore = "requires a graphical display"]
+    fn running_query_status_does_not_duplicate_plan_estimates() {
+        let manager = QueryTabManager::new("running-status-test");
+        manager.new_query_tab();
+        manager.show_loading_for(1).unwrap();
+
+        let results_scroll = manager
+            .tabs
+            .borrow()
+            .get(&1)
+            .unwrap()
+            .results_scroll
+            .clone();
+        let status = find_status_page(results_scroll.upcast_ref()).unwrap();
+        assert_eq!(status.title(), "Running Query");
+        assert_eq!(status.description().as_deref(), Some("Waiting for results"));
     }
 
     #[gtk4::test]

@@ -5,7 +5,7 @@ use libadwaita as adw;
 
 use crate::APP_NAME;
 
-use super::db_tabs::{DatabaseTabManager, QueryPreviewState};
+use super::db_tabs::{DatabaseTabManager, QueryActionState};
 use super::plan_inspector::PlanScroll;
 use super::shortcuts;
 use super::shortcuts::ShortcutAction;
@@ -13,9 +13,7 @@ use super::statusbar::create_statusbar;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PreviewKeyAction {
-    Begin { show_plan: bool },
-    ShowPlan,
-    HidePlan,
+    Begin,
     Cancel,
     Scroll(PlanScroll),
 }
@@ -42,28 +40,27 @@ fn preview_key_pressed(
     modifiers: gtk4::gdk::ModifierType,
 ) -> Option<PreviewKeyAction> {
     let modifiers = relevant_modifiers(modifiers);
-    if key == gtk4::gdk::Key::Control_L || key == gtk4::gdk::Key::Control_R {
-        return Some(PreviewKeyAction::Begin {
-            show_plan: modifiers.contains(gtk4::gdk::ModifierType::SHIFT_MASK),
-        });
-    }
-    if (key == gtk4::gdk::Key::Shift_L || key == gtk4::gdk::Key::Shift_R)
-        && modifiers.contains(gtk4::gdk::ModifierType::CONTROL_MASK)
+    let chord = gtk4::gdk::ModifierType::CONTROL_MASK | gtk4::gdk::ModifierType::SHIFT_MASK;
+    let control_pressed = key == gtk4::gdk::Key::Control_L || key == gtk4::gdk::Key::Control_R;
+    let shift_pressed = key == gtk4::gdk::Key::Shift_L || key == gtk4::gdk::Key::Shift_R;
+    if (control_pressed && (modifiers == gtk4::gdk::ModifierType::SHIFT_MASK || modifiers == chord))
+        || (shift_pressed
+            && (modifiers == gtk4::gdk::ModifierType::CONTROL_MASK || modifiers == chord))
     {
-        return Some(PreviewKeyAction::ShowPlan);
+        return Some(PreviewKeyAction::Begin);
     }
-    if modifiers == (gtk4::gdk::ModifierType::CONTROL_MASK | gtk4::gdk::ModifierType::SHIFT_MASK)
-        || modifiers.is_empty()
-    {
+    if modifiers == chord || modifiers.is_empty() {
         return plan_scroll(key).map(PreviewKeyAction::Scroll);
     }
     None
 }
 
 fn preview_key_released(key: gtk4::gdk::Key) -> Option<PreviewKeyAction> {
-    if key == gtk4::gdk::Key::Shift_L || key == gtk4::gdk::Key::Shift_R {
-        Some(PreviewKeyAction::HidePlan)
-    } else if key == gtk4::gdk::Key::Control_L || key == gtk4::gdk::Key::Control_R {
+    if key == gtk4::gdk::Key::Shift_L
+        || key == gtk4::gdk::Key::Shift_R
+        || key == gtk4::gdk::Key::Control_L
+        || key == gtk4::gdk::Key::Control_R
+    {
         Some(PreviewKeyAction::Cancel)
     } else {
         None
@@ -106,14 +103,8 @@ pub fn build_ui(app: &Application) {
     let db_manager_for_preview = db_tab_manager.clone();
     query_preview_controller.connect_key_pressed(move |_, key, _, modifiers| {
         match preview_key_pressed(key, modifiers) {
-            Some(PreviewKeyAction::Begin { show_plan }) => {
+            Some(PreviewKeyAction::Begin) => {
                 db_manager_for_preview.begin_query_preview();
-                if show_plan {
-                    db_manager_for_preview.show_query_plan();
-                }
-            }
-            Some(PreviewKeyAction::ShowPlan) => {
-                db_manager_for_preview.show_query_plan();
             }
             Some(PreviewKeyAction::Scroll(direction))
                 if db_manager_for_preview.scroll_query_plan(direction) =>
@@ -126,10 +117,8 @@ pub fn build_ui(app: &Application) {
     });
     let db_manager_for_preview = db_tab_manager.clone();
     query_preview_controller.connect_key_released(move |_, key, _, _| {
-        match preview_key_released(key) {
-            Some(PreviewKeyAction::HidePlan) => db_manager_for_preview.hide_query_plan(),
-            Some(PreviewKeyAction::Cancel) => db_manager_for_preview.cancel_query_preview(),
-            _ => {}
+        if let Some(PreviewKeyAction::Cancel) = preview_key_released(key) {
+            db_manager_for_preview.finish_query_preview_chord();
         }
     });
     window.add_controller(query_preview_controller);
@@ -150,22 +139,6 @@ pub fn build_ui(app: &Application) {
         )
     });
     window.add_controller(key_controller);
-
-    // Add keyboard icon button to header bar to show shortcuts
-    let shortcuts_button = gtk4::Button::from_icon_name("input-keyboard-symbolic");
-    shortcuts_button.set_tooltip_text(Some(
-        &shortcuts::shortcut(ShortcutAction::ShowShortcuts).tooltip(),
-    ));
-    shortcuts_button.update_property(&[
-        gtk4::accessible::Property::Label("Keyboard shortcuts"),
-        gtk4::accessible::Property::KeyShortcuts("Control+Shift+question"),
-    ]);
-    let shortcuts_dialog_for_button = shortcuts_dialog.clone();
-    let window_for_button = window.clone();
-    shortcuts_button.connect_clicked(move |_| {
-        shortcuts_dialog_for_button.present(Some(&window_for_button));
-    });
-    header.pack_end(&shortcuts_button);
 
     toast_overlay.set_child(Some(&content));
     toast_overlay.set_vexpand(true);
@@ -249,6 +222,7 @@ fn execute_shortcut_action(
         }
         ShortcutAction::FocusQueryHistory => db_manager.focus_query_history(),
         ShortcutAction::RunQuery => {
+            db_manager.close_query_plan();
             db_manager.cancel_query_preview();
             db_manager.run_current_query();
             true
@@ -262,12 +236,20 @@ fn execute_shortcut_action(
             true
         }
         ShortcutAction::PeekPlan => {
-            db_manager.begin_query_preview();
-            db_manager.show_query_plan()
+            if !db_manager.show_query_plan() {
+                db_manager.begin_query_preview();
+            }
+            db_manager.show_query_plan() && db_manager.pin_query_plan()
         }
-        ShortcutAction::PinPlan => db_manager.pin_query_plan(),
         ShortcutAction::ClosePlan => {
-            db_manager.close_result_preview() || db_manager.close_query_plan()
+            if db_manager.close_result_preview() {
+                true
+            } else if db_manager.close_query_plan() {
+                db_manager.cancel_query_preview();
+                true
+            } else {
+                false
+            }
         }
         ShortcutAction::ShowShortcuts => {
             shortcuts_dialog.present(Some(window));
@@ -325,20 +307,36 @@ fn show_rename_query_dialog(db_manager: &DatabaseTabManager, window: &Applicatio
 fn install_styles() {
     let provider = gtk4::CssProvider::new();
     provider.load_from_string(
-        "progressbar.query-action-wave trough {
-            min-height: 30px;
-            border-radius: 9px;
+        "entry.query-action-field {
+            min-height: 36px;
+            border-color: transparent;
+            background-color: transparent;
+            box-shadow: none;
+        }
+        entry.query-action-field:focus {
+            border-color: alpha(@accent_color, 0.55);
+            background-color: alpha(@view_bg_color, 0.82);
+        }
+        progressbar.query-action-progress {
+            min-width: 0;
+            min-height: 2px;
+            margin: 0;
+            padding: 0;
+        }
+        progressbar.query-action-progress trough {
+            min-width: 0;
+            min-height: 2px;
+            margin: 0;
+            padding: 0;
+            border: none;
+            border-radius: 0;
             background-color: transparent;
         }
-        progressbar.query-action-wave progress {
-            min-height: 30px;
-            border-radius: 9px;
-            background-image: linear-gradient(
-                90deg,
-                alpha(@accent_bg_color, 0.05),
-                alpha(@accent_bg_color, 0.32),
-                alpha(@accent_bg_color, 0.05)
-            );
+        progressbar.query-action-progress progress {
+            min-width: 0;
+            min-height: 2px;
+            border-radius: 0;
+            background-color: @accent_bg_color;
         }
         .plan-inspector {
             background-color: @window_bg_color;
@@ -420,7 +418,7 @@ fn create_header_bar(
     shortcuts_dialog: &adw::Dialog,
 ) -> (HeaderBar, gtk4::Entry) {
     use gtk4::{
-        Button, Entry, EntryIconPosition, EventControllerKey, Label, ListBox, MenuButton, Popover,
+        Button, Entry, EntryIconPosition, EventControllerKey, Label, ListBox, Popover,
         ScrolledWindow, gdk,
     };
     use std::cell::RefCell;
@@ -455,15 +453,23 @@ fn create_header_bar(
     let search_for_preview = db_search.clone();
     let progress_for_preview = progress_bar.clone();
     let pulse_timer_for_preview = Rc::clone(&pulse_timer);
-    db_tab_manager.set_query_preview_callback(move |state| {
+    db_tab_manager.set_query_action_callback(move |state| {
         if let Some(timer) = pulse_timer_for_preview.borrow_mut().take() {
             timer.remove();
         }
 
-        search_for_preview.set_placeholder_text(Some(&query_preview_message(&state)));
+        search_for_preview.set_placeholder_text(Some(&query_action_message(&state)));
         match &state {
-            QueryPreviewState::Loading => {
-                search_for_preview.set_tooltip_text(Some("Release Ctrl to dismiss"));
+            QueryActionState::Loading
+            | QueryActionState::Running
+            | QueryActionState::SavingPlan => {
+                let tooltip = match &state {
+                    QueryActionState::Loading => "Release Ctrl+Shift to dismiss",
+                    QueryActionState::Running => "Query is running",
+                    QueryActionState::SavingPlan => "Saving the estimated query plan",
+                    _ => unreachable!(),
+                };
+                search_for_preview.set_tooltip_text(Some(tooltip));
                 progress_for_preview.set_visible(true);
                 progress_for_preview.set_fraction(0.2);
                 let weak_progress = progress_for_preview.downgrade();
@@ -478,11 +484,11 @@ fn create_header_bar(
                     },
                 ));
             }
-            QueryPreviewState::Error(error) => {
+            QueryActionState::Error(error) => {
                 search_for_preview.set_tooltip_text(Some(error));
                 clear_progress(&progress_for_preview);
             }
-            QueryPreviewState::Idle | QueryPreviewState::Ready { .. } => {
+            QueryActionState::Idle | QueryActionState::Ready { .. } => {
                 search_for_preview.set_tooltip_text(None);
                 clear_progress(&progress_for_preview);
             }
@@ -883,9 +889,14 @@ fn create_header_bar(
     ));
     run_button.update_property(&[
         gtk4::accessible::Property::Label("Run query"),
-        gtk4::accessible::Property::KeyShortcuts("Control+Return"),
+        gtk4::accessible::Property::KeyShortcuts("Control+Return Control+Shift+Return"),
     ]);
     run_button.add_css_class("suggested-action");
+
+    let run_button_for_operation = run_button.clone();
+    db_tab_manager.set_query_availability_callback(move |available| {
+        run_button_for_operation.set_sensitive(available);
+    });
 
     let db_manager_run = db_tab_manager.clone();
     run_button.connect_clicked(move |_| {
@@ -912,21 +923,54 @@ fn create_header_bar(
     header.pack_end(&new_query_button);
 
     // Settings menu
-    let menu_button = MenuButton::new();
-    menu_button.set_icon_name("open-menu-symbolic");
+    let menu_button = Button::from_icon_name("open-menu-symbolic");
     menu_button.set_tooltip_text(Some("Main Menu"));
+    menu_button.update_property(&[gtk4::accessible::Property::Label("Main Menu")]);
+
+    let menu_popover = Popover::new();
+    let menu_content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    menu_content.set_margin_top(6);
+    menu_content.set_margin_bottom(6);
+    menu_content.set_margin_start(6);
+    menu_content.set_margin_end(6);
+    let shortcuts_button = Button::new();
+    shortcuts_button.add_css_class("flat");
+    shortcuts_button.set_halign(gtk4::Align::Fill);
+    let shortcuts_content = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    shortcuts_content.append(&gtk4::Image::from_icon_name("input-keyboard-symbolic"));
+    shortcuts_content.append(&Label::new(Some("Keyboard Shortcuts")));
+    shortcuts_button.set_child(Some(&shortcuts_content));
+    shortcuts_button.set_tooltip_text(Some(
+        &shortcuts::shortcut(ShortcutAction::ShowShortcuts).tooltip(),
+    ));
+    shortcuts_button.update_property(&[
+        gtk4::accessible::Property::Label("Keyboard shortcuts"),
+        gtk4::accessible::Property::KeyShortcuts("F1"),
+    ]);
+    let shortcuts_dialog_for_button = shortcuts_dialog.clone();
+    let window_for_button = window.clone();
+    let menu_popover_for_button = menu_popover.clone();
+    shortcuts_button.connect_clicked(move |_| {
+        menu_popover_for_button.popdown();
+        shortcuts_dialog_for_button.present(Some(&window_for_button));
+    });
+    menu_content.append(&shortcuts_button);
+    menu_popover.set_child(Some(&menu_content));
+    menu_popover.set_parent(&menu_button);
+    let menu_popover_for_menu = menu_popover.clone();
+    menu_button.connect_clicked(move |_| menu_popover_for_menu.popup());
     header.pack_end(&menu_button);
 
     (header, db_search)
 }
 
-fn query_preview_message(state: &QueryPreviewState) -> String {
+fn query_action_message(state: &QueryActionState) -> String {
     match state {
-        QueryPreviewState::Idle => default_action_hint(),
-        QueryPreviewState::Loading => {
-            "Enter to run query - estimating rows and cost...".to_string()
+        QueryActionState::Idle => default_action_hint(),
+        QueryActionState::Loading => {
+            "Enter to run - Space for plan - estimating rows and cost...".to_string()
         }
-        QueryPreviewState::Ready { plan } => match (
+        QueryActionState::Ready { plan } => match (
             plan.estimate.rows,
             plan.estimate.startup_cost,
             plan.estimate.total_cost,
@@ -934,25 +978,31 @@ fn query_preview_message(state: &QueryPreviewState) -> String {
             plan.estimate.marks,
         ) {
             (Some(rows), Some(startup), Some(total), _, _) => {
-                format!("Enter to run query - ~{rows} rows - cost {startup:.2}..{total:.2}")
+                format!(
+                    "Enter to run - Space for plan - ~{rows} rows - cost {startup:.2}..{total:.2}"
+                )
             }
             (Some(rows), _, _, Some(parts), Some(marks)) => {
-                format!("Enter to run query - ~{rows} rows - {parts} parts - {marks} marks")
+                format!(
+                    "Enter to run - Space for plan - ~{rows} rows - {parts} parts - {marks} marks"
+                )
             }
             (Some(rows), _, _, _, _) => {
-                format!("Enter to run query - ~{rows} rows")
+                format!("Enter to run - Space for plan - ~{rows} rows")
             }
-            _ => "Enter to run query - plan ready".to_string(),
+            _ => "Enter to run - Space for plan - estimate ready".to_string(),
         },
-        QueryPreviewState::Error(error) => {
-            format!("Enter to run query - estimate unavailable: {}", error)
+        QueryActionState::Running => "Running query...".to_string(),
+        QueryActionState::SavingPlan => "Query complete - saving estimated plan...".to_string(),
+        QueryActionState::Error(error) => {
+            format!("Enter to run - estimate unavailable: {}", error)
         }
     }
 }
 
 fn default_action_hint() -> String {
     format!(
-        "Search databases... ({})",
+        "Actions and databases ({})",
         shortcuts::shortcut(ShortcutAction::FocusSearch).accelerator()
     )
 }
@@ -960,34 +1010,44 @@ fn default_action_hint() -> String {
 fn create_query_action_field() -> (gtk4::Overlay, gtk4::Entry, gtk4::ProgressBar) {
     let overlay = gtk4::Overlay::new();
     overlay.set_halign(gtk4::Align::Center);
+    overlay.set_width_request(440);
+    overlay.set_overflow(gtk4::Overflow::Hidden);
+    overlay.set_widget_name("query-action-control");
 
     let entry = gtk4::Entry::new();
     entry.set_widget_name("database-search-action");
     entry.update_property(&[
         gtk4::accessible::Property::Label("Database search and query action"),
-        gtk4::accessible::Property::Description(
-            "Search databases and display query preview status",
-        ),
+        gtk4::accessible::Property::Description("Search actions or display query estimates"),
         gtk4::accessible::Property::KeyShortcuts("Control+k"),
     ]);
     entry.set_placeholder_text(Some(&default_action_hint()));
-    entry.set_width_chars(64);
-    entry.add_css_class("search");
-    entry.set_icon_from_icon_name(
-        gtk4::EntryIconPosition::Primary,
-        Some("system-search-symbolic"),
-    );
+    entry.set_width_chars(50);
+    gtk4::prelude::EntryExt::set_alignment(&entry, 0.5);
+    entry.add_css_class("query-action-field");
+    entry.connect_has_focus_notify(|entry| {
+        if entry.has_focus() {
+            gtk4::prelude::EntryExt::set_alignment(entry, 0.0);
+            entry.set_icon_from_icon_name(
+                gtk4::EntryIconPosition::Primary,
+                Some("system-search-symbolic"),
+            );
+        } else {
+            gtk4::prelude::EntryExt::set_alignment(entry, 0.5);
+            entry.set_icon_from_icon_name(gtk4::EntryIconPosition::Primary, None);
+        }
+    });
     overlay.set_child(Some(&entry));
 
     let progress = gtk4::ProgressBar::new();
-    progress.add_css_class("query-action-wave");
+    progress.add_css_class("query-action-progress");
     progress.set_halign(gtk4::Align::Fill);
-    progress.set_valign(gtk4::Align::Fill);
+    progress.set_valign(gtk4::Align::End);
     progress.set_pulse_step(0.08);
     progress.set_can_target(false);
-    progress.set_opacity(0.25);
     progress.set_visible(false);
     overlay.add_overlay(&progress);
+    overlay.set_measure_overlay(&progress, false);
 
     (overlay, entry, progress)
 }
@@ -1015,19 +1075,23 @@ mod tests {
 
         assert_eq!(
             preview_key_pressed(gtk4::gdk::Key::Control_L, control),
-            Some(PreviewKeyAction::Begin { show_plan: false })
+            None
+        );
+        assert_eq!(
+            preview_key_pressed(gtk4::gdk::Key::Shift_L, control),
+            Some(PreviewKeyAction::Begin)
+        );
+        assert_eq!(
+            preview_key_pressed(gtk4::gdk::Key::Control_L, shift),
+            Some(PreviewKeyAction::Begin)
         );
         assert_eq!(
             preview_key_pressed(gtk4::gdk::Key::Shift_L, control | shift),
-            Some(PreviewKeyAction::ShowPlan)
-        );
-        assert_eq!(
-            preview_key_pressed(gtk4::gdk::Key::Control_L, control | shift),
-            Some(PreviewKeyAction::Begin { show_plan: true })
+            Some(PreviewKeyAction::Begin)
         );
         assert_eq!(
             preview_key_released(gtk4::gdk::Key::Shift_L),
-            Some(PreviewKeyAction::HidePlan)
+            Some(PreviewKeyAction::Cancel)
         );
         assert_eq!(
             preview_key_released(gtk4::gdk::Key::Control_L),
@@ -1060,7 +1124,7 @@ mod tests {
 
     #[test]
     fn ready_query_preview_prompts_for_execution_with_estimates() {
-        let message = query_preview_message(&QueryPreviewState::Ready {
+        let message = query_action_message(&QueryActionState::Ready {
             plan: dzban_db::QueryPlan {
                 backend: dzban_db::DatabaseBackend::Postgresql,
                 document: serde_json::json!([]),
@@ -1074,12 +1138,15 @@ mod tests {
             },
         });
 
-        assert_eq!(message, "Enter to run query - ~42 rows - cost 1.25..9.50");
+        assert_eq!(
+            message,
+            "Enter to run - Space for plan - ~42 rows - cost 1.25..9.50"
+        );
     }
 
     #[test]
     fn clickhouse_preview_shows_scan_estimates_without_fake_cost() {
-        let message = query_preview_message(&QueryPreviewState::Ready {
+        let message = query_action_message(&QueryActionState::Ready {
             plan: dzban_db::QueryPlan {
                 backend: dzban_db::DatabaseBackend::Clickhouse,
                 document: serde_json::json!({}),
@@ -1093,18 +1160,33 @@ mod tests {
             },
         });
 
-        assert_eq!(message, "Enter to run query - ~42 rows - 2 parts - 7 marks");
+        assert_eq!(
+            message,
+            "Enter to run - Space for plan - ~42 rows - 2 parts - 7 marks"
+        );
+    }
+
+    #[test]
+    fn running_query_and_plan_storage_are_distinct_states() {
+        assert_eq!(
+            query_action_message(&QueryActionState::Running),
+            "Running query..."
+        );
+        assert_eq!(
+            query_action_message(&QueryActionState::SavingPlan),
+            "Query complete - saving estimated plan..."
+        );
     }
 
     #[test]
     fn query_preview_errors_are_visible_without_a_tooltip() {
-        let message = query_preview_message(&QueryPreviewState::Error(
+        let message = query_action_message(&QueryActionState::Error(
             "Database is not connected".to_string(),
         ));
 
         assert_eq!(
             message,
-            "Enter to run query - estimate unavailable: Database is not connected"
+            "Enter to run - estimate unavailable: Database is not connected"
         );
         assert!(!message.contains("hover"));
     }
@@ -1124,9 +1206,9 @@ mod tests {
         progress.pulse();
         gtk4::test_widget_wait_for_draw(&field);
         assert!(progress.is_visible());
-        assert!((progress.opacity() - 0.25).abs() < 0.01);
-        assert_eq!((progress.width(), progress.height()), baseline);
+        assert!(progress.height() <= 2);
         assert_eq!((field.width(), field.height()), baseline);
+        assert_eq!(field.overflow(), gtk4::Overflow::Hidden);
 
         clear_progress(&progress);
         gtk4::test_widget_wait_for_draw(&field);
@@ -1138,7 +1220,7 @@ mod tests {
         progress.pulse();
         gtk4::test_widget_wait_for_draw(&field);
         assert!(progress.is_visible());
-        assert_eq!((progress.width(), progress.height()), baseline);
+        assert!(progress.height() <= 2);
         assert_eq!((field.width(), field.height()), baseline);
 
         clear_progress(&progress);
@@ -1151,14 +1233,25 @@ mod tests {
 
     #[gtk4::test]
     #[ignore = "requires a graphical display"]
-    fn close_query_action_closes_the_window_when_no_query_tab_remains() {
+    fn close_query_action_returns_to_connections_before_closing_the_window() {
         let statusbar = create_statusbar();
         let manager = DatabaseTabManager::new(statusbar);
+        manager.open_test_database("Close Test");
         let window = ApplicationWindow::builder().build();
         let search = gtk4::Entry::new();
         let shortcuts = shortcuts::create_shortcuts_window();
         window.present();
         gtk4::test_widget_wait_for_draw(&window);
+
+        assert!(execute_shortcut_action(
+            ShortcutAction::CloseQueryTab,
+            &manager,
+            &search,
+            &window,
+            &shortcuts,
+        ));
+        assert!(window.is_visible());
+        assert!(manager.open_database_tabs().is_empty());
 
         assert!(execute_shortcut_action(
             ShortcutAction::CloseQueryTab,

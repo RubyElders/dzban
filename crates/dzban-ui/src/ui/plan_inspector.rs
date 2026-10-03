@@ -2,7 +2,7 @@ use gtk4::prelude::*;
 use gtk4::{Box, Button, Label, Orientation, ScrolledWindow, Spinner, Stack, TextView};
 
 use super::preview_overlay::PreviewOverlay;
-use dzban_db::QueryPlan;
+use dzban_db::{QueryEstimate, QueryPlan};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlanState {
@@ -71,7 +71,7 @@ impl PlanInspector {
         pin_button.update_property(&[
             gtk4::accessible::Property::Label("Pin query plan"),
             gtk4::accessible::Property::Description(
-                "Keep the query plan open after releasing Ctrl and Shift",
+                "Keep the detailed query plan open after releasing Ctrl and Shift",
             ),
             gtk4::accessible::Property::KeyShortcuts("Control+Shift+Space"),
         ]);
@@ -268,23 +268,8 @@ impl PlanInspector {
 
 fn plan_summary(plan: &serde_json::Value) -> String {
     if let Ok(plan) = serde_json::from_value::<QueryPlan>(plan.clone()) {
-        let estimate = plan.estimate;
-        return match (
-            estimate.rows,
-            estimate.startup_cost,
-            estimate.total_cost,
-            estimate.parts,
-            estimate.marks,
-        ) {
-            (Some(rows), Some(startup), Some(total), _, _) => {
-                format!("Estimated rows: {rows}    Cost: {startup:.2}..{total:.2}")
-            }
-            (Some(rows), _, _, Some(parts), Some(marks)) => {
-                format!("Estimated rows: {rows}    Parts: {parts}    Marks: {marks}")
-            }
-            (Some(rows), _, _, _, _) => format!("Estimated rows: {rows}"),
-            _ => "Estimated query plan".to_string(),
-        };
+        return query_estimate_summary(&plan.estimate)
+            .unwrap_or_else(|| "Estimated query plan".to_string());
     }
     let root = plan
         .as_array()
@@ -307,6 +292,25 @@ fn plan_summary(plan: &serde_json::Value) -> String {
             )
         }
         _ => "Estimated query plan".to_string(),
+    }
+}
+
+pub fn query_estimate_summary(estimate: &QueryEstimate) -> Option<String> {
+    match (
+        estimate.rows,
+        estimate.startup_cost,
+        estimate.total_cost,
+        estimate.parts,
+        estimate.marks,
+    ) {
+        (Some(rows), Some(startup), Some(total), _, _) => Some(format!(
+            "Estimated rows: {rows}    Cost: {startup:.2}..{total:.2}"
+        )),
+        (Some(rows), _, _, Some(parts), Some(marks)) => Some(format!(
+            "Estimated rows: {rows}    Parts: {parts}    Marks: {marks}"
+        )),
+        (Some(rows), _, _, _, _) => Some(format!("Estimated rows: {rows}")),
+        _ => None,
     }
 }
 
@@ -347,6 +351,19 @@ mod tests {
         assert_eq!(
             plan_summary(&plan),
             "Estimated rows: 42    Parts: 2    Marks: 7"
+        );
+    }
+
+    #[test]
+    fn running_summary_includes_rows_and_cost() {
+        assert_eq!(
+            query_estimate_summary(&QueryEstimate {
+                rows: Some(42),
+                startup_cost: Some(1.25),
+                total_cost: Some(9.5),
+                ..QueryEstimate::default()
+            }),
+            Some("Estimated rows: 42    Cost: 1.25..9.50".to_string())
         );
     }
 

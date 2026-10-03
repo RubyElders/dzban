@@ -8,7 +8,7 @@ pub enum QueryState {
     Canceling,
 }
 
-/// Manages query execution state to prevent concurrent queries
+/// Tracks execution and cancellation state for one query tab.
 #[derive(Clone)]
 pub struct QueryStateManager {
     state: Arc<Mutex<QueryState>>,
@@ -21,11 +21,12 @@ pub struct QueryExecution {
 }
 
 impl QueryExecution {
-    pub fn start(query_num: u32, state_manager: QueryStateManager) -> Option<Self> {
-        state_manager.try_start().then_some(Self {
+    pub fn start(query_num: u32, state_manager: QueryStateManager) -> Self {
+        state_manager.start();
+        Self {
             query_num,
             state_manager,
-        })
+        }
     }
 
     pub fn query_num(&self) -> u32 {
@@ -44,15 +45,9 @@ impl QueryStateManager {
         }
     }
 
-    /// Try to start a query. Returns true if started, false if already running
-    pub fn try_start(&self) -> bool {
+    pub fn start(&self) {
         let mut state = self.state.lock().unwrap();
-        if *state == QueryState::Idle {
-            *state = QueryState::Running;
-            true
-        } else {
-            false
-        }
+        *state = QueryState::Running;
     }
 
     /// Mark query as finished
@@ -93,27 +88,28 @@ mod tests {
     #[test]
     fn failed_cancellation_keeps_query_running() {
         let state = QueryStateManager::new();
-        assert!(state.try_start());
+        state.start();
         assert!(state.cancel());
 
         state.cancel_failed();
 
-        assert!(!state.try_start());
+        assert!(state.cancel());
         state.finish();
-        assert!(state.try_start());
+        state.start();
+        assert!(state.cancel());
     }
 
     #[test]
     fn completion_finishes_the_execution_that_started_it() {
         let first = QueryStateManager::new();
         let second = QueryStateManager::new();
-        let execution = QueryExecution::start(1, first.clone()).unwrap();
-        assert!(QueryExecution::start(2, second.clone()).is_some());
+        let execution = QueryExecution::start(1, first.clone());
+        QueryExecution::start(2, second.clone());
 
         execution.finish();
 
         assert_eq!(execution.query_num(), 1);
-        assert!(first.try_start());
-        assert!(!second.try_start());
+        assert!(!first.cancel());
+        assert!(second.cancel());
     }
 }

@@ -17,7 +17,7 @@ mod postgres_value;
 
 pub use config::{Config, DatabaseBackend, DatabaseConfig};
 pub use config_gobject::DbConfig;
-pub use connection_gobject::{ConnectionState, DbConnection};
+pub use connection_gobject::{ConnectionOperation, ConnectionState, DbConnection};
 pub use manager_gobject::DbManager;
 pub use query_tab::DbQueryTab;
 pub use result::{QueryEstimate, QueryPlan, QueryResult, ResultCell, ResultColumn, ResultSet};

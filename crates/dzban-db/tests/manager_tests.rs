@@ -410,7 +410,7 @@ fn test_dbmanager_multi_config_isolation() {
 }
 
 #[glib::async_test]
-#[ignore]
+#[ignore = "requires the PostgreSQL service from docker-compose.test.yml"]
 async fn test_dbmanager_full_workflow() {
     println!("Test: DbManager complete workflow with real database");
 
@@ -492,6 +492,11 @@ async fn test_dbmanager_full_workflow() {
     tab2.set_sql_query("SELECT * FROM posts".to_string());
 
     tab1.execute_query();
+
+    let start = std::time::Instant::now();
+    while *query_count.borrow() < 1 && start.elapsed().as_secs() < 10 {
+        glib::timeout_future(std::time::Duration::from_millis(10)).await;
+    }
     tab2.execute_query();
 
     let start = std::time::Instant::now();
@@ -503,7 +508,7 @@ async fn test_dbmanager_full_workflow() {
     assert_eq!(tab1.result_count(), 3);
     assert_eq!(tab2.result_count(), 4);
 
-    println!("✅ Full workflow completed successfully");
+    println!("Full workflow completed successfully");
     println!("Events captured: {}", events.borrow().len());
 
     manager.close_all();

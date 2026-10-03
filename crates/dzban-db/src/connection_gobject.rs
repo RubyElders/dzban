@@ -8,6 +8,25 @@ use crate::internal_connection::InternalConnection;
 use crate::runtime_bridge::RuntimeBridge;
 use crate::{QueryPlan, QueryResult};
 
+pub type QueryReceiver<T> = tokio::sync::oneshot::Receiver<Result<T, String>>;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, glib::Enum)]
+#[enum_type(name = "DzbanConnectionOperation")]
+pub enum ConnectionOperation {
+    #[default]
+    Idle = 0,
+    Ping = 1,
+    Explain = 2,
+    Query = 3,
+    SavingPlan = 4,
+}
+
+impl ConnectionOperation {
+    pub fn is_query(self) -> bool {
+        matches!(self, Self::Query | Self::SavingPlan)
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, glib::Enum)]
 #[enum_type(name = "DzbanConnectionState")]
 pub enum ConnectionState {
@@ -29,8 +48,8 @@ mod imp {
         pub version: RefCell<Option<String>>,
         pub ping_count: Cell<u32>,
         pub last_error: RefCell<String>,
-        pub query_running: Cell<bool>,
-        pub active_query_count: Cell<u32>,
+        pub operation: Cell<ConnectionOperation>,
+        pub operation_generation: Cell<u64>,
 
         pub(super) runtime_bridge: OnceCell<RuntimeBridge>,
         pub(super) database_config: OnceCell<DatabaseConfig>,
@@ -46,8 +65,8 @@ mod imp {
                 version: RefCell::new(None),
                 ping_count: Cell::new(0),
                 last_error: RefCell::new(String::new()),
-                query_running: Cell::new(false),
-                active_query_count: Cell::new(0),
+                operation: Cell::new(ConnectionOperation::Idle),
+                operation_generation: Cell::new(0),
                 runtime_bridge: OnceCell::new(),
                 database_config: OnceCell::new(),
                 db_connection: RefCell::new(None),
@@ -91,6 +110,12 @@ mod imp {
                     glib::ParamSpecBoolean::builder("query-running")
                         .read_only()
                         .build(),
+                    glib::ParamSpecEnum::builder::<ConnectionOperation>("operation")
+                        .read_only()
+                        .build(),
+                    glib::ParamSpecBoolean::builder("operation-available")
+                        .read_only()
+                        .build(),
                 ]
             })
         }
@@ -103,7 +128,11 @@ mod imp {
                 "version" => self.version.borrow().to_value(),
                 "ping-count" => self.ping_count.get().to_value(),
                 "last-error" => self.last_error.borrow().to_value(),
-                "query-running" => self.query_running.get().to_value(),
+                "query-running" => self.operation.get().is_query().to_value(),
+                "operation" => self.operation.get().to_value(),
+                "operation-available" => (self.state.get() == ConnectionState::Connected
+                    && self.operation.get() == ConnectionOperation::Idle)
+                    .to_value(),
                 _ => unimplemented!(),
             }
         }
@@ -152,6 +181,27 @@ mod imp {
 
 glib::wrapper! {
     pub struct DbConnection(ObjectSubclass<imp::DbConnection>);
+}
+
+struct OperationLease {
+    connection: glib::WeakRef<DbConnection>,
+    generation: u64,
+}
+
+impl OperationLease {
+    fn transition(&self, operation: ConnectionOperation) {
+        if let Some(connection) = self.connection.upgrade() {
+            connection.transition_operation(self.generation, operation);
+        }
+    }
+}
+
+impl Drop for OperationLease {
+    fn drop(&mut self) {
+        if let Some(connection) = self.connection.upgrade() {
+            connection.finish_operation(self.generation);
+        }
+    }
 }
 
 impl DbConnection {
@@ -231,11 +281,23 @@ impl DbConnection {
         self.property("query-running")
     }
 
+    pub fn operation(&self) -> ConnectionOperation {
+        self.property("operation")
+    }
+
+    pub fn operation_available(&self) -> bool {
+        self.property("operation-available")
+    }
+
     fn set_state(&self, new_state: ConnectionState) {
         let old_state = self.imp().state.get();
         if old_state != new_state {
+            let was_available = self.operation_available();
             self.imp().state.set(new_state);
             self.notify("state");
+            if was_available != self.operation_available() {
+                self.notify("operation-available");
+            }
             self.emit_by_name::<()>("state-changed", &[&old_state, &new_state]);
             debug!("Connection state: {:?} -> {:?}", old_state, new_state);
         }
@@ -262,25 +324,58 @@ impl DbConnection {
         self.notify("last-error");
     }
 
-    fn begin_query(&self, query: &str) {
-        let count = self.imp().active_query_count.get();
-        self.imp().active_query_count.set(count + 1);
-        if count == 0 {
-            self.imp().query_running.set(true);
+    fn set_operation(&self, operation: ConnectionOperation) {
+        let previous = self.imp().operation.replace(operation);
+        if previous == operation {
+            return;
+        }
+        self.notify("operation");
+        if self.state() == ConnectionState::Connected
+            && (previous == ConnectionOperation::Idle) != (operation == ConnectionOperation::Idle)
+        {
+            self.notify("operation-available");
+        }
+        if previous.is_query() != operation.is_query() {
             self.notify("query-running");
         }
-        self.set_last_error(String::new());
-        self.emit_by_name::<()>("query-started", &[&query]);
     }
 
-    fn finish_query(&self) {
-        let count = self.imp().active_query_count.get();
-        let new_count = count.saturating_sub(1);
-        self.imp().active_query_count.set(new_count);
-        if count > 0 && new_count == 0 {
-            self.imp().query_running.set(false);
-            self.notify("query-running");
+    fn try_begin_operation(
+        &self,
+        operation: ConnectionOperation,
+    ) -> Result<OperationLease, String> {
+        if self.state() != ConnectionState::Connected {
+            return Err("Not connected".to_string());
         }
+        if self.operation() != ConnectionOperation::Idle {
+            return Err("Connection is busy".to_string());
+        }
+        let generation = self.imp().operation_generation.get().wrapping_add(1);
+        self.imp().operation_generation.set(generation);
+        self.set_operation(operation);
+        Ok(OperationLease {
+            connection: self.downgrade(),
+            generation,
+        })
+    }
+
+    fn transition_operation(&self, generation: u64, operation: ConnectionOperation) {
+        if self.imp().operation_generation.get() == generation {
+            self.set_operation(operation);
+        }
+    }
+
+    fn finish_operation(&self, generation: u64) {
+        if self.imp().operation_generation.get() == generation {
+            self.set_operation(ConnectionOperation::Idle);
+        }
+    }
+
+    fn begin_query(&self, query: &str) -> Result<OperationLease, String> {
+        let lease = self.try_begin_operation(ConnectionOperation::Query)?;
+        self.set_last_error(String::new());
+        self.emit_by_name::<()>("query-started", &[&query]);
+        Ok(lease)
     }
 
     /// Connect to the database asynchronously
@@ -369,7 +464,11 @@ impl DbConnection {
         }
 
         self.imp().db_connection.replace(None);
+        self.imp()
+            .operation_generation
+            .set(self.imp().operation_generation.get().wrapping_add(1));
         self.set_state(ConnectionState::Disconnected);
+        self.set_operation(ConnectionOperation::Idle);
         self.set_version(None);
         self.set_latency_micros(-1);
         self.set_last_error(String::new());
@@ -380,6 +479,10 @@ impl DbConnection {
     /// Emits ping-completed or ping-failed signals
     #[instrument(skip(self))]
     pub fn ping(&self) {
+        let Ok(operation) = self.try_begin_operation(ConnectionOperation::Ping) else {
+            trace!("Skipping ping while the connection is busy");
+            return;
+        };
         let db_conn = self.imp().db_connection.borrow().clone();
 
         if db_conn.is_none() {
@@ -399,6 +502,7 @@ impl DbConnection {
             .clone();
 
         glib::MainContext::ref_thread_default().spawn_local(async move {
+            let _operation = operation;
             let rx = bridge.ping(db_conn);
 
             match rx.await {
@@ -446,8 +550,14 @@ impl DbConnection {
             return rx;
         };
 
+        let operation = match self.begin_query(&query) {
+            Ok(operation) => operation,
+            Err(error) => {
+                let _ = tx.send(Err(error));
+                return rx;
+            }
+        };
         debug!("Executing query...");
-        self.begin_query(&query);
 
         let bridge = self
             .imp()
@@ -458,6 +568,7 @@ impl DbConnection {
         let this = self.clone();
 
         glib::MainContext::ref_thread_default().spawn_local(async move {
+            let operation = operation;
             let start = std::time::Instant::now();
             let result = match bridge.execute_query_rows(db_conn, query).await {
                 Ok(result) => result,
@@ -468,7 +579,7 @@ impl DbConnection {
                     let duration = start.elapsed();
                     let row_count = result_set.rows.len() as i64;
                     let duration_ms = duration.as_millis() as i64;
-                    this.finish_query();
+                    drop(operation);
                     this.emit_by_name::<()>("query-finished", &[&row_count, &duration_ms]);
                     Ok(QueryResult {
                         result_set,
@@ -476,7 +587,7 @@ impl DbConnection {
                     })
                 }
                 Err(error) => {
-                    this.finish_query();
+                    drop(operation);
                     this.set_last_error(error.clone());
                     this.emit_by_name::<()>("query-error", &[&error]);
                     Err(error)
@@ -488,15 +599,72 @@ impl DbConnection {
         rx
     }
 
-    pub fn explain_query(
+    pub fn execute_query_rows_with_explain(
         &self,
         query: String,
-    ) -> tokio::sync::oneshot::Receiver<Result<QueryPlan, String>> {
+    ) -> Result<(QueryReceiver<QueryResult>, QueryReceiver<QueryPlan>), String> {
+        let (query_tx, query_rx) = tokio::sync::oneshot::channel();
+        let (plan_tx, plan_rx) = tokio::sync::oneshot::channel();
+        let Some(db_conn) = self.imp().db_connection.borrow().clone() else {
+            let error = "Not connected".to_string();
+            self.set_last_error(error.clone());
+            self.emit_by_name::<()>("query-error", &[&error]);
+            return Err(error);
+        };
+        let operation = self.begin_query(&query)?;
+
+        let bridge = self
+            .imp()
+            .runtime_bridge
+            .get()
+            .expect("RuntimeBridge not initialized")
+            .clone();
+        let this = self.clone();
+        glib::MainContext::ref_thread_default().spawn_local(async move {
+            let start = std::time::Instant::now();
+            let result = bridge
+                .execute_query_rows(db_conn.clone(), query.clone())
+                .await
+                .unwrap_or_else(|_| Err("Query cancelled".to_string()));
+            match result {
+                Ok(result_set) => {
+                    let duration = start.elapsed();
+                    let row_count = result_set.rows.len() as i64;
+                    let duration_ms = duration.as_millis() as i64;
+                    this.emit_by_name::<()>("query-finished", &[&row_count, &duration_ms]);
+                    operation.transition(ConnectionOperation::SavingPlan);
+                    let _ = query_tx.send(Ok(QueryResult {
+                        result_set,
+                        duration,
+                    }));
+
+                    let plan = bridge
+                        .explain(db_conn, query)
+                        .await
+                        .unwrap_or_else(|_| Err("Plan request was dropped".to_string()));
+                    drop(operation);
+                    let _ = plan_tx.send(plan);
+                }
+                Err(error) => {
+                    drop(operation);
+                    this.set_last_error(error.clone());
+                    this.emit_by_name::<()>("query-error", &[&error]);
+                    let _ = query_tx.send(Err(error));
+                    let _ = plan_tx.send(Err("Query did not complete".to_string()));
+                }
+            }
+        });
+
+        Ok((query_rx, plan_rx))
+    }
+
+    pub fn explain_query(&self, query: String) -> Result<QueryReceiver<QueryPlan>, String> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let Some(db_conn) = self.imp().db_connection.borrow().clone() else {
             let _ = tx.send(Err("Not connected".to_string()));
-            return rx;
+            return Ok(rx);
         };
+        let operation = self.try_begin_operation(ConnectionOperation::Explain)?;
         let bridge = self
             .imp()
             .runtime_bridge
@@ -504,13 +672,14 @@ impl DbConnection {
             .expect("RuntimeBridge not initialized")
             .clone();
         glib::MainContext::ref_thread_default().spawn_local(async move {
+            let _operation = operation;
             let result = bridge
                 .explain(db_conn, query)
                 .await
                 .unwrap_or_else(|_| Err("Plan request was dropped".to_string()));
             let _ = tx.send(result);
         });
-        rx
+        Ok(rx)
     }
 
     pub fn cancel_query(&self) -> tokio::sync::oneshot::Receiver<Result<(), String>> {

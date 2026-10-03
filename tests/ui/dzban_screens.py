@@ -89,13 +89,13 @@ class DzbanScreens(unittest.TestCase):
         application = self.launch()
 
         wait_for_node(application, "No Connections Configured")
+        wait_for_node(application, "Main Menu", "button").do_action_named("click")
         shortcuts = wait_for_node(application, "Keyboard shortcuts", "button")
         shortcuts.do_action_named("click")
 
         wait_for_node(application, "Keyboard Shortcuts")
-        wait_for_node(application, "Preview Query")
-        wait_for_node(application, "Peek at Query Plan")
-        wait_for_node(application, "Pin Query Plan")
+        wait_for_node(application, "Estimate Query")
+        wait_for_node(application, "Show Query Plan")
 
     def test_query_results_history_and_saved_plan(self):
         application = self.launch(
@@ -157,6 +157,20 @@ password = "testpass"
         wait_for_node(application, "Analysis")
 
         editor = wait_for_node(application, "SQL query editor")
+        slow_query = (
+            "SELECT value FROM generate_series(1, 3) value, "
+            "LATERAL (SELECT pg_sleep(3)) delay"
+        )
+        editor.text = slow_query
+        run_button = wait_for_node(application, "Run query", "button")
+        run_button.do_action_named("click")
+        wait_for_node(application, "Running Query", timeout=15)
+        self.assertFalse(run_button.sensitive)
+        run_button.do_action_named("click")
+        wait_for_node_containing(application, "3 rows", timeout=15)
+        wait_for_node(application, slow_query, timeout=15)
+        self.assertTrue(run_button.sensitive)
+
         editor.text = "SELECT 1 AS answer"
         wait_for_node(application, "Run query", "button").do_action_named("click")
 
@@ -186,11 +200,15 @@ password = "testpass"
         wait_for_node(application, "Query Failed", timeout=15)
         wait_for_node(application, "SELECT * FROM dzban_missing_table", timeout=15)
 
-        action_field.text = "integration postgresql"
-        wait_for_node(
-            application, "Run action: Connection: Integration PostgreSQL", "button"
-        ).do_action_named("click")
+        for _ in range(2):
+            action_field.text = "close query tab"
+            wait_for_node(
+                application, "Run action: Close Query Tab", "button"
+            ).do_action_named("click")
         wait_for_node(application, "Database Connections")
+        wait_for_node(application, "Open", "button").do_action_named("click")
+        reopened_editor = wait_for_node(application, "SQL query editor")
+        self.assertEqual(reopened_editor.text, "")
 
     def test_clickhouse_results_errors_history_and_plan(self):
         application = self.launch(

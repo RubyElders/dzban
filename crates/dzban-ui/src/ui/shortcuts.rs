@@ -29,7 +29,6 @@ pub enum ShortcutAction {
     StopQuery,
     PreviewQuery,
     PeekPlan,
-    PinPlan,
     ClosePlan,
     ShowShortcuts,
 }
@@ -49,53 +48,52 @@ pub struct Shortcut {
     pub name: &'static str,
     pub description: &'static str,
     pub group: &'static str,
-    trigger: Option<ShortcutTrigger>,
+    triggers: Vec<ShortcutTrigger>,
     pub keywords: &'static [&'static str],
 }
 
 impl Shortcut {
     fn matches(&self, key: gdk::Key, modifiers: gdk::ModifierType) -> bool {
-        matches!(
-            self.trigger,
-            Some(
-            ShortcutTrigger::Key {
-                key: expected_key,
-                modifiers: expected_modifiers,
-            }) if key == expected_key
-                && (modifiers == expected_modifiers
-                    || (self.action == ShortcutAction::RunQuery
-                        && modifiers
-                            == expected_modifiers | gdk::ModifierType::SHIFT_MASK))
-        )
+        self.triggers.iter().any(|trigger| {
+            matches!(
+                trigger,
+                ShortcutTrigger::Key {
+                    key: expected_key,
+                    modifiers: expected_modifiers,
+                } if key == *expected_key && modifiers == *expected_modifiers
+            )
+        })
     }
 
     pub fn accelerator(&self) -> String {
-        let direct = match self.trigger {
-            Some(ShortcutTrigger::Chord(label)) => Some(label.to_string()),
-            Some(ShortcutTrigger::Key { key, modifiers }) => {
-                let mut parts = Vec::new();
-                if modifiers.contains(gdk::ModifierType::CONTROL_MASK) {
-                    parts.push("Ctrl".to_string());
+        self.triggers
+            .iter()
+            .map(|trigger| match trigger {
+                ShortcutTrigger::Chord(label) => label.to_string(),
+                ShortcutTrigger::Key { key, modifiers } => {
+                    let mut parts = Vec::new();
+                    if modifiers.contains(gdk::ModifierType::CONTROL_MASK) {
+                        parts.push("Ctrl".to_string());
+                    }
+                    if modifiers.contains(gdk::ModifierType::SHIFT_MASK) {
+                        parts.push("Shift".to_string());
+                    }
+                    if modifiers.contains(gdk::ModifierType::ALT_MASK) {
+                        parts.push("Alt".to_string());
+                    }
+                    let key = match *key {
+                        gdk::Key::Return | gdk::Key::KP_Enter => "Enter".to_string(),
+                        gdk::Key::space => "Space".to_string(),
+                        gdk::Key::period => ".".to_string(),
+                        gdk::Key::question => "?".to_string(),
+                        _ => key.name().unwrap_or_default().to_string(),
+                    };
+                    parts.push(key);
+                    parts.join("+")
                 }
-                if modifiers.contains(gdk::ModifierType::SHIFT_MASK) {
-                    parts.push("Shift".to_string());
-                }
-                if modifiers.contains(gdk::ModifierType::ALT_MASK) {
-                    parts.push("Alt".to_string());
-                }
-                let key = match key {
-                    gdk::Key::Return | gdk::Key::KP_Enter => "Enter".to_string(),
-                    gdk::Key::space => "Space".to_string(),
-                    gdk::Key::period => ".".to_string(),
-                    gdk::Key::question => "?".to_string(),
-                    _ => key.name().unwrap_or_default().to_string(),
-                };
-                parts.push(key);
-                Some(parts.join("+"))
-            }
-            None => None,
-        };
-        direct.unwrap_or_default()
+            })
+            .collect::<Vec<_>>()
+            .join(" / ")
     }
 
     pub fn tooltip(&self) -> String {
@@ -118,7 +116,30 @@ fn key(
         name,
         description,
         group,
-        trigger: Some(ShortcutTrigger::Key { key, modifiers }),
+        triggers: vec![ShortcutTrigger::Key { key, modifiers }],
+        keywords: &[],
+    }
+}
+
+fn keys(
+    action: ShortcutAction,
+    triggers: &[(gdk::Key, gdk::ModifierType)],
+    name: &'static str,
+    description: &'static str,
+    group: &'static str,
+) -> Shortcut {
+    Shortcut {
+        action,
+        name,
+        description,
+        group,
+        triggers: triggers
+            .iter()
+            .map(|(key, modifiers)| ShortcutTrigger::Key {
+                key: *key,
+                modifiers: *modifiers,
+            })
+            .collect(),
         keywords: &[],
     }
 }
@@ -135,7 +156,7 @@ fn chord(
         name,
         description,
         group,
-        trigger: Some(ShortcutTrigger::Chord(accelerator)),
+        triggers: vec![ShortcutTrigger::Chord(accelerator)],
         keywords: &[],
     }
 }
@@ -152,7 +173,7 @@ fn action(
         name,
         description,
         group,
-        trigger: None,
+        triggers: Vec::new(),
         keywords,
     }
 }
@@ -302,32 +323,27 @@ fn init_shortcuts() -> Vec<Shortcut> {
         ),
         chord(
             ShortcutAction::PreviewQuery,
-            "Hold Ctrl",
-            "Preview Query",
+            "Hold Ctrl+Shift",
+            "Estimate Query",
             "Highlight the current statement and estimate its rows and cost",
             "Query",
         ),
-        chord(
-            ShortcutAction::PeekPlan,
-            "Hold Ctrl+Shift",
-            "Peek at Query Plan",
-            "Show the estimated plan until the modifiers are released",
-            "Query",
-        ),
         key(
-            ShortcutAction::PinPlan,
+            ShortcutAction::PeekPlan,
             gdk::Key::space,
             control | shift,
-            "Pin Query Plan",
-            "Keep the temporary plan inspector open",
+            "Show Query Plan",
+            "Open and keep the detailed estimated plan",
             "Query",
         ),
-        key(
+        keys(
             ShortcutAction::RunQuery,
-            gdk::Key::Return,
-            control,
+            &[
+                (gdk::Key::Return, control),
+                (gdk::Key::Return, control | shift),
+            ],
             "Run Query",
-            "Execute the highlighted SQL statement",
+            "Execute the current SQL statement and save its estimated plan",
             "Query",
         ),
         key(
@@ -348,8 +364,8 @@ fn init_shortcuts() -> Vec<Shortcut> {
         ),
         key(
             ShortcutAction::ShowShortcuts,
-            gdk::Key::question,
-            control | shift,
+            gdk::Key::F1,
+            gdk::ModifierType::empty(),
             "Keyboard Shortcuts",
             "Show this shortcut reference",
             "Help",
@@ -406,7 +422,7 @@ pub fn create_shortcuts_window() -> adw::Dialog {
     let mut current_group = None;
     let mut list = None;
     for shortcut in shortcuts() {
-        if shortcut.trigger.is_none() {
+        if shortcut.triggers.is_empty() {
             continue;
         }
         if current_group != Some(shortcut.group) {
@@ -473,25 +489,23 @@ mod tests {
     fn plan_chords_are_registered_with_user_facing_labels() {
         assert_eq!(
             shortcut(ShortcutAction::PreviewQuery).accelerator(),
-            "Hold Ctrl"
-        );
-        assert_eq!(
-            shortcut(ShortcutAction::PeekPlan).accelerator(),
             "Hold Ctrl+Shift"
         );
         assert_eq!(
-            shortcut(ShortcutAction::PinPlan).accelerator(),
+            shortcut(ShortcutAction::PeekPlan).accelerator(),
             "Ctrl+Shift+Space"
         );
     }
 
     #[test]
-    fn run_query_accepts_enter_while_plan_chord_is_held() {
+    fn run_query_supports_direct_and_plan_chord_execution() {
         let run = shortcut(ShortcutAction::RunQuery);
         assert!(run.matches(
             gdk::Key::Return,
             gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK
         ));
+        assert!(run.matches(gdk::Key::Return, gdk::ModifierType::CONTROL_MASK));
+        assert_eq!(run.accelerator(), "Ctrl+Enter / Ctrl+Shift+Enter");
     }
 
     #[test]
