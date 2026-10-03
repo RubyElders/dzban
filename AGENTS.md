@@ -27,7 +27,7 @@ Run the workspace test suite, strict Clippy, formatting check, and `git diff --c
 - Add regression coverage that fails for the reported bug.
 - Keep normal tests independent of external services.
 - Mark service-dependent tests ignored with the required service in the reason.
-- Reuse Compose fixtures and temporary directories; do not read the user's `dzban.toml`.
+- Reuse Compose fixtures and temporary directories; do not read the user's Dzban configuration.
 - For transient UI, test loading, completion/error, cancellation, and restart. Verify both state and rendering when appearance matters.
 
-Never copy or expose credentials from the local `dzban.toml`. It is user-owned and must not be included in commits or test artifacts.
+Never copy or expose credentials from a user-owned Dzban configuration. It must not be included in commits or test artifacts.

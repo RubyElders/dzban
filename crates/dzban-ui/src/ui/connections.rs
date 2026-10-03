@@ -87,7 +87,10 @@ where
         let status_page = StatusPage::new();
         status_page.set_icon_name(Some("network-server-symbolic"));
         status_page.set_title("No Connections Configured");
-        status_page.set_description(Some("Create a dzban.toml file with database connections"));
+        let description = Config::user_config_path()
+            .map(|path| format!("Create {} with database connections", path.display()))
+            .unwrap_or_else(|| "Set DZBAN_CONFIG to a database configuration file".to_string());
+        status_page.set_description(Some(&description));
         container.append(&status_page);
         return ConnectionManager {
             container,

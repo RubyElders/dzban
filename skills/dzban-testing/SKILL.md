@@ -19,4 +19,4 @@ git diff --check
 
 When database behavior changed, read [references/database-integration.md](references/database-integration.md) and run the ignored suite against the Compose services. Docker access may require approval. Always tear down the disposable services after the run.
 
-Never use credentials from the repository's local `dzban.toml` for tests or copy them into logs, fixtures, screenshots, skills, or commits.
+Never use credentials from a user-owned Dzban configuration for tests or copy them into logs, fixtures, screenshots, skills, or commits.

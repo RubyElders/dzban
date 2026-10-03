@@ -1,7 +1,12 @@
 use serde::{Deserialize, Serialize};
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, instrument, warn};
+
+const CONFIG_ENV: &str = "DZBAN_CONFIG";
+const CONFIG_DIR: &str = "dzban";
+const CONFIG_FILE: &str = "dzban.toml";
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -129,29 +134,22 @@ impl Config {
     pub fn load() -> Result<Self, String> {
         debug!("Loading configuration...");
 
-        let local_path = Path::new("dzban.toml");
-        if local_path.exists() {
-            let config = Self::load_from_path(local_path)?;
-            info!(
-                "Loaded config from local dzban.toml ({} databases)",
-                config.databases.len()
-            );
-            return Ok(config);
-        }
+        let explicit = nonempty_env(CONFIG_ENV).map(PathBuf::from);
+        let fallbacks = config_fallback_paths(
+            std::env::current_dir().ok(),
+            nonempty_env("XDG_CONFIG_HOME").map(PathBuf::from),
+            nonempty_env("HOME").map(PathBuf::from),
+            nonempty_env("XDG_CONFIG_DIRS"),
+        );
 
-        if let Some(config) = Self::load_from_xdg()? {
-            info!(
-                "Loaded config from XDG directory ({} databases)",
-                config.databases.len()
-            );
-            return Ok(config);
-        }
+        Self::load_from_locations(explicit, fallbacks)
+    }
 
-        // Return default empty config
-        warn!("No config file found, using empty configuration");
-        Ok(Config {
-            databases: Vec::new(),
-        })
+    pub fn user_config_path() -> Option<PathBuf> {
+        user_config_path(
+            nonempty_env("XDG_CONFIG_HOME").map(PathBuf::from),
+            nonempty_env("HOME").map(PathBuf::from),
+        )
     }
 
     #[instrument(skip(path))]
@@ -170,22 +168,184 @@ impl Config {
         Ok(config)
     }
 
-    #[instrument]
-    fn load_from_xdg() -> Result<Option<Self>, String> {
-        let config_dir = std::env::var("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-                PathBuf::from(home).join(".config")
-            });
-
-        let config_path = config_dir.join("dzban").join("dzban.toml");
-        debug!("Checking XDG config path: {}", config_path.display());
-
-        if !config_path.exists() {
-            return Ok(None);
+    fn load_from_locations(
+        explicit: Option<PathBuf>,
+        fallbacks: Vec<PathBuf>,
+    ) -> Result<Self, String> {
+        if let Some(path) = explicit {
+            let config = Self::load_from_path(&path)?;
+            info!(
+                "Loaded config from {} ({} databases)",
+                path.display(),
+                config.databases.len()
+            );
+            return Ok(config);
         }
 
-        Self::load_from_path(config_path).map(Some)
+        for path in fallbacks {
+            debug!("Checking config path: {}", path.display());
+            if path.exists() {
+                let config = Self::load_from_path(&path)?;
+                info!(
+                    "Loaded config from {} ({} databases)",
+                    path.display(),
+                    config.databases.len()
+                );
+                return Ok(config);
+            }
+        }
+
+        warn!("No config file found, using empty configuration");
+        Ok(Self {
+            databases: Vec::new(),
+        })
+    }
+}
+
+fn nonempty_env(name: &str) -> Option<OsString> {
+    std::env::var_os(name).filter(|value| !value.is_empty())
+}
+
+fn config_fallback_paths(
+    current_dir: Option<PathBuf>,
+    xdg_config_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+    xdg_config_dirs: Option<OsString>,
+) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    if let Some(current_dir) = current_dir {
+        paths.push(current_dir.join(CONFIG_FILE));
+    }
+    if let Some(path) = user_config_path(xdg_config_home, home) {
+        paths.push(path);
+    }
+
+    let system_dirs = xdg_config_dirs
+        .map(|dirs| {
+            std::env::split_paths(&dirs)
+                .filter(|path| path.is_absolute())
+                .collect::<Vec<_>>()
+        })
+        .filter(|dirs| !dirs.is_empty())
+        .unwrap_or_else(|| vec![PathBuf::from("/etc/xdg")]);
+    paths.extend(
+        system_dirs
+            .into_iter()
+            .map(|path| path.join(CONFIG_DIR).join(CONFIG_FILE)),
+    );
+
+    paths
+}
+
+fn user_config_path(xdg_config_home: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
+    xdg_config_home
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            home.filter(|path| path.is_absolute())
+                .map(|path| path.join(".config"))
+        })
+        .map(|path| path.join(CONFIG_DIR).join(CONFIG_FILE))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "dzban-config-{name}-{}-{unique}",
+            std::process::id()
+        ))
+    }
+
+    fn write_config(path: &Path, name: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            path,
+            format!(
+                r#"[[databases]]
+name = "{name}"
+user = "reader"
+database = "test"
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn searches_local_then_user_then_system() {
+        let root = temp_dir("order");
+        let local = root.join("project").join(CONFIG_FILE);
+        let user = root.join("user").join(CONFIG_DIR).join(CONFIG_FILE);
+        let system = root.join("system").join(CONFIG_DIR).join(CONFIG_FILE);
+        write_config(&local, "local");
+        write_config(&user, "user");
+        write_config(&system, "system");
+
+        let paths = config_fallback_paths(
+            local.parent().map(Path::to_path_buf),
+            Some(root.join("user")),
+            None,
+            Some(std::env::join_paths([root.join("system")]).unwrap()),
+        );
+        let config = Config::load_from_locations(None, paths).unwrap();
+
+        assert_eq!(config.databases[0].name, "local");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn falls_back_to_user_then_system() {
+        let root = temp_dir("fallback");
+        let user = root.join("user").join(CONFIG_DIR).join(CONFIG_FILE);
+        let system = root.join("system").join(CONFIG_DIR).join(CONFIG_FILE);
+        write_config(&user, "user");
+        write_config(&system, "system");
+        let paths = config_fallback_paths(
+            Some(root.join("project")),
+            Some(root.join("user")),
+            None,
+            Some(std::env::join_paths([root.join("system")]).unwrap()),
+        );
+
+        let config = Config::load_from_locations(None, paths.clone()).unwrap();
+        assert_eq!(config.databases[0].name, "user");
+
+        fs::remove_file(user).unwrap();
+        let config = Config::load_from_locations(None, paths).unwrap();
+        assert_eq!(config.databases[0].name, "system");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explicit_path_is_authoritative() {
+        let root = temp_dir("explicit");
+        let explicit = root.join("selected.toml");
+        let fallback = root.join(CONFIG_FILE);
+        write_config(&explicit, "explicit");
+        write_config(&fallback, "fallback");
+
+        let config = Config::load_from_locations(Some(explicit), vec![fallback]).unwrap();
+
+        assert_eq!(config.databases[0].name, "explicit");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ignores_relative_xdg_locations() {
+        assert_eq!(
+            user_config_path(Some(PathBuf::from("relative")), None),
+            None
+        );
+
+        let paths = config_fallback_paths(None, None, None, Some(OsString::from("relative")));
+        assert_eq!(paths, vec![PathBuf::from("/etc/xdg/dzban/dzban.toml")]);
     }
 }
