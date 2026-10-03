@@ -34,7 +34,7 @@ xdotool keyup Control_L
 import -window "$win" /tmp/reset.png
 ```
 
-Use a temporary working directory containing only a test `dzban.toml`; never launch a visual test from the repository root when its local file contains user credentials. Prefer the Compose database fixtures.
+Use a temporary working directory containing only a test `config.toml`; never launch a visual test from the repository root when its local file contains user credentials. Prefer the Compose database fixtures.
 
 Use `view_image` to inspect frames. ImageMagick can assert quantitative differences or unchanged geometry:
 

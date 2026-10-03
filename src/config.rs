@@ -44,7 +44,7 @@ impl DatabaseConfig {
 impl Config {
     pub fn load() -> Result<Self, String> {
         // Try local file first (for testing)
-        if let Ok(config) = Self::load_from_path("dzban.toml") {
+        if let Ok(config) = Self::load_from_path("config.toml") {
             return Ok(config);
         }
         
@@ -75,7 +75,7 @@ impl Config {
                 PathBuf::from(home).join(".config")
             });
         
-        let config_path = config_dir.join("dzban").join("dzban.toml");
+        let config_path = config_dir.join("dzban").join("config.toml");
         
         if !config_path.exists() {
             return Err("Config file not found".to_string());

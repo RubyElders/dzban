@@ -6,7 +6,7 @@ use tracing::{debug, info, instrument, warn};
 
 const CONFIG_ENV: &str = "DZBAN_CONFIG";
 const CONFIG_DIR: &str = "dzban";
-const CONFIG_FILE: &str = "dzban.toml";
+const CONFIG_FILE: &str = "config.toml";
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -346,6 +346,6 @@ database = "test"
         );
 
         let paths = config_fallback_paths(None, None, None, Some(OsString::from("relative")));
-        assert_eq!(paths, vec![PathBuf::from("/etc/xdg/dzban/dzban.toml")]);
+        assert_eq!(paths, vec![PathBuf::from("/etc/xdg/dzban/config.toml")]);
     }
 }

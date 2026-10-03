@@ -35,7 +35,7 @@ where
         let status_page = StatusPage::new();
         status_page.set_icon_name(Some("network-server-symbolic"));
         status_page.set_title("No Connections Configured");
-        status_page.set_description(Some("Create a dzban.toml file with database connections"));
+        status_page.set_description(Some("Create a config.toml file with database connections"));
         container.append(&status_page);
         return container;
     }

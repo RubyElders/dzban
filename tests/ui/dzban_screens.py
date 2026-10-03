@@ -76,7 +76,7 @@ class DzbanScreens(unittest.TestCase):
 
     def launch(self, config=None):
         if config is not None:
-            Path("dzban.toml").write_text(config, encoding="utf-8")
+            Path("config.toml").write_text(config, encoding="utf-8")
         process = self.session.launch(
             [str(self.binary)],
             extra_environment={"RUST_LOG": "warn"},

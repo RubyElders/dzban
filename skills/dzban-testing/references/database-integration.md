@@ -17,7 +17,7 @@ The reusable wrapper is `skills/dzban-testing/scripts/run-db-integration.sh`.
 - Put pure parsing, formatting, state, and error-chain checks in ordinary `#[test]` functions near the implementation.
 - Put public database workflows in `crates/dzban-db/tests/`.
 - Mark tests that need a Compose service with a precise `#[ignore = "requires ..."]` reason so the normal workspace suite remains self-contained.
-- Reuse the ports and credentials from `docker-compose.test.yml`; do not use `dzban.toml`.
+- Reuse the ports and credentials from `docker-compose.test.yml`; do not use `config.toml`.
 - Add schema or data required by a server version to `crates/dzban-db/tests/fixtures/` and mount it from Compose.
 - Assert observable contracts: returned values, detailed errors, connection/query state, cancellation, timing, and isolation. Avoid tests that merely call a function without checking its result.
 - Keep shared-fixture integration tests serial unless each test creates and drops isolated resources.

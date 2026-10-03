@@ -12,7 +12,7 @@ Keep these invariants:
 
 - Run one `HermeticSession` per Python process. Split independent scenarios into separate invocations because libatspi caches its first desktop connection.
 - Start the Python runner with `NO_AT_BRIDGE=1`. Dogtail imports GTK 3 before the hermetic bus exists; disabling that runner-side bridge prevents it from attaching to the user's accessibility bus. `HermeticSession.launch()` sets `NO_AT_BRIDGE=0` for Dzban.
-- Launch Dzban from a temporary working directory. Put only fixture credentials in its temporary `dzban.toml`; never read the repository's user-owned file.
+- Launch Dzban from a temporary working directory. Put only fixture credentials in its temporary `config.toml`; never read the repository's user-owned file.
 - Prefer `do_action_named()` and editable-text operations. Use raw input only for behavior that is specifically about keyboard routing. Avoid coordinate actions.
 - Select nodes by stable accessible name and role. Add labels and descriptions to icon-only controls and custom widgets before testing them.
 - Poll observable UI state with bounded timeouts. Include `dump_tree()` in failures instead of adding fixed sleeps.
