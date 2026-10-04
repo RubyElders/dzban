@@ -423,6 +423,7 @@ mod tests {
             sql: "SELECT successful_query".to_string(),
             executed_at: 0,
             outcome: QueryHistoryOutcome::Success {
+                cutoff: None,
                 command: None,
                 duration_ms: 42,
                 rows: 1,

@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 fn snapshot() -> QuerySnapshot {
     QuerySnapshot {
+        capture: None,
         execution_error: None,
         planning_error: None,
         session: SessionId(Uuid::new_v4()),
