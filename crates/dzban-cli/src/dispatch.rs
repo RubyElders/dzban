@@ -2,7 +2,7 @@ use std::io::{IsTerminal, Read};
 use std::sync::Arc;
 use std::time::Instant;
 
-use dzban_core::QueryResult;
+use dzban_core::execution::StreamedQueryResult;
 use dzban_core::execution::{QueryEngine, QueryPhase};
 use dzban_core::history::QueryHistoryStore;
 
@@ -95,7 +95,7 @@ pub async fn run(args: Args) -> Result<(), CliError> {
             let session = engine.id();
             let result = execute(engine, &profile.name, &sql).await;
             let result = finish_session(&context, session, result).await?;
-            output::write(&output::render_query(&result, format.value)?)
+            crate::streamed_output::write_stdout(&result, format.value).await
         }
         Some(command @ (Command::List { .. } | Command::Describe { .. })) => {
             let command_context = crate::context::CommandContext::load(&args)?;
@@ -159,7 +159,7 @@ pub async fn execute(
     engine: Arc<QueryEngine>,
     profile: &str,
     sql: &str,
-) -> Result<QueryResult, CliError> {
+) -> Result<StreamedQueryResult, CliError> {
     let mut snapshot = engine.subscribe();
     let query = start_query(&engine, profile, sql.to_owned())?.wait_completion();
     tokio::pin!(query);
@@ -188,7 +188,8 @@ pub async fn execute(
                 let state = snapshot.borrow();
                 let label = match state.phase { QueryPhase::Explaining(_) => "Estimating", QueryPhase::Canceling(_) => "Stopping", _ => "Running" };
                 let estimate = state.plan.as_ref().map(output::estimate).filter(|text| !text.is_empty()).map(|text| format!(" | {text}")).unwrap_or_default();
-                eprint!("\r\x1b[2K{label} {:.1}s{estimate}", start.elapsed().as_secs_f64());
+                let capture = state.capture.as_ref().map(crate::streamed_output::progress).filter(|text| !text.is_empty()).map(|text| format!(" | {text}")).unwrap_or_default();
+                eprint!("\r\x1b[2K{label} {:.1}s{estimate}{capture}", start.elapsed().as_secs_f64());
             }
         }
     };
@@ -235,18 +236,18 @@ pub fn start_query(
     engine: &Arc<QueryEngine>,
     profile: &str,
     sql: String,
-) -> Result<dzban_core::execution::QueryHandle, CliError> {
+) -> Result<dzban_core::execution::StreamedQueryHandle, CliError> {
     let query = match QueryHistoryStore::load(profile) {
-        Ok(history) => engine.start_recorded_detailed(sql, history),
+        Ok(history) => engine.start_streamed(sql, Default::default(), Some(history)),
         Err(error) => {
             eprintln!("dzb: history unavailable: {error}");
-            engine.start_detailed(sql)
+            engine.start_streamed(sql, Default::default(), None)
         }
     };
     query.map_err(|error| CliError::runtime(error.to_string()))
 }
 
-pub fn report_history(completion: &dzban_core::execution::QueryCompletion) {
+pub fn report_history(completion: &dzban_core::execution::StreamedQueryCompletion) {
     if let Some(error) = completion.snapshot.phase.id().and_then(|id| {
         completion
             .history
