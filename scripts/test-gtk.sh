@@ -10,5 +10,5 @@ env -u WAYLAND_DISPLAY \
     GDK_BACKEND=x11 GTK_A11Y=none CCACHE_DISABLE=1 \
     DZBAN_CONFIG=/dev/null XDG_DATA_HOME="$test_root/data" \
     dbus-run-session -- xvfb-run -a \
-    cargo +1.88.0 test -p dzban-gtk --bin dzban --test connection_lifecycle \
+    cargo +1.88.0 test -p dzban-gtk --bin dzban --test connection_lifecycle --test result_model \
     -- --ignored --test-threads=1

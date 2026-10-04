@@ -20,7 +20,7 @@ system_paths=$(
 if [[ -n ${DZBAN_UI_SCENARIO:-} ]]; then
     scenarios=("$DZBAN_UI_SCENARIO")
 else
-    scenarios=(empty database clickhouse shutdown)
+    scenarios=(empty database clickhouse shutdown streaming-postgres streaming-clickhouse)
 fi
 
 for scenario in "${scenarios[@]}"; do
