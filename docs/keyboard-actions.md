@@ -1,6 +1,6 @@
 # Keyboard action system
 
-Dzban has one action catalog in `crates/dzban-ui/src/ui/shortcuts.rs`. Every user-facing command has an identifier, name, description, group, search keywords, and an optional direct shortcut.
+Dzban has one action catalog in `crates/dzban-gtk/src/ui/shortcuts.rs`. Every user-facing command has an identifier, name, description, group, search keywords, and an optional direct shortcut.
 
 The catalog drives:
 

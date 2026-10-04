@@ -2,7 +2,9 @@
 resolver = "2"
 members = [
     "crates/dzban-db",
-    "crates/dzban-ui",
+    "crates/dzban-gtk",
+    "crates/dzban-core",
+    "crates/dzban-cli",
 ]
 
 [workspace.dependencies]
