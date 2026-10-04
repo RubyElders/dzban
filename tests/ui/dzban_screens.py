@@ -93,12 +93,43 @@ class DzbanScreens(unittest.TestCase):
             [str(self.binary)],
             extra_environment={"RUST_LOG": "warn"},
         )
+        self.process = process
         self.addCleanup(process.wait, 5)
         self.addCleanup(process.terminate)
         application = self.session.wait_for_app(APP_NAME)
         from gi.repository import Atspi
         application.set_cache_mask(Atspi.Cache.NONE)
         return application
+
+    def test_busy_window_close_and_retry(self):
+        from dogtail import rawinput
+
+        application = self.launch(
+            """
+[[databases]]
+name = "Integration PostgreSQL"
+host = "127.0.0.1"
+port = 5415
+user = "testuser"
+database = "testdb"
+password = "testpass"
+""".strip()
+        )
+        wait_for_node(application, "Open", "button").do_action_named("click")
+        editor = wait_for_node(application, "SQL query editor")
+        editor.text = "SELECT pg_sleep(30)"
+        wait_for_node(application, "Run query", "button").do_action_named("click")
+        wait_for_node(application, "Running Query")
+
+        rawinput.key_combo("<Alt>F4")
+        wait_for_node_containing(application, "Cannot close Dzban:")
+        wait_for_node_containing(application, "Finish or cancel running work")
+        self.assertIsNone(self.process.poll())
+        wait_for_node(application, "Stop query", "button").do_action_named("click")
+        wait_for_node(application, "Query Failed", timeout=15)
+
+        rawinput.key_combo("<Alt>F4")
+        self.assertEqual(self.process.wait(timeout=15), 0)
 
     def test_empty_connections_and_shortcuts_screen(self):
         application = self.launch()
@@ -177,6 +208,17 @@ password = "testpass"
         wait_for_node(application, "Analysis")
 
         editor = wait_for_node(application, "SQL query editor")
+        for sql, affected in [
+            ("BEGIN", 0),
+            ("CREATE TEMP TABLE dzb_gtk_ack (value integer)", 0),
+            ("INSERT INTO dzb_gtk_ack VALUES (1), (2)", 2),
+            ("ROLLBACK", 0),
+        ]:
+            editor.text = sql
+            wait_for_node(application, "Run query", "button").do_action_named("click")
+            wait_for_node(application, sql, timeout=15)
+            wait_for_node(application, "Command completed", timeout=15)
+            wait_for_node(application, f"{affected} affected rows", timeout=15)
         editor.text = "SELECT 1 AS preview_value"
         editor.grab_focus()
         from dogtail import rawinput
@@ -301,6 +343,10 @@ password = "dzban-test"
         wait_for_node(application, "Database ping latency")
         wait_for_node(application, "ClickHouse database server")
         editor = wait_for_node(application, "SQL query editor")
+        editor.text = "SET max_threads = 2"
+        wait_for_node(application, "Run query", "button").do_action_named("click")
+        wait_for_node(application, "Command completed", timeout=15)
+        wait_for_node(application, "Affected row count unavailable", timeout=15)
         editor.text = "SELECT id, name, occurred_at FROM events ORDER BY id"
         wait_for_node(application, "Run query", "button").do_action_named("click")
 
@@ -329,6 +375,7 @@ if __name__ == "__main__":
         "empty": "test_empty_connections_and_shortcuts_screen",
         "database": "test_query_results_history_and_saved_plan",
         "clickhouse": "test_clickhouse_results_errors_history_and_plan",
+        "shutdown": "test_busy_window_close_and_retry",
     }
     scenario = os.environ.get("DZBAN_UI_SCENARIO")
     if scenario not in scenarios:
