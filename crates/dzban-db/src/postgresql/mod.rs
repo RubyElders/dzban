@@ -4,6 +4,7 @@ use crate::postgres_value::{display_value, is_null};
 use crate::result::{QueryEstimate, QueryPlan, ResultCell, ResultColumn, ResultSet};
 use async_trait::async_trait;
 use dzban_core::adapter::DatabaseSession;
+use futures_util::StreamExt;
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -18,31 +19,34 @@ pub(crate) struct PostgresSession {
 
 fn result_set(statement: &tokio_postgres::Statement, rows: &[tokio_postgres::Row]) -> ResultSet {
     ResultSet {
-        columns: statement
-            .columns()
-            .iter()
-            .map(|column| ResultColumn {
-                name: column.name().into(),
-                type_name: column.type_().name().into(),
-            })
-            .collect(),
-        rows: rows
-            .iter()
-            .map(|row| {
-                row.columns()
-                    .iter()
-                    .enumerate()
-                    .map(|(index, _)| {
-                        if is_null(row, index) {
-                            ResultCell::Null
-                        } else {
-                            ResultCell::Text(display_value(row, index))
-                        }
-                    })
-                    .collect()
-            })
-            .collect(),
+        columns: result_columns(statement),
+        rows: rows.iter().map(result_row).collect(),
     }
+}
+
+fn result_columns(statement: &tokio_postgres::Statement) -> Vec<ResultColumn> {
+    statement
+        .columns()
+        .iter()
+        .map(|column| ResultColumn {
+            name: column.name().into(),
+            type_name: column.type_().name().into(),
+        })
+        .collect()
+}
+
+fn result_row(row: &tokio_postgres::Row) -> Vec<ResultCell> {
+    row.columns()
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            if is_null(row, index) {
+                ResultCell::Null
+            } else {
+                ResultCell::Text(display_value(row, index))
+            }
+        })
+        .collect()
 }
 
 impl PostgresSession {
@@ -197,6 +201,70 @@ impl DatabaseSession for PostgresSession {
         self.cancel_detailed()
             .await
             .map_err(|error| error.to_string())
+    }
+
+    async fn execute_streamed(
+        &self,
+        query: &str,
+        results: &mut dzban_core::result_stream::ResultSink,
+    ) -> Result<Option<dzban_core::CommandAcknowledgment>, dzban_core::error::ExecutionError> {
+        use dzban_core::error::ExecutionError;
+        use dzban_core::result_stream::Delivery;
+        let client = self.client().await?;
+        let statement = client
+            .prepare(query)
+            .await
+            .map_err(|error| ExecutionError::Database(postgres_error(&error)))?;
+        if statement.columns().is_empty() {
+            let affected_rows = client
+                .execute(&statement, &[])
+                .await
+                .map_err(|error| ExecutionError::Database(postgres_error(&error)))?;
+            return Ok(Some(dzban_core::CommandAcknowledgment {
+                affected_rows: Some(affected_rows),
+            }));
+        }
+        let mut delivery = results.schema(result_columns(&statement)).await?;
+        let mut stream = Box::pin(
+            client
+                .query_raw(
+                    &statement,
+                    std::iter::empty::<&(dyn tokio_postgres::types::ToSql + Sync)>(),
+                )
+                .await
+                .map_err(|error| ExecutionError::Database(postgres_error(&error)))?,
+        );
+        let mut storage_failure = None;
+        let mut execution_failure = None;
+        while let Some(item) = stream.next().await {
+            let row = match item {
+                Ok(row) => row,
+                Err(error) => {
+                    let server_error = error.as_db_error().is_some();
+                    execution_failure
+                        .get_or_insert_with(|| ExecutionError::Database(postgres_error(&error)));
+                    if server_error {
+                        continue;
+                    }
+                    drop(stream);
+                    let _ = client.batch_execute("").await;
+                    return Err(execution_failure.unwrap());
+                }
+            };
+            if delivery == Delivery::Continue && storage_failure.is_none() {
+                match results.row(result_row(&row)).await {
+                    Ok(next) => delivery = next,
+                    Err(error) => storage_failure = Some(error),
+                }
+            }
+        }
+        if let Some(error) = execution_failure {
+            return Err(error);
+        }
+        if let Some(error) = storage_failure {
+            return Err(error);
+        }
+        Ok(None)
     }
 
     async fn cancel_detailed(&self) -> Result<(), dzban_core::error::ExecutionError> {
