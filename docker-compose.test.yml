@@ -83,6 +83,7 @@ services:
     environment:
       CLICKHOUSE_USER: dzban
       CLICKHOUSE_PASSWORD: dzban-test
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
       CLICKHOUSE_DB: dzban_test
     ports:
       - "58123:8123"
@@ -92,7 +93,7 @@ services:
       test:
         [
           "CMD-SHELL",
-          "clickhouse-client --user dzban --password dzban-test --database dzban_test --query 'SELECT 1'",
+          "wget -qO- -T 2 'http://'\"$$(hostname -i)\"':8123/?user=dzban&password=dzban-test&database=dzban_test&query=SELECT%20count()%20FROM%20events' | grep -qx 3",
         ]
       interval: 2s
       timeout: 3s
