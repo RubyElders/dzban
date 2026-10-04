@@ -11,7 +11,7 @@ cleanup() {
 trap cleanup EXIT
 
 cd "$repo_root"
-CCACHE_DISABLE=1 cargo +1.88.0 build -p dzban-ui
+CCACHE_DISABLE=1 cargo +1.88.0 build -p dzban-gtk
 docker compose -f "$compose_file" up -d --wait postgres15 clickhouse
 
 system_paths=$(
@@ -20,7 +20,7 @@ system_paths=$(
 if [[ -n ${DZBAN_UI_SCENARIO:-} ]]; then
     scenarios=("$DZBAN_UI_SCENARIO")
 else
-    scenarios=(empty database clickhouse)
+    scenarios=(empty database clickhouse shutdown)
 fi
 
 for scenario in "${scenarios[@]}"; do
