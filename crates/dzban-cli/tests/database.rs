@@ -58,6 +58,66 @@ impl Drop for Fixture {
 
 #[test]
 #[ignore = "requires PostgreSQL and ClickHouse from docker-compose.test.yml"]
+fn batch_capture_stops_at_row_limit_and_reports_it_without_changing_order() {
+    let fixture = Fixture::new();
+    for (profile, sql) in [
+        ("pg", "SELECT i FROM generate_series(1,12000) i"),
+        ("ch", "SELECT number + 1 AS i FROM numbers(12000)"),
+    ] {
+        let output = fixture.query(profile, sql, "json");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["cutoff"], "Rows");
+        let rows = result["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 10_000);
+        assert_eq!(rows[0][0], "1");
+        assert_eq!(rows[9999][0], "10000");
+        let csv = fixture.query(profile, sql, "csv");
+        assert!(csv.status.success());
+        assert_eq!(String::from_utf8_lossy(&csv.stdout).lines().count(), 10_001);
+        assert!(String::from_utf8_lossy(&csv.stderr).contains("result limited by row limit"));
+    }
+}
+
+#[test]
+#[ignore = "requires PostgreSQL and ClickHouse from docker-compose.test.yml"]
+fn batch_capture_stops_at_byte_limit_and_pages_wide_values() {
+    let fixture = Fixture::new();
+    for (profile, sql) in [
+        (
+            "pg",
+            "SELECT repeat('xx',524288) AS payload FROM generate_series(1,40)",
+        ),
+        (
+            "ch",
+            "SELECT repeat('xx',524288) AS payload FROM numbers(40)",
+        ),
+    ] {
+        let output = fixture.query(profile, sql, "json");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["cutoff"], "Bytes");
+        let rows = result["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 31);
+        assert!(
+            rows.iter()
+                .all(|row| row[0].as_str().unwrap().len() == 1048576)
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires PostgreSQL and ClickHouse from docker-compose.test.yml"]
 fn batch_catalog_commands_share_actions_aliases_and_clean_pipe_contracts() {
     let fixture = Fixture::new();
     for profile in ["pg", "ch"] {

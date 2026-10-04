@@ -78,7 +78,12 @@ pub async fn run(args: &Args) -> Result<(), CliError> {
     let mut editor = Editor::default();
     editor.set_dialect(statement_dialect(profile.backend));
     let mut renderer = crate::editor_view::Renderer::default();
-    let mut query: Option<(String, dzban_core::execution::QueryHandle, OutputFormat)> = None;
+    let mut preview = LivePreview::default();
+    let mut query: Option<(
+        String,
+        dzban_core::execution::StreamedQueryHandle,
+        OutputFormat,
+    )> = None;
     let mut format = OutputFormat::Table;
     let mut paging = *enabled;
     let mut timing = false;
@@ -107,7 +112,7 @@ pub async fn run(args: &Args) -> Result<(), CliError> {
                 terminal_guard = Some(Terminal::enter()?);
             }
         }
-        render_editor(&editor, &engine, &profile.name, &mut renderer)?;
+        render_editor(&editor, &engine, &profile.name, &mut renderer, &mut preview).await?;
         if query
             .as_ref()
             .is_some_and(|(_, task, _)| task.is_finished())
@@ -125,11 +130,7 @@ pub async fn run(args: &Args) -> Result<(), CliError> {
                 Err(error) => (Err(error), None),
             };
             match result {
-                Ok(result) => show_output(
-                    &output::render_query(&result, query_format)?,
-                    pager,
-                    !paging,
-                )?,
+                Ok(result) => show_streamed_output(&result, query_format, pager, !paging).await?,
                 Err(error) => {
                     eprintln!("dzb: {error}");
                     last_error = Some(error);
@@ -551,14 +552,55 @@ async fn pick_items(choices: &[String], title: &str) -> Result<usize, CliError> 
     }
 }
 
-fn render_editor(
+#[derive(Default)]
+struct LivePreview {
+    id: Option<dzban_core::execution::QueryId>,
+    rows: usize,
+    page: dzban_core::ResultSet,
+}
+
+async fn render_editor(
     editor: &Editor,
     engine: &QueryEngine,
     profile: &str,
     renderer: &mut crate::editor_view::Renderer,
+    preview: &mut LivePreview,
 ) -> Result<(), CliError> {
     let snapshot = engine.subscribe();
-    let state = snapshot.borrow();
+    let state = snapshot.borrow().clone();
+    if matches!(
+        state.phase,
+        QueryPhase::Executing(_) | QueryPhase::Canceling(_)
+    ) {
+        if let Some(capture) = &state.capture {
+            let rows = capture.rows.min(3);
+            if (preview.id != state.phase.id() || preview.rows != rows)
+                && let Some(reader) = &capture.result
+            {
+                preview.page = reader
+                    .read_page(0, rows)
+                    .await
+                    .map_err(|error| CliError::runtime(error.to_string()))?;
+                preview.page.columns.truncate(10);
+                for column in &mut preview.page.columns {
+                    column.name = crate::editor_view::single_line(&column.name, 120);
+                    column.type_name.clear();
+                }
+                for row in &mut preview.page.rows {
+                    row.truncate(10);
+                    for value in row {
+                        if let dzban_core::ResultCell::Text(text) = value {
+                            *text = crate::editor_view::single_line(text, 120);
+                        }
+                    }
+                }
+                preview.id = state.phase.id();
+                preview.rows = rows;
+            }
+        }
+    } else {
+        *preview = LivePreview::default();
+    }
     let phase = match state.phase {
         QueryPhase::Queued(_) => "queued",
         QueryPhase::Explaining(_) => "estimating",
@@ -584,12 +626,29 @@ fn render_editor(
         | QueryPhase::Canceling(_) => format!(" {:.1}s", state.elapsed().as_secs_f64()),
         _ => String::new(),
     };
-    let layout = crate::editor_view::layout(
-        editor,
-        &format!("{profile} [{phase}{elapsed}]{estimate}"),
+    let lines = crate::streamed_output::preview_lines(
+        &preview.page,
         width as usize,
-        height as usize,
+        height.saturating_sub(6).min(3) as usize,
     );
+    let mut layout = crate::editor_view::layout(
+        editor,
+        &format!(
+            "{profile} [{phase}{elapsed}]{estimate}{}",
+            state
+                .capture
+                .as_ref()
+                .filter(|_| !elapsed.is_empty())
+                .map(crate::streamed_output::progress)
+                .filter(|text| !text.is_empty())
+                .map(|text| format!(" | {text}"))
+                .unwrap_or_default()
+        ),
+        width as usize,
+        (height as usize).saturating_sub(lines.len()),
+    );
+    layout.cursor_row += lines.len();
+    layout.lines.splice(1..1, lines);
     print!("{}", renderer.paint(&layout));
     std::io::stdout().flush().map_err(io_error)
 }
@@ -602,4 +661,19 @@ fn show_output(text: &str, command: Option<&str>, disabled: bool) -> Result<(), 
         }
     }
     output::write(text)
+}
+
+async fn show_streamed_output(
+    result: &dzban_core::execution::StreamedQueryResult,
+    format: OutputFormat,
+    command: Option<&str>,
+    disabled: bool,
+) -> Result<(), CliError> {
+    if !disabled && let Some(command) = command {
+        match crate::pager::run_streamed(command, result, format).await {
+            Ok(()) => return Ok(()),
+            Err(error) => eprintln!("dzb: {error}; displaying without pager"),
+        }
+    }
+    crate::streamed_output::write_stdout(result, format).await
 }

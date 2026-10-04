@@ -11,6 +11,7 @@ pub mod output;
 pub mod pager;
 pub mod picker;
 pub mod statement;
+pub mod streamed_output;
 
 #[derive(Debug)]
 pub struct CliError {
