@@ -884,9 +884,13 @@ impl DatabaseTabManager {
             tracing::debug!("No executable query in the selected tab");
             return;
         };
-        let Ok((query_rx, explain_rx)) = connection.execute_recorded_query(sql) else {
+        let Ok(delivery) = connection.execute_streamed_recorded_query(sql) else {
             return;
         };
+        let query_rx = delivery.result;
+        let mut snapshots = delivery.state;
+        let query_id = delivery.id;
+        let bridge = delivery.bridge;
         let execution = QueryExecution::start(query_num, state_manager);
         let Some(output_generation) = query_manager.show_loading_for(execution.query_num()) else {
             execution.finish();
@@ -899,22 +903,35 @@ impl DatabaseTabManager {
         let database_page_for_plan = database_page.clone();
         let connection_for_plan = connection.clone();
         let query_manager_for_result = query_manager.clone();
+        let bridge_for_result = bridge.clone();
         gtk4::glib::spawn_future_local(async move {
             let result = query_rx.await;
             execution.finish();
             query_manager_for_result.refresh_history();
             match result {
                 Ok(Ok(result)) => {
-                    let row_count = result.result_set.rows.len();
+                    let row_count = result.capture.rows;
                     let duration = result.duration;
                     tracing::info!("Query returned {} rows", row_count);
                     let command = result.command;
                     if let Some(command) = &command {
                         query_manager_for_result
                             .display_command_for(execution.query_num(), command);
+                    } else if row_count == 0 {
+                        query_manager_for_result.display_results_for(
+                            execution.query_num(),
+                            dzban_gtk::database::ResultSet {
+                                columns: vec![],
+                                rows: vec![],
+                            },
+                        );
                     } else {
-                        query_manager_for_result
-                            .display_results_for(execution.query_num(), result.result_set);
+                        query_manager_for_result.display_stream_for(
+                            execution.query_num(),
+                            output_generation,
+                            result.capture,
+                            bridge_for_result,
+                        );
                     };
                     if tab_view.selected_page().as_ref() == Some(&database_page)
                         && query_manager_for_result.is_query_selected(execution.query_num())
@@ -937,25 +954,44 @@ impl DatabaseTabManager {
         });
 
         gtk4::glib::spawn_future_local(async move {
-            let (plan, planning_error) = match explain_rx.await {
-                Ok(Ok(plan)) => (Some(plan), None),
-                Ok(Err(error)) => (None, Some(error)),
-                Err(_) => (
-                    None,
-                    Some("EXPLAIN request was cancelled".to_string().into()),
-                ),
-            };
-            let explain_error = planning_error.as_ref().map(ToString::to_string);
-            query_manager.display_explain_for(
-                query_num,
-                output_generation,
-                plan.as_ref(),
-                explain_error.as_deref(),
-            );
-            if manager_for_plan.tab_view.selected_page().as_ref() == Some(&database_page_for_plan)
-                && connection_for_plan.operation() == ConnectionOperation::Query
-            {
-                manager_for_plan.dispatch(AppEvent::QueryRunning(plan.clone()));
+            let mut plan_rendered = false;
+            loop {
+                let snapshot = snapshots.borrow_and_update().clone();
+                if snapshot.phase.id() != Some(query_id) {
+                    break;
+                }
+                if !plan_rendered && (snapshot.plan.is_some() || snapshot.explain_error.is_some()) {
+                    query_manager.display_explain_for(
+                        query_num,
+                        output_generation,
+                        snapshot.plan.as_ref(),
+                        snapshot.explain_error.as_deref(),
+                    );
+                    if manager_for_plan.tab_view.selected_page().as_ref()
+                        == Some(&database_page_for_plan)
+                        && connection_for_plan.operation() == ConnectionOperation::Query
+                    {
+                        manager_for_plan.dispatch(AppEvent::QueryRunning(snapshot.plan.clone()));
+                    }
+                    plan_rendered = true;
+                }
+                if let Some(capture) = snapshot.capture {
+                    query_manager.display_stream_for(
+                        query_num,
+                        output_generation,
+                        capture,
+                        bridge.clone(),
+                    );
+                }
+                if matches!(
+                    snapshot.phase,
+                    dzban_core::execution::QueryPhase::Completed(_)
+                        | dzban_core::execution::QueryPhase::Canceled(_)
+                        | dzban_core::execution::QueryPhase::Failed(_, _)
+                ) || snapshots.changed().await.is_err()
+                {
+                    break;
+                }
             }
         });
     }

@@ -21,6 +21,15 @@ pub struct ConnectionDelivery {
         oneshot::Receiver<Result<InternalConnection, dzban_core::application::ApplicationError>>,
 }
 
+pub struct StreamedQueryDelivery {
+    pub id: dzban_core::execution::QueryId,
+    pub state: tokio::sync::watch::Receiver<dzban_core::execution::QuerySnapshot>,
+    pub result: QueryReceiver<
+        dzban_core::execution::StreamedQueryCompletion,
+        dzban_core::error::ExecutionError,
+    >,
+}
+
 /// A bridge that runs Tokio tasks from non-Tokio contexts (like GTK/GLib)
 #[derive(Clone)]
 pub struct RuntimeBridge {
@@ -38,6 +47,79 @@ impl std::fmt::Debug for RuntimeBridge {
 }
 
 impl RuntimeBridge {
+    pub fn start_streamed(
+        &self,
+        connection: InternalConnection,
+        sql: String,
+        history: Option<dzban_core::history::QueryHistoryStore>,
+    ) -> Result<StreamedQueryDelivery, dzban_core::error::ExecutionError> {
+        let engine = connection.engine();
+        let query = {
+            let _runtime = self.runtime.enter();
+            engine.start_streamed(sql, Default::default(), history)?
+        };
+        let id = query.id;
+        let state = engine.subscribe();
+        let (sender, result) = oneshot::channel();
+        self.runtime.spawn(async move {
+            let _ = sender.send(query.wait_completion().await);
+        });
+        Ok(StreamedQueryDelivery { id, state, result })
+    }
+    pub fn read_result_page(
+        &self,
+        result: dzban_core::result_stream::ResultHandle,
+        start: usize,
+        count: usize,
+    ) -> QueryReceiver<ResultSet, dzban_core::error::ExecutionError> {
+        let (sender, receiver) = oneshot::channel();
+        self.runtime.spawn(async move {
+            let _ = sender.send(result.read_page(start, count).await);
+        });
+        receiver
+    }
+
+    pub fn read_result_rows(
+        &self,
+        result: dzban_core::result_stream::ResultHandle,
+        start: usize,
+    ) -> QueryReceiver<Vec<String>, dzban_core::error::ExecutionError> {
+        let (sender, receiver) = oneshot::channel();
+        self.runtime.spawn(async move {
+            let page = result
+                .read_page(start, dzban_core::result_store::MAX_PAGE_ROWS)
+                .await;
+            let rows = page.map(|page| {
+                let mut bytes = 0usize;
+                page.rows
+                    .into_iter()
+                    .map(|row| {
+                        let chars = (1_048_576usize / row.len().max(1)).saturating_sub(3) / 6;
+                        serde_json::to_string(
+                            &row.iter()
+                                .map(|cell| {
+                                    cell.display()
+                                        .chars()
+                                        .take(chars.min(512))
+                                        .collect::<String>()
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                        .expect("result preview serialization")
+                    })
+                    .take_while(|row| {
+                        if bytes + row.len() > 2 * 1024 * 1024 {
+                            return false;
+                        }
+                        bytes += row.len();
+                        true
+                    })
+                    .collect()
+            });
+            let _ = sender.send(rows);
+        });
+        receiver
+    }
     pub fn application_context(&self) -> Arc<dzban_core::application::ApplicationContext> {
         self.context.clone()
     }

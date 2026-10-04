@@ -14,6 +14,16 @@ pub type PlannedQueryReceivers = (
     QueryReceiver<QueryPlan, dzban_core::error::ExecutionError>,
 );
 
+pub struct StreamedQueryDelivery {
+    pub id: dzban_core::execution::QueryId,
+    pub state: tokio::sync::watch::Receiver<dzban_core::execution::QuerySnapshot>,
+    pub result: QueryReceiver<
+        dzban_core::execution::StreamedQueryResult,
+        dzban_core::error::ExecutionError,
+    >,
+    pub bridge: RuntimeBridge,
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, glib::Enum)]
 #[enum_type(name = "DzbanConnectionOperation")]
 pub enum ConnectionOperation {
@@ -200,6 +210,93 @@ glib::wrapper! {
 }
 
 impl DbConnection {
+    pub fn execute_streamed_recorded_query(
+        &self,
+        sql: String,
+    ) -> Result<StreamedQueryDelivery, String> {
+        let config = self
+            .imp()
+            .database_config
+            .get()
+            .expect("Database configuration initialized");
+        let history = match dzban_core::history::QueryHistoryStore::load(&config.name) {
+            Ok(history) => Some(history),
+            Err(error) => {
+                tracing::warn!("Query history unavailable: {error}");
+                None
+            }
+        };
+        self.execute_streamed_query(sql, history)
+    }
+
+    pub fn execute_streamed_query(
+        &self,
+        sql: String,
+        history: Option<dzban_core::history::QueryHistoryStore>,
+    ) -> Result<StreamedQueryDelivery, String> {
+        let connection = self
+            .imp()
+            .db_connection
+            .borrow()
+            .clone()
+            .ok_or_else(|| "Not connected".to_string())?;
+        let bridge = self
+            .imp()
+            .runtime_bridge
+            .get()
+            .expect("RuntimeBridge initialized")
+            .clone();
+        let delivery = bridge
+            .start_streamed(connection, sql.clone(), history)
+            .map_err(|error| error.to_string())?;
+        self.begin_query(&sql);
+        let id = delivery.id;
+        let state = delivery.state;
+        let (sender, result) = tokio::sync::oneshot::channel();
+        let this = self.clone();
+        glib::spawn_future_local(async move {
+            let result = delivery.result.await.unwrap_or_else(|error| {
+                Err(dzban_core::error::ExecutionError::Message(
+                    error.to_string(),
+                ))
+            });
+            let result = match result {
+                Ok(completion) => {
+                    if let Some(error) = completion
+                        .history
+                        .as_ref()
+                        .and_then(|history| history.error_for(id))
+                    {
+                        tracing::warn!("Failed to save query history: {error}");
+                    }
+                    completion.result
+                }
+                Err(error) => Err(error),
+            };
+            this.refresh_core_state();
+            match &result {
+                Ok(result) => this.emit_by_name::<()>(
+                    "query-finished",
+                    &[
+                        &(result.capture.rows as i64),
+                        &(result.duration.as_millis() as i64),
+                    ],
+                ),
+                Err(error) => {
+                    let message = error.to_string();
+                    this.set_last_error(message.clone());
+                    this.emit_by_name::<()>("query-error", &[&message]);
+                }
+            }
+            let _ = sender.send(result);
+        });
+        Ok(StreamedQueryDelivery {
+            id,
+            state,
+            result,
+            bridge,
+        })
+    }
     pub fn new(connection_string: String) -> Self {
         let config = DatabaseConfig::from_connection_string(&connection_string);
         Self::build(connection_string, config, RuntimeBridge::default())
