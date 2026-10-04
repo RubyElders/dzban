@@ -22,7 +22,17 @@ use super::result_inspector::ResultInspector;
 use super::sidebar::{HistoryPlanAction, QueryHistory};
 
 type EmptyCallback = Rc<dyn Fn()>;
+use dzban_core::result_stream::{ResultPhase, ResultSnapshot, ResultTermination};
+use dzban_gtk::database::RuntimeBridge;
 use dzban_gtk::database::{QueryPlan, ResultSet};
+use dzban_gtk::result_model::ResultListModel;
+
+enum StreamView {
+    Empty,
+    Loading(ResultSnapshot),
+    Ready(ResultListModel, Label),
+    Unreadable,
+}
 
 const MAX_RESULT_COLUMN_WIDTH: i32 = 360;
 const RESULT_CELL_HORIZONTAL_SPACE: i32 = 16;
@@ -34,17 +44,20 @@ struct QueryTab {
     page: TabPage,
     editor: SourceView,
     results_scroll: ScrolledWindow,
+    stream_status: Label,
     state_manager: QueryStateManager,
     running_plan: RefCell<Option<QueryPlan>>,
     output_generation: Cell<u64>,
     result_scroll_position: Cell<Option<ResultScrollPosition>>,
     result_scroll_restore_pending: Rc<Cell<bool>>,
+    stream_view: RefCell<StreamView>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ResultScrollPosition {
     horizontal: f64,
     vertical: f64,
+    row: u32,
 }
 
 #[derive(Clone)]
@@ -225,7 +238,7 @@ impl QueryTabManager {
         *counter += 1;
         let query_num = *counter;
 
-        let (content, editor, results_scroll) = create_query_editor_pane();
+        let (content, editor, results_scroll, stream_status) = create_query_editor_pane();
 
         // Create state manager for this tab
         let state_manager = QueryStateManager::new();
@@ -242,11 +255,13 @@ impl QueryTabManager {
                 page: page.clone(),
                 editor: editor.clone(),
                 results_scroll,
+                stream_status,
                 state_manager,
                 running_plan: RefCell::new(None),
                 output_generation: Cell::new(0),
                 result_scroll_position: Cell::new(None),
                 result_scroll_restore_pending: Rc::new(Cell::new(false)),
+                stream_view: RefCell::new(StreamView::Empty),
             },
         );
 
@@ -391,13 +406,172 @@ impl QueryTabManager {
 
     pub fn display_command_for(&self, query_num: u32, command: &dzban_core::CommandAcknowledgment) {
         if let Some(tab) = self.tabs.borrow().get(&query_num) {
+            tab.stream_status.set_visible(false);
             tab.results_scroll
                 .set_child(Some(&create_command_page(command)));
         }
     }
 
+    pub fn display_stream_for(
+        &self,
+        query_num: u32,
+        generation: u64,
+        snapshot: ResultSnapshot,
+        bridge: RuntimeBridge,
+    ) {
+        if matches!(
+            snapshot.phase,
+            ResultPhase::FailedAwaitingCleanup(_)
+                | ResultPhase::Finished(ResultTermination::Failed(_) | ResultTermination::Canceled)
+        ) {
+            return;
+        }
+        let tabs = self.tabs.borrow();
+        let Some(tab) = tabs
+            .get(&query_num)
+            .filter(|tab| tab.output_generation.get() == generation)
+        else {
+            return;
+        };
+        let mut state = tab.stream_view.borrow_mut();
+        match &mut *state {
+            StreamView::Ready(model, status) => {
+                model.set_rows(snapshot.rows);
+                status.set_text(&stream_status(&snapshot));
+                status.set_visible(!matches!(
+                    snapshot.phase,
+                    ResultPhase::Finished(ResultTermination::Complete)
+                ));
+                restore_stream_position(tab, &snapshot);
+                return;
+            }
+            StreamView::Loading(current) => {
+                *current = snapshot;
+                return;
+            }
+            StreamView::Empty => {}
+            StreamView::Unreadable => return,
+        }
+        let Some(result) = snapshot.result.clone().filter(|_| snapshot.rows > 0) else {
+            return;
+        };
+        *state = StreamView::Loading(snapshot);
+        drop(state);
+        drop(tabs);
+        let manager = self.clone();
+        let page = bridge.read_result_page(result.clone(), 0, 0);
+        let rows = bridge.read_result_rows(result.clone(), 0);
+        glib::spawn_future_local(async move {
+            let mut sample = match page.await {
+                Ok(Ok(sample)) => result_snapshot(&sample),
+                Ok(Err(error)) => {
+                    if manager
+                        .tabs
+                        .borrow()
+                        .get(&query_num)
+                        .is_some_and(|tab| tab.output_generation.get() == generation)
+                    {
+                        manager.display_result_read_error(
+                            query_num,
+                            generation,
+                            &error.to_string(),
+                        );
+                    }
+                    return;
+                }
+                Err(_) => {
+                    manager.display_result_read_error(
+                        query_num,
+                        generation,
+                        "Result schema delivery closed",
+                    );
+                    return;
+                }
+            };
+            let rows = match rows.await {
+                Ok(Ok(rows)) => rows,
+                Ok(Err(error)) => {
+                    manager.display_result_read_error(query_num, generation, &error.to_string());
+                    return;
+                }
+                Err(_) => {
+                    manager.display_result_read_error(
+                        query_num,
+                        generation,
+                        "Result page delivery closed",
+                    );
+                    return;
+                }
+            };
+            sample.rows = rows
+                .iter()
+                .filter_map(|row| serde_json::from_str(row).ok())
+                .collect();
+            let tabs = manager.tabs.borrow();
+            let Some(tab) = tabs
+                .get(&query_num)
+                .filter(|tab| tab.output_generation.get() == generation)
+            else {
+                return;
+            };
+            let mut state = tab.stream_view.borrow_mut();
+            let StreamView::Loading(snapshot) = &*state else {
+                return;
+            };
+            let model = ResultListModel::new(result, bridge, sample.columns.len(), snapshot.rows);
+            let weak_tabs = Rc::downgrade(&manager.tabs);
+            model.connect_local("load-error", false, move |values| {
+                if let Some(tabs) = weak_tabs.upgrade() {
+                    let tabs = tabs.borrow();
+                    if let Some(tab) = tabs
+                        .get(&query_num)
+                        .filter(|tab| tab.output_generation.get() == generation)
+                    {
+                        let error = values[1].get::<String>().unwrap();
+                        tab.stream_view.replace(StreamView::Unreadable);
+                        tab.stream_status
+                            .set_text(&format!("Cannot read result page: {error}"));
+                        tab.stream_status.set_visible(true);
+                    }
+                }
+                None
+            });
+            let view = create_result_column_view(
+                model.clone(),
+                &sample.columns,
+                &sample.rows,
+                Some(&manager.result_inspector),
+            );
+            let status = tab.stream_status.clone();
+            status.set_text(&stream_status(snapshot));
+            status.set_visible(!matches!(
+                snapshot.phase,
+                ResultPhase::Finished(ResultTermination::Complete)
+            ));
+            tab.results_scroll.set_child(Some(&view));
+            let snapshot = snapshot.clone();
+            *state = StreamView::Ready(model, status);
+            restore_stream_position(tab, &snapshot);
+        });
+    }
+
+    fn display_result_read_error(&self, query_num: u32, generation: u64, error: &str) {
+        let tabs = self.tabs.borrow();
+        if let Some(tab) = tabs
+            .get(&query_num)
+            .filter(|tab| tab.output_generation.get() == generation)
+        {
+            tab.stream_view.replace(StreamView::Unreadable);
+            tab.results_scroll
+                .set_child(Some(&create_error_page(&format!(
+                    "Cannot read result page: {error}"
+                ))));
+        }
+    }
+
     fn display_result_snapshot_for(&self, query_num: u32, result: &QueryResultSnapshot) {
         if let Some(tab) = self.tabs.borrow().get(&query_num) {
+            tab.stream_status.set_visible(false);
             let results_widget = create_results_grid(result, Some(&self.result_inspector));
             tab.results_scroll.set_child(Some(&results_widget));
             if let Some(position) = tab.result_scroll_position.get() {
@@ -443,6 +617,8 @@ impl QueryTabManager {
     /// Show error message in results area
     pub fn display_error_for(&self, query_num: u32, error: &str) {
         if let Some(tab) = self.tabs.borrow().get(&query_num) {
+            tab.stream_status.set_visible(false);
+            tab.stream_view.replace(StreamView::Empty);
             tab.results_scroll
                 .set_child(Some(&create_error_page(error)));
         }
@@ -463,6 +639,8 @@ impl QueryTabManager {
             let output_generation = tab.output_generation.get().wrapping_add(1);
             tab.output_generation.set(output_generation);
             tab.running_plan.replace(None);
+            tab.stream_status.set_visible(false);
+            tab.stream_view.replace(StreamView::Empty);
             let loading_page = adw::StatusPage::new();
             loading_page.set_widget_name("query-running-status");
             loading_page.add_css_class("compact");
@@ -663,10 +841,33 @@ impl QueryTabManager {
 }
 
 fn result_scroll_position(scroll: &ScrolledWindow) -> ResultScrollPosition {
+    let rows = find_result_view(scroll.upcast_ref())
+        .and_then(|view| view.model())
+        .map_or(0, |model| model.n_items());
+    let height = scroll.vadjustment().upper().max(1.0);
     ResultScrollPosition {
         horizontal: scroll.hadjustment().value(),
         vertical: scroll.vadjustment().value(),
+        row: ((scroll.vadjustment().value() / height * f64::from(rows)) as u32)
+            .min(rows.saturating_sub(1)),
     }
+}
+
+fn restore_stream_position(tab: &QueryTab, snapshot: &ResultSnapshot) {
+    let Some(position) = tab.result_scroll_position.get() else {
+        return;
+    };
+    if snapshot.rows <= position.row as usize && !matches!(snapshot.phase, ResultPhase::Finished(_))
+    {
+        return;
+    }
+    tab.result_scroll_position.set(None);
+    tab.result_scroll_restore_pending.set(true);
+    restore_result_scroll_position(
+        &tab.results_scroll,
+        position,
+        tab.result_scroll_restore_pending.clone(),
+    );
 }
 
 fn restore_result_scroll_position(
@@ -679,7 +880,19 @@ fn restore_result_scroll_position(
     restore_adjustment(&horizontal, position.horizontal);
     restore_adjustment(&vertical, position.vertical);
     let frames_remaining = Rc::new(Cell::new(4_u8));
+    let view = find_result_view(scroll.upcast_ref());
     scroll.add_tick_callback(move |_, _| {
+        if let Some(view) = &view
+            && let Some(model) = view.model()
+            && model.n_items() > 0
+        {
+            view.scroll_to(
+                position.row.min(model.n_items() - 1),
+                None,
+                gtk4::ListScrollFlags::NONE,
+                None,
+            );
+        }
         restore_adjustment(&horizontal, position.horizontal);
         restore_adjustment(&vertical, position.vertical);
         let remaining = frames_remaining.get() - 1;
@@ -828,7 +1041,7 @@ fn extract_query_at_cursor(text: &str, cursor_pos: usize) -> Option<(String, usi
     None
 }
 
-fn create_query_editor_pane() -> (Box, SourceView, ScrolledWindow) {
+fn create_query_editor_pane() -> (Box, SourceView, ScrolledWindow, Label) {
     let container = Box::new(Orientation::Vertical, 0);
     container.set_vexpand(true);
 
@@ -915,11 +1128,19 @@ fn create_query_editor_pane() -> (Box, SourceView, ScrolledWindow) {
     let results_placeholder = create_results_placeholder();
     results_scroll.set_child(Some(&results_placeholder));
 
-    paned.set_end_child(Some(&results_scroll));
+    let output = Box::new(Orientation::Vertical, 0);
+    let status = Label::new(None);
+    status.set_xalign(0.0);
+    status.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    status.set_single_line_mode(true);
+    status.set_visible(false);
+    output.append(&status);
+    output.append(&results_scroll);
+    paned.set_end_child(Some(&output));
 
     container.append(&paned);
 
-    (container, sql_editor, results_scroll)
+    (container, sql_editor, results_scroll, status)
 }
 
 fn create_results_placeholder() -> adw::StatusPage {
@@ -986,6 +1207,38 @@ fn bounded_result_snapshot(result: &QueryResultSnapshot) -> QueryResultSnapshot 
     result.bounded()
 }
 
+fn stream_status(snapshot: &ResultSnapshot) -> String {
+    match &snapshot.phase {
+        ResultPhase::WaitingForSchema => "Waiting for results".into(),
+        ResultPhase::Receiving => format!("Receiving results - {} rows", snapshot.rows),
+        ResultPhase::Draining(limit) => format!(
+            "{} reached - {} rows kept; waiting for query completion",
+            result_limit_name(*limit),
+            snapshot.rows
+        ),
+        ResultPhase::FailedAwaitingCleanup(error) => {
+            format!("{} - waiting for query cleanup", error)
+        }
+        ResultPhase::Finished(ResultTermination::Limited(limit)) => {
+            format!(
+                "Result truncated - {} rows kept ({})",
+                snapshot.rows,
+                result_limit_name(*limit)
+            )
+        }
+        ResultPhase::Finished(ResultTermination::Canceled) => "Query canceled".into(),
+        ResultPhase::Finished(ResultTermination::Failed(error)) => error.to_string(),
+        ResultPhase::Finished(ResultTermination::Complete) => String::new(),
+    }
+}
+
+fn result_limit_name(limit: dzban_core::result_store::ResultCutoff) -> &'static str {
+    match limit {
+        dzban_core::result_store::ResultCutoff::Rows => "10,000-row limit",
+        dzban_core::result_store::ResultCutoff::Bytes => "32 MiB limit",
+    }
+}
+
 fn create_results_grid(
     result: &QueryResultSnapshot,
     result_inspector: Option<&ResultInspector>,
@@ -1006,24 +1259,93 @@ fn create_results_grid(
         string_list.append(&serde_json::to_string(row).unwrap_or_default());
     }
 
-    let selection_model = SingleSelection::new(Some(string_list));
+    let column_view =
+        create_result_column_view(string_list, &result.columns, &result.rows, result_inspector);
+    container.append(&column_view);
+    container
+}
+
+fn create_result_column_view(
+    model: impl IsA<gtk4::gio::ListModel>,
+    columns: &[String],
+    sample: &[Vec<String>],
+    result_inspector: Option<&ResultInspector>,
+) -> ColumnView {
+    let model = model.upcast::<gtk4::gio::ListModel>();
+    let streamed_model = model.clone().downcast::<ResultListModel>().ok();
+    let tooltip_value = Rc::new(RefCell::new(None::<(u32, usize, String)>));
+    let tooltip_request = Rc::new(Cell::new(None::<(u32, usize)>));
+    let selection_model = SingleSelection::new(Some(model));
     selection_model.set_autoselect(true);
     selection_model.set_can_unselect(false);
     let column_view = ColumnView::new(Some(selection_model));
     column_view.set_focusable(true);
+    column_view.update_property(&[gtk4::accessible::Property::Label("Query results")]);
     column_view.set_show_column_separators(true);
     column_view.set_show_row_separators(true);
 
-    for (col_idx, column) in result.columns.iter().enumerate() {
+    for (col_idx, column) in columns.iter().enumerate() {
         let factory = SignalListItemFactory::new();
-        let column_width = result_column_width(&column_view, column, &result.rows, col_idx);
+        let column_width = result_column_width(&column_view, column, sample, col_idx);
+        let streamed = streamed_model.clone();
+        let value = tooltip_value.clone();
+        let request = tooltip_request.clone();
 
         factory.connect_setup(move |_, list_item| {
             let cell = create_result_cell();
             let item = list_item.downcast_ref::<ListItem>().unwrap();
+            if let Some(model) = streamed.clone() {
+                let weak_item = item.downgrade();
+                let value = value.clone();
+                let request = request.clone();
+                cell.connect_query_tooltip(move |cell, _, _, _, tooltip| {
+                    let Some(item) = weak_item.upgrade() else {
+                        return false;
+                    };
+                    let position = item.position();
+                    if let Some((row, column, text)) = &*value.borrow()
+                        && (*row, *column) == (position, col_idx)
+                    {
+                        tooltip.set_text(Some(text));
+                        return true;
+                    }
+                    if request.get() == Some((position, col_idx)) {
+                        return false;
+                    }
+                    request.set(Some((position, col_idx)));
+                    let response = model.read_row(position);
+                    let request = request.clone();
+                    let value = value.clone();
+                    let weak_cell = cell.downgrade();
+                    let weak_item = item.downgrade();
+                    glib::spawn_future_local(async move {
+                        let response = response.await;
+                        if request.get() != Some((position, col_idx)) {
+                            return;
+                        }
+                        request.set(None);
+                        let Ok(Ok(row)) = response else {
+                            return;
+                        };
+                        let Some(text) = row.rows.first().and_then(|row| row.get(col_idx)) else {
+                            return;
+                        };
+                        value.replace(Some((position, col_idx, text.display().to_string())));
+                        if weak_item
+                            .upgrade()
+                            .is_some_and(|item| item.position() == position)
+                            && let Some(cell) = weak_cell.upgrade()
+                        {
+                            cell.trigger_tooltip_query();
+                        }
+                    });
+                    false
+                });
+            }
             item.set_child(Some(&cell));
         });
 
+        let streamed = streamed_model.is_some();
         factory.connect_bind(move |_, list_item| {
             let item = list_item.downcast_ref::<ListItem>().unwrap();
             if let Some(string_obj) = item
@@ -1036,6 +1358,10 @@ fn create_results_grid(
                     && let Some(cell) = item.child().and_then(|c| c.downcast::<Label>().ok())
                 {
                     set_result_cell_value(&cell, cell_text);
+                    if streamed {
+                        cell.set_tooltip_text(None);
+                        cell.set_has_tooltip(true);
+                    }
                 }
             }
         });
@@ -1049,10 +1375,52 @@ fn create_results_grid(
     if let Some(inspector) = result_inspector.cloned() {
         install_result_preview_controller(&column_view, inspector);
     }
+    if let Some(model) = streamed_model {
+        let weak_view = column_view.downgrade();
+        let widths = Rc::new(RefCell::new(
+            (0..column_view.columns().n_items())
+                .map(|index| {
+                    column_view
+                        .columns()
+                        .item(index)
+                        .and_downcast::<ColumnViewColumn>()
+                        .unwrap()
+                        .fixed_width()
+                })
+                .collect::<Vec<_>>(),
+        ));
+        let weak_model = model.downgrade();
+        model.connect_local("page-ready", false, move |_| {
+            let (Some(view), Some(model)) = (weak_view.upgrade(), weak_model.upgrade()) else {
+                return None;
+            };
+            let rows = model.cached_values();
+            let mut widths = widths.borrow_mut();
+            for (index, width) in widths.iter_mut().enumerate() {
+                let column = view
+                    .columns()
+                    .item(index as u32)
+                    .and_downcast::<ColumnViewColumn>()
+                    .unwrap();
+                if column.fixed_width() != *width {
+                    continue;
+                }
+                let required = result_column_width(
+                    &view,
+                    column.title().as_deref().unwrap_or_default(),
+                    &rows,
+                    index,
+                );
+                if required > *width {
+                    *width = required;
+                    column.set_fixed_width(required);
+                }
+            }
+            None
+        });
+    }
 
-    container.append(&column_view);
-
-    container
+    column_view
 }
 
 fn create_result_cell() -> Label {
@@ -1075,6 +1443,8 @@ fn install_result_preview_controller(column_view: &ColumnView, inspector: Result
     controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
     let started = Rc::new(Cell::new(None::<std::time::Instant>));
     let started_for_press = started.clone();
+    let request = Rc::new(Cell::new(0u64));
+    let request_for_press = request.clone();
     let weak_view = column_view.downgrade();
     let inspector_for_press = inspector.clone();
     controller.connect_key_pressed(move |_, key, _, modifiers| {
@@ -1097,6 +1467,58 @@ fn install_result_preview_controller(column_view: &ColumnView, inspector: Result
             return glib::Propagation::Proceed;
         };
         inspector_for_press.show_row(&values);
+        if let Some(view) = weak_view.upgrade()
+            && let Some(selection) = view
+                .model()
+                .and_then(|model| model.downcast::<SingleSelection>().ok())
+            && let Some(model) = selection
+                .model()
+                .and_then(|model| model.downcast::<ResultListModel>().ok())
+        {
+            let generation = request_for_press.get().wrapping_add(1);
+            request_for_press.set(generation);
+            let position = selection.selected();
+            let row = model.read_row(position);
+            let request = request_for_press.clone();
+            let inspector = inspector_for_press.clone();
+            let weak_view = view.downgrade();
+            glib::spawn_future_local(async move {
+                let Ok(Ok(row)) = row.await else {
+                    return;
+                };
+                if request.get() != generation || !inspector.widget().is_visible() {
+                    return;
+                }
+                let Some(view) = weak_view.upgrade().filter(|view| view.root().is_some()) else {
+                    return;
+                };
+                if view
+                    .model()
+                    .and_then(|model| model.downcast::<SingleSelection>().ok())
+                    .is_none_or(|selection| selection.selected() != position)
+                {
+                    return;
+                }
+                let pinned = inspector.is_pinned();
+                let values = row
+                    .rows
+                    .first()
+                    .map(|values| {
+                        row.columns
+                            .iter()
+                            .zip(values)
+                            .map(|(column, value)| {
+                                (column.name.clone(), value.display().to_string())
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                inspector.show_row(&values);
+                if pinned {
+                    inspector.pin();
+                }
+            });
+        }
         if started_for_press.get().is_none() {
             started_for_press.set(Some(std::time::Instant::now()));
         }
@@ -1114,7 +1536,10 @@ fn install_result_preview_controller(column_view: &ColumnView, inspector: Result
             PreviewRelease::Pin => {
                 inspector_for_release.pin();
             }
-            PreviewRelease::Hide => inspector_for_release.hide_transient(),
+            PreviewRelease::Hide => {
+                request.set(request.get().wrapping_add(1));
+                inspector_for_release.hide_transient();
+            }
         }
     });
     column_view.add_controller(controller);
@@ -1209,6 +1634,464 @@ fn result_cell_preview(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gtk4::test]
+    #[ignore = "requires a graphical display"]
+    fn byte_cutoff_notice_stays_outside_the_virtual_table() {
+        adw::init().unwrap();
+        let snapshot = tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (mut sink, reader) =
+                dzban_core::result_stream::start_results(dzban_core::result_store::ResultLimits {
+                    memory_rows: 1,
+                    ..Default::default()
+                });
+            sink.schema(vec![dzban_core::ResultColumn {
+                name: "payload".into(),
+                type_name: "text".into(),
+            }])
+            .await
+            .unwrap();
+            for _ in 0..40 {
+                if matches!(
+                    sink.row(vec![dzban_core::ResultCell::Text("x".repeat(1024 * 1024))])
+                        .await
+                        .unwrap(),
+                    dzban_core::result_stream::Delivery::Stop(_)
+                ) {
+                    break;
+                }
+            }
+            sink.finish(Ok(())).await.unwrap();
+            reader.borrow().clone()
+        });
+        assert_eq!(snapshot.rows, 31);
+        assert_eq!(
+            snapshot.phase,
+            ResultPhase::Finished(ResultTermination::Limited(
+                dzban_core::result_store::ResultCutoff::Bytes
+            ))
+        );
+        let manager = QueryTabManager::new("byte-cutoff-screen-regression");
+        manager.new_query_tab();
+        let window = gtk4::Window::new();
+        window.set_default_size(1000, 700);
+        window.set_child(Some(manager.get_widget()));
+        window.present();
+        let generation = manager.show_loading_for(1).unwrap();
+        manager.display_stream_for(1, generation, snapshot, RuntimeBridge::new().unwrap());
+        let scroll = manager
+            .tabs
+            .borrow()
+            .get(&1)
+            .unwrap()
+            .results_scroll
+            .clone();
+        wait_for_stream_widget(|| find_result_view(scroll.upcast_ref()).is_some());
+        wait_for_stream_widget(|| {
+            find_descendant_label(scroll.upcast_ref(), &"x".repeat(512)).is_some()
+        });
+        wait_for_stream_widget(|| {
+            let tabs = manager.tabs.borrow();
+            matches!(&*tabs.get(&1).unwrap().stream_view.borrow(), StreamView::Ready(model, _) if model.phase() == dzban_gtk::result_model::ResultModelPhase::Idle)
+        });
+        let tabs = manager.tabs.borrow();
+        let tab = tabs.get(&1).unwrap();
+        assert_eq!(
+            tab.stream_status.text(),
+            "Result truncated - 31 rows kept (32 MiB limit)"
+        );
+        assert!(!tab.stream_status.is_ancestor(&scroll));
+        gtk4::test_widget_wait_for_draw(manager.get_widget());
+        assert!(tab.stream_status.is_mapped());
+        assert_eq!(
+            tab.stream_status.ellipsize(),
+            gtk4::pango::EllipsizeMode::End
+        );
+        if let Some(path) = std::env::var_os("DZBAN_BYTE_SCREENSHOT") {
+            assert!(
+                std::process::Command::new("import")
+                    .args(["-window", "root"])
+                    .arg(path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        drop(tabs);
+        window.close();
+    }
+
+    fn wait_for_stream_widget(mut ready: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "streamed widget did not settle"
+            );
+            glib::MainContext::default().iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    #[gtk4::test]
+    #[ignore = "requires a graphical display"]
+    fn streamed_rerun_restores_scroll_after_the_previous_row_arrives() {
+        adw::init().unwrap();
+        let mut snapshot = tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (mut sink, reader) =
+                dzban_core::result_stream::start_results(dzban_core::result_store::ResultLimits {
+                    memory_rows: 1,
+                    ..Default::default()
+                });
+            sink.schema(
+                (0..12)
+                    .map(|index| dzban_core::ResultColumn {
+                        name: format!("column_{index}"),
+                        type_name: "text".into(),
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+            for index in 0..2000 {
+                sink.row(
+                    (0..12)
+                        .map(|column| {
+                            dzban_core::ResultCell::Text(format!("row {index} column {column}"))
+                        })
+                        .collect(),
+                )
+                .await
+                .unwrap();
+            }
+            sink.finish(Ok(())).await.unwrap();
+            reader.borrow().clone()
+        });
+        let manager = QueryTabManager::new("streamed-scroll-regression");
+        manager.new_query_tab();
+        let window = gtk4::Window::new();
+        window.set_default_size(1000, 700);
+        window.set_child(Some(manager.get_widget()));
+        window.present();
+        let bridge = RuntimeBridge::new().unwrap();
+        let generation = manager.show_loading_for(1).unwrap();
+        manager.display_stream_for(1, generation, snapshot.clone(), bridge.clone());
+        let scroll = manager
+            .tabs
+            .borrow()
+            .get(&1)
+            .unwrap()
+            .results_scroll
+            .clone();
+        wait_for_stream_widget(|| find_result_view(scroll.upcast_ref()).is_some());
+        let view = find_result_view(scroll.upcast_ref()).unwrap();
+        gtk4::test_widget_wait_for_draw(&view);
+        assert_eq!(view.vadjustment().unwrap(), scroll.vadjustment());
+        assert_eq!(view.hadjustment().unwrap(), scroll.hadjustment());
+        assert!(view.height() <= scroll.height());
+        view.scroll_to(1500, None, gtk4::ListScrollFlags::NONE, None);
+        wait_for_stream_widget(|| {
+            find_descendant_label(view.upcast_ref(), "row 1500 column 0").is_some()
+        });
+        scroll.hadjustment().set_value(200.0);
+        gtk4::test_widget_wait_for_draw(&view);
+        let position = result_scroll_position(&scroll);
+        assert!(
+            position.row > 1000,
+            "position={position:?}, upper={}, page={}",
+            scroll.vadjustment().upper(),
+            scroll.vadjustment().page_size()
+        );
+        assert_eq!(position.horizontal, 200.0);
+        for _ in 0..3 {
+            let generation = manager.show_loading_for(1).unwrap();
+            snapshot.rows = 1;
+            snapshot.phase = ResultPhase::Receiving;
+            manager.display_stream_for(1, generation, snapshot.clone(), bridge.clone());
+            wait_for_stream_widget(|| find_result_view(scroll.upcast_ref()).is_some());
+            assert!(
+                manager
+                    .tabs
+                    .borrow()
+                    .get(&1)
+                    .unwrap()
+                    .result_scroll_position
+                    .get()
+                    .is_some()
+            );
+            snapshot.rows = 1000;
+            manager.display_stream_for(1, generation, snapshot.clone(), bridge.clone());
+            assert!(
+                manager
+                    .tabs
+                    .borrow()
+                    .get(&1)
+                    .unwrap()
+                    .result_scroll_position
+                    .get()
+                    .is_some()
+            );
+            snapshot.rows = 2000;
+            snapshot.phase = ResultPhase::Finished(ResultTermination::Complete);
+            manager.display_stream_for(1, generation, snapshot.clone(), bridge.clone());
+            wait_for_stream_widget(|| {
+                !manager
+                    .tabs
+                    .borrow()
+                    .get(&1)
+                    .unwrap()
+                    .result_scroll_restore_pending
+                    .get()
+            });
+            let view = find_result_view(scroll.upcast_ref()).unwrap();
+            wait_for_stream_widget(|| {
+                find_descendant_label(view.upcast_ref(), "row 1500 column 0").is_some()
+            });
+            gtk4::test_widget_wait_for_draw(&view);
+            let column = view
+                .columns()
+                .item(2)
+                .and_downcast::<ColumnViewColumn>()
+                .unwrap();
+            assert!(
+                column.fixed_width()
+                    >= result_column_width(
+                        &view,
+                        "column_2",
+                        &[vec![
+                            String::new(),
+                            String::new(),
+                            "row 1500 column 2".into()
+                        ]],
+                        2
+                    )
+            );
+            assert!((scroll.hadjustment().value() - position.horizontal).abs() < 1.0);
+            assert!((scroll.vadjustment().value() - position.vertical).abs() < 1.0);
+        }
+        if let Some(path) = std::env::var_os("DZBAN_SCROLL_SCREENSHOT") {
+            assert!(
+                std::process::Command::new("import")
+                    .args(["-window", "root"])
+                    .arg(path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        window.close();
+    }
+
+    #[gtk4::test]
+    #[ignore = "requires a graphical display"]
+    fn streamed_preview_keeps_full_values_and_does_not_reopen_after_release() {
+        adw::init().unwrap();
+        let full_value = "full-value-".repeat(100);
+        let snapshot = tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (mut sink, reader) = dzban_core::result_stream::start_results(Default::default());
+            sink.schema(vec![dzban_core::ResultColumn {
+                name: "payload".into(),
+                type_name: "text".into(),
+            }])
+            .await
+            .unwrap();
+            sink.row(vec![dzban_core::ResultCell::Text(full_value.clone())])
+                .await
+                .unwrap();
+            sink.finish(Ok(())).await.unwrap();
+            reader.borrow().clone()
+        });
+        let manager = QueryTabManager::new("streamed-preview-regression");
+        manager.new_query_tab();
+        let window = gtk4::Window::new();
+        window.set_default_size(1000, 700);
+        window.set_child(Some(manager.get_widget()));
+        window.present();
+        let generation = manager.show_loading_for(1).unwrap();
+        manager.display_stream_for(1, generation, snapshot, RuntimeBridge::new().unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let view = loop {
+            let scroll = manager
+                .tabs
+                .borrow()
+                .get(&1)
+                .unwrap()
+                .results_scroll
+                .clone();
+            if let Some(view) = find_result_view(scroll.upcast_ref()) {
+                break view;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            glib::MainContext::default().iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        gtk4::test_widget_wait_for_draw(&view);
+        let controllers = view.observe_controllers();
+        let key = (0..controllers.n_items())
+            .find_map(|index| {
+                controllers
+                    .item(index)
+                    .and_downcast::<gtk4::EventControllerKey>()
+            })
+            .unwrap();
+        key.emit_by_name::<bool>(
+            "key-pressed",
+            &[&gdk::Key::space, &0_u32, &gdk::ModifierType::empty()],
+        );
+        key.emit_by_name::<()>(
+            "key-released",
+            &[&gdk::Key::space, &0_u32, &gdk::ModifierType::empty()],
+        );
+        while manager.result_inspector.current_values()
+            != vec![("payload".into(), full_value.clone())]
+        {
+            assert!(std::time::Instant::now() < deadline);
+            glib::MainContext::default().iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(manager.result_inspector.is_pinned());
+        if let Some(path) = std::env::var_os("DZBAN_STREAM_SCREENSHOT") {
+            gtk4::test_widget_wait_for_draw(manager.get_widget());
+            assert!(
+                std::process::Command::new("import")
+                    .args(["-window", "root"])
+                    .arg(path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        manager.result_inspector.close();
+        key.emit_by_name::<bool>(
+            "key-pressed",
+            &[&gdk::Key::space, &0_u32, &gdk::ModifierType::empty()],
+        );
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        key.emit_by_name::<()>(
+            "key-released",
+            &[&gdk::Key::space, &0_u32, &gdk::ModifierType::empty()],
+        );
+        for _ in 0..50 {
+            glib::MainContext::default().iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(!manager.result_inspector.is_visible());
+        window.close();
+    }
+
+    #[gtk4::test]
+    #[ignore = "requires a graphical display"]
+    fn streamed_tabs_grow_without_rebuilding_and_discard_stale_pages() {
+        adw::init().unwrap();
+        let mut snapshot = tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (mut sink, reader) = dzban_core::result_stream::start_results(Default::default());
+            sink.schema(vec![dzban_core::ResultColumn {
+                name: "value".into(),
+                type_name: "text".into(),
+            }])
+            .await
+            .unwrap();
+            for index in 0..1000 {
+                sink.row(vec![dzban_core::ResultCell::Text(format!("row {index}"))])
+                    .await
+                    .unwrap();
+            }
+            sink.finish(Ok(())).await.unwrap();
+            reader.borrow().clone()
+        });
+        let manager = QueryTabManager::new("streamed-tab-regression");
+        manager.new_query_tab();
+        let query_num = *manager.tabs.borrow().keys().next().unwrap();
+        let generation = manager.show_loading_for(query_num).unwrap();
+        let bridge = RuntimeBridge::new().unwrap();
+        snapshot.rows = 1;
+        snapshot.phase = ResultPhase::Receiving;
+        manager.display_stream_for(query_num, generation, snapshot.clone(), bridge.clone());
+        snapshot.rows = 1000;
+        manager.display_stream_for(query_num, generation, snapshot.clone(), bridge.clone());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if matches!(
+                *manager
+                    .tabs
+                    .borrow()
+                    .get(&query_num)
+                    .unwrap()
+                    .stream_view
+                    .borrow(),
+                StreamView::Ready(_, _)
+            ) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            glib::MainContext::default().iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let tabs = manager.tabs.borrow();
+        let tab = tabs.get(&query_num).unwrap();
+        let view = find_result_view(tab.results_scroll.upcast_ref()).unwrap();
+        let selection = view.model().unwrap().downcast::<SingleSelection>().unwrap();
+        let model = selection
+            .model()
+            .unwrap()
+            .downcast::<ResultListModel>()
+            .unwrap();
+        assert_eq!(model.n_items(), 1000);
+        assert!(model.cached_rows() <= 200);
+        drop(tabs);
+        snapshot.phase = ResultPhase::Finished(ResultTermination::Limited(
+            dzban_core::result_store::ResultCutoff::Rows,
+        ));
+        manager.display_stream_for(query_num, generation, snapshot.clone(), bridge.clone());
+        let tabs = manager.tabs.borrow();
+        let tab = tabs.get(&query_num).unwrap();
+        assert_eq!(
+            find_result_view(tab.results_scroll.upcast_ref()).unwrap(),
+            view
+        );
+        let state = tab.stream_view.borrow();
+        let StreamView::Ready(_, status) = &*state else {
+            panic!("stream view missing");
+        };
+        assert!(status.is_visible());
+        assert_eq!(
+            status.text(),
+            "Result truncated - 1000 rows kept (10,000-row limit)"
+        );
+        drop(state);
+        drop(tabs);
+        model.set_rows(1001);
+        model.item(1000);
+        wait_for_stream_widget(|| {
+            model.phase() == dzban_gtk::result_model::ResultModelPhase::Failed
+        });
+        manager.display_stream_for(query_num, generation, snapshot.clone(), bridge.clone());
+        let tabs = manager.tabs.borrow();
+        let tab = tabs.get(&query_num).unwrap();
+        assert!(matches!(*tab.stream_view.borrow(), StreamView::Unreadable));
+        assert_eq!(
+            tab.stream_status.text(),
+            "Cannot read result page: Result page is missing"
+        );
+        assert!(tab.stream_status.is_visible());
+        drop(tabs);
+        let next = manager.show_loading_for(query_num).unwrap();
+        manager.display_stream_for(query_num, next, snapshot.clone(), bridge.clone());
+        manager.display_error_for(query_num, "test failure");
+        for _ in 0..50 {
+            glib::MainContext::default().iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let tabs = manager.tabs.borrow();
+        let tab = tabs.get(&query_num).unwrap();
+        assert!(find_result_view(tab.results_scroll.upcast_ref()).is_none());
+        assert_eq!(
+            find_status_page(tab.results_scroll.upcast_ref())
+                .unwrap()
+                .title(),
+            "Query Failed"
+        );
+    }
 
     #[gtk4::test]
     #[ignore = "requires a graphical display"]
