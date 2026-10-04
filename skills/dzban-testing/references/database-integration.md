@@ -8,7 +8,7 @@ Run the suite serially because tests share service fixtures:
 docker compose -f docker-compose.test.yml up -d --wait
 CCACHE_DISABLE=1 cargo +1.88.0 test -p dzban-db -- --ignored --test-threads=1
 CCACHE_DISABLE=1 cargo +1.88.0 test -p dzban-cli --test database -- --ignored --test-threads=1
-CCACHE_DISABLE=1 cargo +1.88.0 test -p dzban-gtk --test connection_integration_tests --test clickhouse_integration_tests --test runtime_bridge_isolation_tests --test config_tests --test manager_tests --test query_tab_tests -- --ignored --test-threads=1
+CCACHE_DISABLE=1 cargo +1.88.0 test -p dzban-gtk --test connection_integration_tests --test clickhouse_integration_tests --test streamed_connection_tests --test runtime_bridge_isolation_tests --test config_tests --test manager_tests --test query_tab_tests -- --ignored --test-threads=1
 docker compose -f docker-compose.test.yml down
 ```
 

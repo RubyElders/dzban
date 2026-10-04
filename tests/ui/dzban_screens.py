@@ -369,6 +369,92 @@ password = "dzban-test"
         wait_for_node(application, "Query Failed", timeout=15)
         wait_for_node_containing(application, "missing_clickhouse_table", timeout=15)
 
+    def check_streamed_results(self, backend):
+        from dogtail import rawinput
+        from dogtail.config import config as dogtail_config
+
+        dogtail_config.action_delay = 0.02
+        dogtail_config.typing_delay = 0.02
+
+        endpoint = (
+            'host = "127.0.0.1"\nport = 5415'
+            if backend == "postgresql"
+            else 'url = "http://127.0.0.1:58123"'
+        )
+        credentials = (
+            'user = "testuser"\ndatabase = "testdb"\npassword = "testpass"'
+            if backend == "postgresql"
+            else 'user = "dzban"\ndatabase = "dzban_test"\npassword = "dzban-test"'
+        )
+        application = self.launch(
+            f'[[databases]]\nname = "Streaming fixture"\nbackend = "{backend}"\n'
+            f'{endpoint}\n{credentials}'
+        )
+        wait_for_node(application, "Open", "button").do_action_named("click")
+        wait_for_node_containing(application, "15." if backend == "postgresql" else "25.", timeout=15)
+        editor = wait_for_node(application, "SQL query editor")
+        editor.text = (
+            "SELECT i AS stream_value, repeat('x', 9000) AS payload, pg_sleep(0.1) "
+            "FROM generate_series(1, 100) AS i"
+            if backend == "postgresql"
+            else "SELECT number + 1 AS stream_value, repeat('x', 9000) AS payload, "
+            "sleepEachRow(0.1) FROM numbers(100) SETTINGS max_block_size=1, max_threads=1"
+        )
+        wait_for_node(application, "Run query", "button").do_action_named("click")
+        wait_for_node_containing(application, "Receiving results -", timeout=15)
+        wait_for_node(application, "1", timeout=15)
+        self.assertTrue(wait_for_node(application, "Stop query", "button").sensitive)
+        editor.grab_focus()
+        rawinput.press_key("Escape")
+        wait_for_node(application, "Query Failed", timeout=15)
+        editor.text = (
+            "SELECT generate_series(1, 12000) AS capped_value"
+            if backend == "postgresql"
+            else "SELECT number AS capped_value FROM numbers(12000)"
+        )
+        wait_for_node(application, "Run query", "button").do_action_named("click")
+        wait_for_node(application, "Result truncated - 10000 rows kept (10,000-row limit)", timeout=20)
+        self.assertTrue(wait_for_node(application, "Run query", "button").sensitive)
+
+        editor.text = (
+            "SELECT repeat('x', 1048576) AS byte_limited FROM generate_series(1, 40)"
+            if backend == "postgresql"
+            else "SELECT repeat('xx', 524288) AS byte_limited FROM numbers(40)"
+        )
+        wait_for_node(application, "Run query", "button").do_action_named("click")
+        wait_for_node(application, "Result truncated - 31 rows kept (32 MiB limit)", timeout=25)
+        self.assertTrue(wait_for_node(application, "Run query", "button").sensitive)
+
+        full_value = "full-value-" * 100
+        editor.text = "SELECT repeat('full-value-', 100) AS complete_value"
+        wait_for_node(application, "Run query", "button").do_action_named("click")
+        wait_for_node(application, "SELECT repeat('full-value-', 100) AS complete_value", timeout=15)
+        results = wait_for_node(application, "Query results")
+        cell = wait_for_node_containing(results, "full-value-")
+        self.assertNotEqual(cell.name, full_value)
+        cell.point()
+        wait_for_node(application, full_value, timeout=15)
+        editor.point()
+        wait_for_node_to_disappear(application, full_value)
+        action_field = wait_for_node(application, "Database search and query action", "text")
+        action_field.text = "Focus Query Results"
+        wait_for_node(application, "Run action: Focus Query Results", "button").do_action_named("click")
+        rawinput.press_key("space")
+        wait_for_node(application, "Result Row")
+        wait_for_node(application, full_value, timeout=15)
+        wait_for_node(application, "Close result row", "button").do_action_named("click")
+
+        editor.text = "SELECT 42 AS restarted_value"
+        wait_for_node(application, "Run query", "button").do_action_named("click")
+        wait_for_node(application, "42", timeout=15)
+        wait_for_node_to_disappear(application, "Result truncated - 10000 rows kept (10,000-row limit)")
+
+    def test_postgres_streamed_results(self):
+        self.check_streamed_results("postgresql")
+
+    def test_clickhouse_streamed_results(self):
+        self.check_streamed_results("clickhouse")
+
 
 if __name__ == "__main__":
     scenarios = {
@@ -376,6 +462,8 @@ if __name__ == "__main__":
         "database": "test_query_results_history_and_saved_plan",
         "clickhouse": "test_clickhouse_results_errors_history_and_plan",
         "shutdown": "test_busy_window_close_and_retry",
+        "streaming-postgres": "test_postgres_streamed_results",
+        "streaming-clickhouse": "test_clickhouse_streamed_results",
     }
     scenario = os.environ.get("DZBAN_UI_SCENARIO")
     if scenario not in scenarios:

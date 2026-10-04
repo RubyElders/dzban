@@ -66,6 +66,19 @@ Ctrl+C or Escape cancels an active query. Idle Ctrl+C clears input. Input remain
 editable while a query runs, but a second submission on that connection is rejected.
 An error or cancellation returns to the prompt.
 
+Queries capture at most 10,000 rows or 32 MiB, including schema/value bytes and
+encoded spool payload. Up to 200 rows stay in a byte-bounded memory cache;
+additional rows use private temporary storage. A cutoff drains the native response
+without retaining further rows; it does not implicitly cancel writes. Ctrl+C or
+Escape can still cancel during draining.
+
+The console previews the first few rows while receiving results and leaves the
+editor usable. Completed output and pager input read bounded pages from the same
+store. Batch output waits for successful completion so a SQL error leaves stdout
+empty. Limited JSON includes a `cutoff` field; CSV reports the limit on stderr;
+table/expanded output includes a limit notice. Human tables shorten cells at 120
+display columns. Use expanded, JSON or CSV for full captured values.
+
 | Command | Action |
 | --- | --- |
 | `\?` | Show console help |

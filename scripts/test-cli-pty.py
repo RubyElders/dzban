@@ -303,6 +303,22 @@ with tempfile.TemporaryDirectory(prefix="dzb-pty-") as data:
     editor_failure.send("\x03\\q\r")
     finish(editor_failure)
 
+    for profile, sql in [
+        ("pg", "SELECT i AS live_row, repeat('x',9000), pg_sleep(0.1) FROM generate_series(1,100) i"),
+        ("ch", "SELECT number + 1 AS live_row, repeat('x',9000), sleepEachRow(0.1) FROM numbers(100) SETTINGS max_block_size=1, max_threads=1"),
+    ]:
+        live = launch(data, "--connection", profile, "c", "--no-pager")
+        live.expect(f"Connected to {profile}")
+        live.send(sql + "\r\\g\r")
+        live.expect("Row 1: live_row: 1")
+        live.send("\x03")
+        live.expect("Query cancelled")
+        live.send("SELECT 55 AS restarted_live\r\\g\r")
+        live.expect(r"\| 55\s+\|")
+        live.expect(r"\(1 rows\)")
+        live.send("\\q\r")
+        finish(live)
+
     paged = launch(data, "--connection", "pg", "c", "--pager", "pspg")
     paged.expect("Connected to pg")
     paged.send("SELECT generate_series(1,100) AS pager_value\r\\g\r")
