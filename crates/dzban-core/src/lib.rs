@@ -7,6 +7,8 @@ pub mod error;
 pub mod execution;
 pub mod history;
 pub mod result;
+pub mod result_store;
+pub mod result_stream;
 
 pub use config::{Config, ConnectionProfileId, DatabaseBackend, DatabaseConfig, ProfileError};
 pub use result::{

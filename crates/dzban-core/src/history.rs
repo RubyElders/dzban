@@ -91,6 +91,8 @@ pub struct QueryHistoryEntry {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum QueryHistoryOutcome {
     Success {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cutoff: Option<crate::result_store::ResultCutoff>,
         #[serde(default)]
         command: Option<crate::CommandAcknowledgment>,
         duration_ms: u64,
@@ -174,6 +176,71 @@ impl QueryResultSnapshot {
 }
 
 impl QueryHistoryEntry {
+    pub async fn from_streamed(
+        sql: String,
+        result: &Result<crate::execution::StreamedQueryResult, crate::error::ExecutionError>,
+        snapshot: &crate::execution::QuerySnapshot,
+    ) -> Result<Self, crate::error::ExecutionError> {
+        let explain = snapshot
+            .plan
+            .as_ref()
+            .and_then(|plan| serde_json::to_value(plan).ok());
+        let mut entry = match result {
+            Ok(result) => {
+                let mut sample = QueryResultSnapshot {
+                    total_rows: result.capture.rows,
+                    ..Default::default()
+                };
+                if let Some(reader) = &result.capture.result {
+                    let schema = reader.read_page(0, 0).await?;
+                    sample.columns = schema
+                        .columns
+                        .into_iter()
+                        .map(|column| column.name)
+                        .collect();
+                    let mut bytes = sample.columns.iter().map(String::len).sum::<usize>();
+                    for index in 0..result.capture.rows.min(MAX_HISTORY_RESULT_ROWS) {
+                        let mut page = reader.read_page(index, 1).await?;
+                        let row = page.rows.pop().ok_or_else(|| {
+                            crate::error::ExecutionError::Message(
+                                "History result row is missing".into(),
+                            )
+                        })?;
+                        let size = row.iter().map(|cell| cell.display().len()).sum::<usize>();
+                        if bytes.saturating_add(size) > MAX_HISTORY_RESULT_BYTES {
+                            break;
+                        }
+                        bytes += size;
+                        sample
+                            .rows
+                            .push(row.iter().map(|cell| cell.display().to_owned()).collect());
+                    }
+                }
+                let mut entry = Self::success(
+                    sql,
+                    result.duration,
+                    result.capture.rows,
+                    sample,
+                    explain,
+                    snapshot.explain_error.clone(),
+                )
+                .with_command(result.command.clone());
+                if let QueryHistoryOutcome::Success { cutoff, .. } = &mut entry.outcome {
+                    *cutoff = result.capture.cutoff;
+                }
+                entry
+            }
+            Err(error) => Self::failure(
+                sql,
+                error.to_string(),
+                explain,
+                snapshot.explain_error.clone(),
+            )
+            .with_diagnostic(error.clone()),
+        };
+        entry.planning_error = snapshot.planning_error.clone();
+        Ok(entry)
+    }
     pub fn with_diagnostic(mut self, error: crate::error::ExecutionError) -> Self {
         if let QueryHistoryOutcome::Failure { diagnostic, .. } = &mut self.outcome {
             *diagnostic = Some(error);
@@ -236,6 +303,7 @@ impl QueryHistoryEntry {
             executed_at: timestamp(),
             planning_error: None,
             outcome: QueryHistoryOutcome::Success {
+                cutoff: None,
                 command: None,
                 duration_ms: duration.as_millis().min(u64::MAX as u128) as u64,
                 rows,

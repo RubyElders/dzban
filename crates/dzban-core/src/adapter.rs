@@ -50,6 +50,15 @@ pub trait DatabaseSession: Send + Sync {
     ) -> Result<crate::ExecutionOutcome, crate::error::ExecutionError> {
         self.execute_outcome(query).await.map_err(Into::into)
     }
+    async fn execute_streamed(
+        &self,
+        _query: &str,
+        _results: &mut crate::result_stream::ResultSink,
+    ) -> Result<Option<crate::CommandAcknowledgment>, crate::error::ExecutionError> {
+        Err(crate::error::ExecutionError::Unsupported(
+            "Streaming query execution".into(),
+        ))
+    }
     async fn cancel(&self) -> Result<(), String>;
     async fn cancel_detailed(&self) -> Result<(), crate::error::ExecutionError> {
         self.cancel().await.map_err(Into::into)

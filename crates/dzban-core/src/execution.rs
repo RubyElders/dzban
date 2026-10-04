@@ -5,6 +5,8 @@ use tokio::sync::{Mutex, watch};
 use uuid::Uuid;
 
 use crate::adapter::DatabaseSession;
+use crate::result_store::ResultLimits;
+use crate::result_stream::{ResultSnapshot, start_results};
 use crate::{QueryPlan, QueryResult};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,6 +90,7 @@ impl QueryPhase {
 
 #[derive(Clone, Debug)]
 pub struct QuerySnapshot {
+    pub capture: Option<ResultSnapshot>,
     pub session: SessionId,
     pub phase: QueryPhase,
     pub plan: Option<QueryPlan>,
@@ -132,6 +135,41 @@ pub struct QueryCompletion {
     pub snapshot: QuerySnapshot,
     pub history: Option<HistoryPublication>,
     pub transaction_status: Option<crate::adapter::TransactionStatus>,
+}
+
+pub struct StreamedQueryHandle {
+    pub session: SessionId,
+    pub id: QueryId,
+    pub results: watch::Receiver<ResultSnapshot>,
+    task: tokio::task::JoinHandle<StreamedQueryCompletion>,
+}
+
+#[derive(Debug)]
+pub struct StreamedQueryResult {
+    pub capture: ResultSnapshot,
+    pub command: Option<crate::CommandAcknowledgment>,
+    pub duration: Duration,
+}
+
+pub struct StreamedQueryCompletion {
+    pub result: Result<StreamedQueryResult, crate::error::ExecutionError>,
+    pub snapshot: QuerySnapshot,
+    pub history: Option<HistoryPublication>,
+    pub transaction_status: Option<crate::adapter::TransactionStatus>,
+}
+
+impl StreamedQueryHandle {
+    pub fn is_finished(&self) -> bool {
+        self.task.is_finished()
+    }
+
+    pub async fn wait_completion(
+        self,
+    ) -> Result<StreamedQueryCompletion, crate::error::ExecutionError> {
+        self.task.await.map_err(|error| {
+            crate::error::ExecutionError::Message(format!("Query worker failed: {error}"))
+        })
+    }
 }
 
 pub struct SessionCloseHandle {
@@ -183,6 +221,7 @@ impl QueryEngine {
     pub fn new(session: Arc<dyn DatabaseSession>) -> Self {
         let id = SessionId(Uuid::new_v4());
         let (snapshot, _) = watch::channel(QuerySnapshot {
+            capture: None,
             session: id,
             phase: QueryPhase::Idle,
             plan: None,
@@ -280,6 +319,11 @@ impl QueryEngine {
             } else {
                 SessionPhase::Open
             });
+            if result.is_ok() {
+                engine
+                    .snapshot
+                    .send_modify(|snapshot| snapshot.capture = None);
+            }
             result
         });
         Ok(SessionCloseHandle {
@@ -509,6 +553,114 @@ impl QueryEngine {
         self.history.subscribe()
     }
 
+    pub fn start_streamed(
+        self: &Arc<Self>,
+        sql: String,
+        limits: ResultLimits,
+        history: Option<crate::history::QueryHistoryStore>,
+    ) -> Result<StreamedQueryHandle, crate::error::ExecutionError> {
+        let (id, operation) = self.begin_query()?;
+        let (mut producer, results) = start_results(limits);
+        self.snapshot
+            .send_modify(|snapshot| snapshot.capture = Some(results.borrow().clone()));
+        let mut updates = results.clone();
+        let engine = self.clone();
+        let relay = tokio::spawn(async move {
+            loop {
+                let capture = updates.borrow_and_update().clone();
+                let finished = matches!(
+                    capture.phase,
+                    crate::result_stream::ResultPhase::Finished(_)
+                );
+                engine.snapshot.send_modify(|snapshot| {
+                    if snapshot.phase.id() == Some(id)
+                        && (finished
+                            || !matches!(
+                                snapshot.phase,
+                                QueryPhase::Completed(_)
+                                    | QueryPhase::Canceled(_)
+                                    | QueryPhase::Failed(_, _)
+                            ))
+                    {
+                        snapshot.capture = Some(capture);
+                    }
+                });
+                if finished || updates.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
+        let engine = self.clone();
+        let query_sql = sql.clone();
+        let completed_results = results.clone();
+        let worker = tokio::spawn(async move {
+            let (outcome, duration) = match engine.plan(id, &query_sql).await {
+                Ok(()) => {
+                    let start = Instant::now();
+                    let outcome = engine
+                        .session
+                        .execute_streamed(&query_sql, &mut producer)
+                        .await;
+                    (outcome, start.elapsed())
+                }
+                Err(error) => (Err(error), Duration::ZERO),
+            };
+            let outcome = engine
+                .finish_execution(
+                    id,
+                    outcome,
+                    duration,
+                    Some((&mut producer, &completed_results)),
+                )
+                .await;
+            outcome.map(|(command, duration)| StreamedQueryResult {
+                capture: completed_results.borrow().clone(),
+                command,
+                duration,
+            })
+        });
+        if history.is_some() {
+            self.history.send_replace(HistoryPublication::Pending(id));
+        }
+        let engine = self.clone();
+        let task = tokio::spawn(async move {
+            let _operation = operation;
+            let result = match worker.await {
+                Ok(result) => result,
+                Err(error) => Err(engine.worker_failed(id, error)),
+            };
+            let _ = relay.await;
+            let snapshot = engine.snapshot.borrow().clone();
+            let transaction_status = engine.transaction_status();
+            let publication = if let Some(history) = history {
+                match crate::history::QueryHistoryEntry::from_streamed(sql, &result, &snapshot)
+                    .await
+                {
+                    Ok(entry) => Some(engine.publish_history(id, history, entry).await),
+                    Err(error) => {
+                        let publication = HistoryPublication::Failed(id, error.to_string());
+                        engine.history.send_replace(publication.clone());
+                        Some(publication)
+                    }
+                }
+            } else {
+                None
+            };
+            StreamedQueryCompletion {
+                result,
+                snapshot,
+                history: publication,
+                transaction_status,
+            }
+        });
+        Ok(StreamedQueryHandle {
+            session: self.id,
+            id,
+            results,
+            task,
+        })
+    }
+
     pub fn start_recorded_detailed(
         self: &Arc<Self>,
         sql: String,
@@ -522,29 +674,22 @@ impl QueryEngine {
         sql: String,
         history: Option<crate::history::QueryHistoryStore>,
     ) -> Result<QueryHandle, crate::error::ExecutionError> {
-        let operation = self
-            .operation
-            .clone()
-            .try_lock_owned()
-            .map_err(|_| crate::error::ExecutionError::Busy)?;
-        self.ensure_open()?;
-        let id = QueryId(Uuid::new_v4());
-        let operation = self.track_operation(operation, OperationState::Query(id));
-        self.snapshot.send_replace(QuerySnapshot {
-            session: self.id,
-            phase: QueryPhase::Queued(id),
-            plan: None,
-            explain_error: None,
-            planning_error: None,
-            execution_error: None,
-            planning_duration: Duration::ZERO,
-            execution_duration: Duration::ZERO,
-            started_at: Some(Instant::now()),
-            finished_at: None,
-        });
+        let (id, operation) = self.begin_query()?;
         let engine = self.clone();
         let query_sql = sql.clone();
-        let worker = tokio::spawn(async move { engine.run(id, &query_sql).await });
+        let worker = tokio::spawn(async move {
+            engine
+                .run(id, &query_sql, engine.session.execute_detailed(&query_sql))
+                .await
+                .map(|(outcome, duration)| {
+                    let (result_set, command) = outcome.into_parts();
+                    QueryResult {
+                        result_set,
+                        command,
+                        duration,
+                    }
+                })
+        });
         if history.is_some() {
             self.history.send_replace(HistoryPublication::Pending(id));
         }
@@ -553,39 +698,14 @@ impl QueryEngine {
             let _operation = operation;
             let result = match worker.await {
                 Ok(result) => result,
-                Err(error) => {
-                    let error = format!("Query worker failed: {error}");
-                    engine.snapshot.send_modify(|snapshot| {
-                        if snapshot.phase.id() == Some(id) {
-                            snapshot.phase = QueryPhase::Failed(id, error.clone());
-                            snapshot.execution_error = Some(error.clone().into());
-                            snapshot.finished_at = Some(Instant::now());
-                        }
-                    });
-                    Err(error.into())
-                }
+                Err(error) => Err(engine.worker_failed(id, error)),
             };
             let snapshot = engine.snapshot.borrow().clone();
-            let transaction_status = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                engine.session.transaction_status()
-            }))
-            .unwrap_or_else(|_| {
-                tracing::warn!("Adapter transaction status failed");
-                None
-            });
-            let history = if let Some(mut history) = history {
+            let transaction_status = engine.transaction_status();
+            let history = if let Some(history) = history {
                 let entry =
                     crate::history::QueryHistoryEntry::from_execution(sql, &result, &snapshot);
-                let published = tokio::task::spawn_blocking(move || history.add(entry)).await;
-                let publication = match published {
-                    Ok(Ok(())) => HistoryPublication::Published(id),
-                    Ok(Err(error)) => HistoryPublication::Failed(id, error),
-                    Err(error) => {
-                        HistoryPublication::Failed(id, format!("History worker failed: {error}"))
-                    }
-                };
-                engine.history.send_replace(publication.clone());
-                Some(publication)
+                Some(engine.publish_history(id, history, entry).await)
             } else {
                 None
             };
@@ -603,6 +723,73 @@ impl QueryEngine {
         })
     }
 
+    fn begin_query(&self) -> Result<(QueryId, TrackedOperation), crate::error::ExecutionError> {
+        let operation = self
+            .operation
+            .clone()
+            .try_lock_owned()
+            .map_err(|_| crate::error::ExecutionError::Busy)?;
+        self.ensure_open()?;
+        let id = QueryId(Uuid::new_v4());
+        let operation = self.track_operation(operation, OperationState::Query(id));
+        self.snapshot.send_replace(QuerySnapshot {
+            capture: None,
+            session: self.id,
+            phase: QueryPhase::Queued(id),
+            plan: None,
+            explain_error: None,
+            planning_error: None,
+            execution_error: None,
+            planning_duration: Duration::ZERO,
+            execution_duration: Duration::ZERO,
+            started_at: Some(Instant::now()),
+            finished_at: None,
+        });
+        Ok((id, operation))
+    }
+
+    fn worker_failed(
+        &self,
+        id: QueryId,
+        error: tokio::task::JoinError,
+    ) -> crate::error::ExecutionError {
+        let error = format!("Query worker failed: {error}");
+        self.snapshot.send_modify(|snapshot| {
+            if snapshot.phase.id() == Some(id) {
+                snapshot.phase = QueryPhase::Failed(id, error.clone());
+                snapshot.execution_error = Some(error.clone().into());
+                snapshot.finished_at = Some(Instant::now());
+            }
+        });
+        error.into()
+    }
+
+    fn transaction_status(&self) -> Option<crate::adapter::TransactionStatus> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.session.transaction_status()
+        }))
+        .unwrap_or_else(|_| {
+            tracing::warn!("Adapter transaction status failed");
+            None
+        })
+    }
+
+    async fn publish_history(
+        &self,
+        id: QueryId,
+        mut history: crate::history::QueryHistoryStore,
+        entry: crate::history::QueryHistoryEntry,
+    ) -> HistoryPublication {
+        let published = tokio::task::spawn_blocking(move || history.add(entry)).await;
+        let publication = match published {
+            Ok(Ok(())) => HistoryPublication::Published(id),
+            Ok(Err(error)) => HistoryPublication::Failed(id, error),
+            Err(error) => HistoryPublication::Failed(id, format!("History worker failed: {error}")),
+        };
+        self.history.send_replace(publication.clone());
+        publication
+    }
+
     pub async fn execute(self: &Arc<Self>, sql: &str) -> Result<QueryResult, String> {
         self.start(sql.to_owned())?.wait().await
     }
@@ -614,11 +801,20 @@ impl QueryEngine {
         self.start_detailed(sql.to_owned())?.wait_detailed().await
     }
 
-    async fn run(
+    async fn run<T>(
         &self,
         id: QueryId,
         sql: &str,
-    ) -> Result<QueryResult, crate::error::ExecutionError> {
+        execution: impl std::future::Future<Output = Result<T, crate::error::ExecutionError>>,
+    ) -> Result<(T, Duration), crate::error::ExecutionError> {
+        self.plan(id, sql).await?;
+        let start = Instant::now();
+        let result = execution.await;
+        self.finish_execution(id, result, start.elapsed(), None)
+            .await
+    }
+
+    async fn plan(&self, id: QueryId, sql: &str) -> Result<(), crate::error::ExecutionError> {
         {
             let _cancel = self.cancellation.lock().await;
             if self.snapshot.borrow().phase == QueryPhase::Canceled(id) {
@@ -660,12 +856,48 @@ impl QueryEngine {
                 snapshot.phase = QueryPhase::Executing(id);
             });
         }
-        let start = Instant::now();
-        let result = self.session.execute_detailed(sql).await;
-        let execution_duration = start.elapsed();
+        Ok(())
+    }
+
+    async fn finish_execution<T>(
+        &self,
+        id: QueryId,
+        mut result: Result<T, crate::error::ExecutionError>,
+        execution_duration: Duration,
+        capture: Option<(
+            &mut crate::result_stream::ResultSink,
+            &watch::Receiver<ResultSnapshot>,
+        )>,
+    ) -> Result<(T, Duration), crate::error::ExecutionError> {
         let _cancel = self.cancellation.lock().await;
-        let canceled = self.snapshot.borrow().phase == QueryPhase::Canceling(id);
+        let canceled = matches!(self.snapshot.borrow().phase, QueryPhase::Canceling(active) | QueryPhase::Canceled(active) if active == id)
+            || matches!(result, Err(crate::error::ExecutionError::Canceled));
+        if canceled {
+            result = Err(crate::error::ExecutionError::Canceled);
+        }
+        let capture = if let Some((producer, reader)) = capture {
+            if let Err(error) = producer
+                .finish(result.as_ref().map(|_| ()).map_err(Clone::clone))
+                .await
+            {
+                result = Err(error);
+            }
+            let capture = reader.borrow().clone();
+            if result.is_ok()
+                && let crate::result_stream::ResultPhase::Finished(
+                    crate::result_stream::ResultTermination::Failed(error),
+                ) = &capture.phase
+            {
+                result = Err(error.clone());
+            }
+            Some(capture)
+        } else {
+            None
+        };
         self.snapshot.send_modify(|snapshot| {
+            if capture.is_some() {
+                snapshot.capture = capture;
+            }
             snapshot.finished_at = Some(Instant::now());
             snapshot.execution_error = result
                 .as_ref()
@@ -685,14 +917,7 @@ impl QueryEngine {
         if canceled {
             return Err(crate::error::ExecutionError::Canceled);
         }
-        result.map(|outcome| {
-            let (result_set, command) = outcome.into_parts();
-            QueryResult {
-                result_set,
-                command,
-                duration: execution_duration,
-            }
-        })
+        result.map(|outcome| (outcome, execution_duration))
     }
 
     pub async fn cancel(&self, id: QueryId) -> Result<(), String> {
