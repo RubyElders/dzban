@@ -513,6 +513,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "dzban-core",
+ "futures-util",
  "reqwest",
  "serde",
  "serde_json",

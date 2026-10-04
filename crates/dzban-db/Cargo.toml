@@ -19,6 +19,7 @@ toml.workspace = true
 async-trait.workspace = true
 reqwest.workspace = true
 uuid.workspace = true
+futures-util = "=0.3.31"
 
 # Logging
 tracing.workspace = true

@@ -5,20 +5,75 @@ use async_trait::async_trait;
 use dzban_core::adapter::DatabaseSession;
 use reqwest::StatusCode;
 use serde_json::Value;
-use tokio::sync::{Mutex, OnceCell};
+use std::sync::Mutex;
+use tokio::sync::OnceCell;
+
+mod stream;
+
+struct ActiveQuery<'a> {
+    queries: &'a Mutex<Vec<QueryRegistration>>,
+    id: String,
+}
+
+impl Drop for ActiveQuery<'_> {
+    fn drop(&mut self) {
+        self.queries
+            .lock()
+            .expect("active query lock")
+            .retain(|query| query.id != self.id);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum QueryStatus {
+    Running,
+    CancelRequested,
+}
+
+struct QueryRegistration {
+    id: String,
+    status: QueryStatus,
+}
+
+impl ActiveQuery<'_> {
+    fn canceled(&self) -> bool {
+        self.queries
+            .lock()
+            .expect("active query lock")
+            .iter()
+            .any(|query| {
+                query.id == self.id && matches!(query.status, QueryStatus::CancelRequested)
+            })
+    }
+}
 
 pub(crate) struct ClickHouseSession {
     config: DatabaseConfig,
     client: OnceCell<reqwest::Client>,
-    active_queries: Mutex<Vec<String>>,
+    active_queries: Mutex<Vec<QueryRegistration>>,
+    cancellation: tokio::sync::Mutex<()>,
 }
 
 impl ClickHouseSession {
+    fn track(&self, id: &str) -> ActiveQuery<'_> {
+        self.active_queries
+            .lock()
+            .expect("active query lock")
+            .push(QueryRegistration {
+                id: id.to_owned(),
+                status: QueryStatus::Running,
+            });
+        ActiveQuery {
+            queries: &self.active_queries,
+            id: id.to_owned(),
+        }
+    }
     pub(crate) fn new(config: DatabaseConfig) -> Result<Self, String> {
         Ok(Self {
             config,
             client: OnceCell::new(),
             active_queries: Mutex::new(Vec::new()),
+            cancellation: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -39,6 +94,16 @@ impl ClickHouseSession {
         query: &str,
         query_id: &str,
     ) -> reqwest::RequestBuilder {
+        self.request_mode(client, query, query_id, "1")
+    }
+
+    fn request_mode(
+        &self,
+        client: &reqwest::Client,
+        query: &str,
+        query_id: &str,
+        wait: &str,
+    ) -> reqwest::RequestBuilder {
         client
             .post(
                 self.config
@@ -51,7 +116,7 @@ impl ClickHouseSession {
             .query(&[
                 ("database", self.config.database.as_str()),
                 ("query_id", query_id),
-                ("wait_end_of_query", "1"),
+                ("wait_end_of_query", wait),
                 ("output_format_json_quote_64bit_integers", "1"),
                 ("output_format_json_quote_decimals", "1"),
             ])
@@ -81,9 +146,7 @@ impl ClickHouseSession {
         use dzban_core::error::ExecutionError;
         let client = self.client().await?;
         let query_id = uuid::Uuid::new_v4().to_string();
-        if track {
-            self.active_queries.lock().await.push(query_id.clone());
-        }
+        let _active = track.then(|| self.track(&query_id));
         let response = self
             .request(client, query, &query_id)
             .query(parameters)
@@ -105,12 +168,6 @@ impl ClickHouseSession {
             }
             Err(error) => Err(ExecutionError::Database(clickhouse_transport_error(&error))),
         };
-        if track {
-            self.active_queries
-                .lock()
-                .await
-                .retain(|active| active != &query_id);
-        }
         let (status, exception_code, body) = response_body?;
         if !status.is_success() {
             return Err(ExecutionError::Database(clickhouse_error(
@@ -118,6 +175,14 @@ impl ClickHouseSession {
                 exception_code.as_deref(),
                 &body,
             )));
+        }
+        let _cancellation = if track {
+            Some(self.cancellation.lock().await)
+        } else {
+            None
+        };
+        if _active.as_ref().is_some_and(ActiveQuery::canceled) {
+            return Err(ExecutionError::Canceled);
         }
         parse_clickhouse_result(&body).map_err(Into::into)
     }
@@ -199,6 +264,28 @@ impl DatabaseSession for ClickHouseSession {
         }
     }
 
+    async fn execute_streamed(
+        &self,
+        query: &str,
+        results: &mut dzban_core::result_stream::ResultSink,
+    ) -> Result<Option<dzban_core::CommandAcknowledgment>, dzban_core::error::ExecutionError> {
+        let client = self.client().await?;
+        let query_id = uuid::Uuid::new_v4().to_string();
+        let active = self.track(&query_id);
+        let outcome = stream::execute(
+            self.request_mode(client, query, &query_id, "0")
+                .query(&[("buffer_size", "0")]),
+            results,
+        )
+        .await;
+        let _cancellation = self.cancellation.lock().await;
+        if outcome.is_ok() && active.canceled() {
+            Err(dzban_core::error::ExecutionError::Canceled)
+        } else {
+            outcome
+        }
+    }
+
     async fn cancel(&self) -> Result<(), String> {
         self.cancel_detailed()
             .await
@@ -206,21 +293,33 @@ impl DatabaseSession for ClickHouseSession {
     }
 
     async fn cancel_detailed(&self) -> Result<(), dzban_core::error::ExecutionError> {
-        let query_id = self
-            .active_queries
-            .lock()
-            .await
-            .last()
-            .cloned()
-            .ok_or_else(|| {
+        let _cancellation = self.cancellation.lock().await;
+        let query_id = {
+            let mut queries = self.active_queries.lock().expect("active query lock");
+            let query = queries.last_mut().ok_or_else(|| {
                 dzban_core::error::ExecutionError::Message("No ClickHouse query is running".into())
             })?;
-        self.execute_tracked_detailed(
-            &format!("KILL QUERY WHERE query_id = '{query_id}' SYNC"),
-            false,
-        )
-        .await
-        .map(|_| ())
+            query.status = QueryStatus::CancelRequested;
+            query.id.clone()
+        };
+        let outcome = self
+            .execute_tracked_detailed(
+                &format!("KILL QUERY WHERE query_id = '{query_id}' SYNC"),
+                false,
+            )
+            .await
+            .map(|_| ());
+        if outcome.is_err()
+            && let Some(query) = self
+                .active_queries
+                .lock()
+                .expect("active query lock")
+                .iter_mut()
+                .find(|query| query.id == query_id)
+        {
+            query.status = QueryStatus::Running;
+        }
+        outcome
     }
 
     async fn version(&self) -> Result<String, String> {
@@ -399,6 +498,34 @@ fn clickhouse_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn abandoned_queries_leave_no_active_registration() {
+        let queries = Mutex::new(vec![
+            QueryRegistration {
+                id: "older".into(),
+                status: QueryStatus::Running,
+            },
+            QueryRegistration {
+                id: "dropped".into(),
+                status: QueryStatus::Running,
+            },
+        ]);
+        let active = ActiveQuery {
+            queries: &queries,
+            id: "dropped".into(),
+        };
+        drop(active);
+        assert_eq!(
+            queries
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|query| query.id.clone())
+                .collect::<Vec<_>>(),
+            ["older"]
+        );
+    }
 
     #[tokio::test]
     #[ignore = "requires ClickHouse from docker-compose.test.yml"]
