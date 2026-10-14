@@ -4,6 +4,12 @@ set -euo pipefail
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
+test_root=$(mktemp -d "${TMPDIR:-/tmp}/dzban-headless.XXXXXX")
+trap 'rm -rf "$test_root"' EXIT
+export DZBAN_CONFIG=/dev/null
+export XDG_CONFIG_HOME="$test_root/config"
+export XDG_CONFIG_DIRS="$test_root/system-config"
+export XDG_DATA_HOME="$test_root/data"
 export CCACHE_DISABLE=1
 export PKG_CONFIG=/bin/false
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$repo_root/target/headless}"
