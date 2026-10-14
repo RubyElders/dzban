@@ -10,7 +10,6 @@ use std::time::Duration;
 use super::connection_state::ConnectionStateWidget;
 use super::connections::{self, ConnectionManager};
 use super::plan_inspector::{PlanScroll, PlanState};
-use super::query_state::QueryExecution;
 use super::query_tabs::QueryTabManager;
 use super::statusbar::Statusbar;
 use dzban_gtk::database::{
@@ -109,6 +108,33 @@ mod tests {
         manager.dispatch(AppEvent::QueryPlanning);
         assert!(!widget.is_visible());
     }
+
+    #[gtk4::test]
+    #[ignore = "requires a graphical display"]
+    fn repeated_execution_snapshots_do_not_restart_action_bar_rendering() {
+        let manager = DatabaseTabManager::new(super::super::statusbar::create_statusbar());
+        let count = Rc::new(Cell::new(0));
+        let observed = count.clone();
+        manager.set_app_state_callback(move |_| observed.set(observed.get() + 1));
+        assert_eq!(count.get(), 1);
+        manager.dispatch(AppEvent::QueryRunning(None));
+        assert_eq!(count.get(), 2);
+        manager.dispatch(AppEvent::QueryRunning(None));
+        assert_eq!(count.get(), 2);
+        let second_count = Rc::new(Cell::new(0));
+        let observed = second_count.clone();
+        manager.set_app_state_callback(move |_| observed.set(observed.get() + 1));
+        assert_eq!(second_count.get(), 1);
+        assert_eq!(count.get(), 2);
+        manager.dispatch(AppEvent::QueryRunning(None));
+        assert_eq!(second_count.get(), 1);
+        manager.dispatch(AppEvent::QueryCanceling);
+        assert_eq!(count.get(), 3);
+        assert_eq!(second_count.get(), 2);
+        manager.dispatch(AppEvent::QueryFinished);
+        assert_eq!(count.get(), 4);
+        assert_eq!(second_count.get(), 3);
+    }
 }
 
 const QUERY_PREVIEW_DELAY: Duration = Duration::from_millis(250);
@@ -161,6 +187,7 @@ pub struct DatabaseTabManager {
     db_manager: DbManager,
     statusbar: Statusbar,
     app_state: Rc<RefCell<AppState>>,
+    published_app_state: Rc<RefCell<Option<AppState>>>,
     app_state_callbacks: Rc<RefCell<Vec<AppStateCallback>>>,
     query_preview_generation: Rc<Cell<u64>>,
     query_preview_timer: Rc<RefCell<Option<glib::SourceId>>>,
@@ -207,6 +234,7 @@ impl DatabaseTabManager {
             db_manager: DbManager::with_runtime_bridge(runtime_bridge),
             statusbar: statusbar.clone(),
             app_state: Rc::new(RefCell::new(AppState::default())),
+            published_app_state: Rc::new(RefCell::new(None)),
             app_state_callbacks: Rc::new(RefCell::new(Vec::new())),
             query_preview_generation: Rc::new(Cell::new(0)),
             query_preview_timer: Rc::new(RefCell::new(None)),
@@ -314,10 +342,11 @@ impl DatabaseTabManager {
     where
         F: Fn(AppState) + 'static,
     {
-        self.app_state_callbacks
-            .borrow_mut()
-            .push(Rc::new(callback));
-        self.emit_app_state();
+        let state = self.app_state.borrow().clone();
+        let callback: AppStateCallback = Rc::new(callback);
+        self.app_state_callbacks.borrow_mut().push(callback.clone());
+        self.published_app_state.replace(Some(state.clone()));
+        callback(state);
     }
 
     pub fn begin_query_preview(&self) {
@@ -425,6 +454,10 @@ impl DatabaseTabManager {
 
     fn emit_app_state(&self) {
         let state = self.app_state.borrow().clone();
+        if self.published_app_state.borrow().as_ref() == Some(&state) {
+            return;
+        }
+        self.published_app_state.replace(Some(state.clone()));
         for callback in self.app_state_callbacks.borrow().iter() {
             callback(state.clone());
         }
@@ -880,40 +913,35 @@ impl DatabaseTabManager {
         else {
             return;
         };
-        let Some((query_num, sql, state_manager)) = query_manager.current_query() else {
+        let Some((query_num, sql, document)) = query_manager.current_query() else {
             tracing::debug!("No executable query in the selected tab");
             return;
         };
-        if state_manager.is_active() {
-            return;
-        }
-        let Ok(delivery) = connection.execute_streamed_recorded_query(sql) else {
+        let mut snapshots = document.subscribe();
+        let Ok(delivery) = connection.execute_document_query(document.clone(), sql) else {
             return;
         };
         let query_rx = delivery.result;
-        let mut snapshots = delivery.state;
+        let engine_state = delivery.state;
         let query_id = delivery.id;
+        let output_generation = delivery
+            .generation
+            .expect("document query has an output identity");
         let bridge = delivery.bridge;
-        let execution = QueryExecution::start(state_manager.clone(), query_id)
-            .expect("admitted query belongs to an idle document");
-        let Some(output_generation) = query_manager.show_loading_for(execution.query_num()) else {
-            execution.finish();
+        if !query_manager.show_loading_generation(query_num, output_generation) {
             return;
-        };
+        }
 
         let statusbar = self.statusbar.clone();
         let tab_view = self.tab_view.clone();
         let manager_for_plan = self.clone();
         let database_page_for_plan = database_page.clone();
-        let connection_for_plan = connection.clone();
         let query_manager_for_result = query_manager.clone();
         let bridge_for_result = bridge.clone();
-        let document_for_plan = state_manager.clone();
         gtk4::glib::spawn_future_local(async move {
             let result = query_rx.await;
-            execution.finish();
             query_manager_for_result.refresh_history();
-            if !state_manager.accepts_output(output_generation) {
+            if !document.accepts_output(output_generation) {
                 return;
             }
             match result {
@@ -923,11 +951,10 @@ impl DatabaseTabManager {
                     tracing::info!("Query returned {} rows", row_count);
                     let command = result.command;
                     if let Some(command) = &command {
-                        query_manager_for_result
-                            .display_command_for(execution.query_num(), command);
+                        query_manager_for_result.display_command_for(query_num, command);
                     } else if row_count == 0 {
                         query_manager_for_result.display_results_for(
-                            execution.query_num(),
+                            query_num,
                             dzban_gtk::database::ResultSet {
                                 columns: vec![],
                                 rows: vec![],
@@ -935,14 +962,14 @@ impl DatabaseTabManager {
                         );
                     } else {
                         query_manager_for_result.display_stream_for(
-                            execution.query_num(),
+                            query_num,
                             output_generation,
                             result.capture,
                             bridge_for_result,
                         );
                     };
                     if tab_view.selected_page().as_ref() == Some(&database_page)
-                        && query_manager_for_result.is_query_selected(execution.query_num())
+                        && query_manager_for_result.is_query_selected(query_num)
                     {
                         statusbar.update_rows(command.is_none().then_some(row_count));
                         statusbar.update_exec_time(Some(duration.as_secs_f64()));
@@ -950,13 +977,12 @@ impl DatabaseTabManager {
                 }
                 Ok(Err(error)) => {
                     tracing::error!("Query failed: {}", error);
-                    query_manager_for_result
-                        .display_error_for(execution.query_num(), &error.to_string());
+                    query_manager_for_result.display_error_for(query_num, &error.to_string());
                 }
                 Err(_) => {
                     let error = "Query execution was cancelled";
                     tracing::error!("{}", error);
-                    query_manager_for_result.display_error_for(execution.query_num(), error);
+                    query_manager_for_result.display_error_for(query_num, error);
                 }
             }
         });
@@ -964,24 +990,30 @@ impl DatabaseTabManager {
         gtk4::glib::spawn_future_local(async move {
             let mut plan_rendered = false;
             loop {
-                let snapshot = snapshots.borrow_and_update().clone();
-                if snapshot.phase.id() != Some(query_id) {
+                let document = snapshots.borrow_and_update().clone();
+                if document.execution.query() != Some(query_id) {
                     break;
                 }
+                let scope = engine_state.borrow().scope();
+                if manager_for_plan.tab_view.selected_page().as_ref()
+                    == Some(&database_page_for_plan)
+                    && let Some(event) = AppEvent::scoped_document_execution(&document, Some(scope))
+                {
+                    manager_for_plan.dispatch(event);
+                }
+                let Some(snapshot) = document.operation else {
+                    if !document.execution.is_active() || snapshots.changed().await.is_err() {
+                        break;
+                    }
+                    continue;
+                };
                 if !plan_rendered && (snapshot.plan.is_some() || snapshot.explain_error.is_some()) {
-                    document_for_plan.set_execution_plan(query_id, snapshot.plan.clone());
                     query_manager.display_explain_for(
                         query_num,
                         output_generation,
                         snapshot.plan.as_ref(),
                         snapshot.explain_error.as_deref(),
                     );
-                    if manager_for_plan.tab_view.selected_page().as_ref()
-                        == Some(&database_page_for_plan)
-                        && connection_for_plan.operation() == ConnectionOperation::Query
-                    {
-                        manager_for_plan.dispatch(AppEvent::QueryRunning(snapshot.plan.clone()));
-                    }
                     plan_rendered = true;
                 }
                 if let Some(capture) = snapshot.capture {
@@ -992,13 +1024,7 @@ impl DatabaseTabManager {
                         bridge.clone(),
                     );
                 }
-                if matches!(
-                    snapshot.phase,
-                    dzban_core::execution::QueryPhase::Completed(_)
-                        | dzban_core::execution::QueryPhase::Canceled(_)
-                        | dzban_core::execution::QueryPhase::Failed(_, _)
-                ) || snapshots.changed().await.is_err()
-                {
+                if !document.execution.is_active() || snapshots.changed().await.is_err() {
                     break;
                 }
             }
@@ -1022,38 +1048,32 @@ impl DatabaseTabManager {
         else {
             return;
         };
-        let Some((_, state_manager)) = query_manager.running_query() else {
+        let Some((_, document)) = query_manager.running_query() else {
             return;
         };
-        let Some(query) = state_manager.cancel() else {
+        let query = document.snapshot().execution.query();
+        let Ok(cancellation) = connection.cancel_document(document.clone()) else {
             return;
         };
-        self.dispatch(AppEvent::QueryCanceling);
-        if connection.state() != ConnectionState::Connected {
-            state_manager.finish(query);
-            self.dispatch(AppEvent::QueryFinished);
-            return;
+        if let Some(event) =
+            AppEvent::scoped_document_execution(&document.snapshot(), connection.query_scope())
+        {
+            self.dispatch(event);
         }
         let manager = self.clone();
         gtk4::glib::spawn_future_local(async move {
-            match connection.cancel_query_identified(query).await {
+            match cancellation.await {
                 Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    tracing::error!("Failed to cancel query: {}", error);
-                    if state_manager.cancel_failed(query)
-                        && manager.tab_view.selected_page().as_ref() == Some(&current_page)
-                    {
-                        manager.dispatch(AppEvent::QueryRunning(query_manager.running_plan()));
-                    }
-                }
-                Err(_) => {
-                    tracing::error!("Cancellation request was dropped");
-                    if state_manager.cancel_failed(query)
-                        && manager.tab_view.selected_page().as_ref() == Some(&current_page)
-                    {
-                        manager.dispatch(AppEvent::QueryRunning(query_manager.running_plan()));
-                    }
-                }
+                Ok(Err(error)) => tracing::error!("Failed to cancel query: {error}"),
+                Err(_) => tracing::error!("Cancellation delivery was dropped"),
+            }
+            let snapshot = document.snapshot();
+            if snapshot.execution.query() == query
+                && manager.tab_view.selected_page().as_ref() == Some(&current_page)
+                && let Some(event) =
+                    AppEvent::scoped_document_execution(&snapshot, connection.query_scope())
+            {
+                manager.dispatch(event);
             }
         });
     }

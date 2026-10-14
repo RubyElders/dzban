@@ -23,6 +23,7 @@ pub struct ConnectionDelivery {
 
 pub struct StreamedQueryDelivery {
     pub id: dzban_core::execution::QueryId,
+    pub generation: Option<u64>,
     pub state: tokio::sync::watch::Receiver<dzban_core::execution::QuerySnapshot>,
     pub result: QueryReceiver<
         dzban_core::execution::StreamedQueryCompletion,
@@ -64,7 +65,55 @@ impl RuntimeBridge {
         self.runtime.spawn(async move {
             let _ = sender.send(query.wait_completion().await);
         });
-        Ok(StreamedQueryDelivery { id, state, result })
+        Ok(StreamedQueryDelivery {
+            id,
+            generation: None,
+            state,
+            result,
+        })
+    }
+
+    pub fn start_document(
+        &self,
+        connection: InternalConnection,
+        document: dzban_core::documents::QueryDocument,
+        sql: String,
+        history: Option<dzban_core::history::QueryHistoryStore>,
+    ) -> Result<StreamedQueryDelivery, dzban_core::error::ExecutionError> {
+        let engine = connection.engine();
+        let query = {
+            let _runtime = self.runtime.enter();
+            document.submit(engine.clone(), sql, Default::default(), history)?
+        };
+        let id = query.query;
+        let generation = Some(query.generation);
+        let state = engine.subscribe();
+        let (sender, result) = oneshot::channel();
+        self.runtime.spawn(async move {
+            let _ = sender.send(query.wait().await);
+        });
+        Ok(StreamedQueryDelivery {
+            id,
+            generation,
+            state,
+            result,
+        })
+    }
+
+    pub fn cancel_document(
+        &self,
+        connection: InternalConnection,
+        document: dzban_core::documents::QueryDocument,
+    ) -> Result<oneshot::Receiver<Result<(), String>>, dzban_core::error::ExecutionError> {
+        let cancellation = {
+            let _runtime = self.runtime.enter();
+            document.request_cancel(connection.engine())?
+        };
+        let (sender, result) = oneshot::channel();
+        self.runtime.spawn(async move {
+            let _ = sender.send(cancellation.wait().await.map_err(|error| error.to_string()));
+        });
+        Ok(result)
     }
     pub fn read_result_page(
         &self,

@@ -5,7 +5,6 @@ pub(crate) mod icons;
 mod plan_inspector;
 mod preview_overlay;
 mod query_history;
-mod query_state;
 mod query_tabs;
 mod result_inspector;
 mod shortcuts;

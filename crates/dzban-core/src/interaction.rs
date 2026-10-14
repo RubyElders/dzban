@@ -82,6 +82,30 @@ pub enum AppEvent {
     QueryFinished,
 }
 
+impl AppEvent {
+    pub fn scoped_document_execution(
+        snapshot: &crate::documents::DocumentSnapshot,
+        current: Option<crate::execution::QueryScope>,
+    ) -> Option<Self> {
+        let current = current?;
+        if snapshot.session != Some(current.session) || snapshot.execution.query() != current.query
+        {
+            return None;
+        }
+        Some(Self::document_execution(snapshot))
+    }
+
+    pub fn document_execution(snapshot: &crate::documents::DocumentSnapshot) -> Self {
+        use crate::documents::DocumentExecution;
+        match snapshot.execution {
+            DocumentExecution::Idle | DocumentExecution::Finished(_) => Self::QueryFinished,
+            DocumentExecution::Planning(_) => Self::QueryPlanning,
+            DocumentExecution::Running(_) => Self::QueryRunning(snapshot.plan.clone()),
+            DocumentExecution::Canceling(_) => Self::QueryCanceling,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppCommand {
     BeginPreview,

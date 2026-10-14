@@ -1,7 +1,9 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use tokio::sync::watch;
 
 use crate::QueryPlan;
-use crate::execution::QueryId;
+use crate::execution::{QueryId, QuerySnapshot, SessionId, StreamedQueryCompletion};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DocumentId(pub uuid::Uuid);
@@ -16,6 +18,7 @@ pub enum DocumentLifecycle {
 pub enum DocumentExecution {
     #[default]
     Idle,
+    Planning(QueryId),
     Running(QueryId),
     Canceling(QueryId),
     Finished(QueryId),
@@ -25,12 +28,18 @@ impl DocumentExecution {
     pub fn query(&self) -> Option<QueryId> {
         match self {
             Self::Idle => None,
-            Self::Running(query) | Self::Canceling(query) | Self::Finished(query) => Some(*query),
+            Self::Planning(query)
+            | Self::Running(query)
+            | Self::Canceling(query)
+            | Self::Finished(query) => Some(*query),
         }
     }
 
     pub fn is_active(&self) -> bool {
-        matches!(self, Self::Running(_) | Self::Canceling(_))
+        matches!(
+            self,
+            Self::Planning(_) | Self::Running(_) | Self::Canceling(_)
+        )
     }
 }
 
@@ -42,41 +51,52 @@ pub struct DocumentSnapshot {
     pub title: String,
     pub draft: String,
     pub execution: DocumentExecution,
+    pub session: Option<SessionId>,
     pub output_generation: u64,
     pub plan: Option<QueryPlan>,
+    pub operation: Option<QuerySnapshot>,
+    pub completion: Option<Result<Arc<StreamedQueryCompletion>, crate::error::ExecutionError>>,
 }
 
 #[derive(Clone, Debug)]
 pub struct QueryDocument {
-    state: Arc<Mutex<DocumentSnapshot>>,
+    state: Arc<watch::Sender<DocumentSnapshot>>,
 }
 
 impl QueryDocument {
     fn new(number: u32) -> Self {
+        let snapshot = DocumentSnapshot {
+            id: DocumentId(uuid::Uuid::new_v4()),
+            number,
+            lifecycle: DocumentLifecycle::Open,
+            title: format!("Query {number}"),
+            draft: String::new(),
+            execution: DocumentExecution::Idle,
+            session: None,
+            output_generation: 0,
+            plan: None,
+            operation: None,
+            completion: None,
+        };
         Self {
-            state: Arc::new(Mutex::new(DocumentSnapshot {
-                id: DocumentId(uuid::Uuid::new_v4()),
-                number,
-                lifecycle: DocumentLifecycle::Open,
-                title: format!("Query {number}"),
-                draft: String::new(),
-                execution: DocumentExecution::Idle,
-                output_generation: 0,
-                plan: None,
-            })),
+            state: Arc::new(watch::channel(snapshot).0),
         }
     }
 
     pub fn snapshot(&self) -> DocumentSnapshot {
-        self.state.lock().unwrap().clone()
+        self.state.borrow().clone()
+    }
+
+    pub fn subscribe(&self) -> watch::Receiver<DocumentSnapshot> {
+        self.state.subscribe()
     }
 
     pub fn id(&self) -> DocumentId {
-        self.state.lock().unwrap().id
+        self.state.borrow().id
     }
 
     pub fn number(&self) -> u32 {
-        self.state.lock().unwrap().number
+        self.state.borrow().number
     }
 
     pub fn rename(&self, title: &str) -> bool {
@@ -84,100 +104,131 @@ impl QueryDocument {
         if title.is_empty() {
             return false;
         }
-        let mut state = self.state.lock().unwrap();
-        if state.lifecycle != DocumentLifecycle::Open {
-            return false;
-        }
-        state.title = title.to_string();
-        true
+        self.state.send_if_modified(|state| {
+            if state.lifecycle != DocumentLifecycle::Open {
+                return false;
+            }
+            state.title = title.to_string();
+            true
+        })
     }
 
     pub fn set_draft(&self, draft: String) -> bool {
-        let mut state = self.state.lock().unwrap();
-        if state.lifecycle != DocumentLifecycle::Open {
-            return false;
-        }
-        state.draft = draft;
-        true
+        self.state.send_if_modified(|state| {
+            if state.lifecycle != DocumentLifecycle::Open {
+                return false;
+            }
+            state.draft = draft;
+            true
+        })
     }
 
     pub fn draft(&self) -> String {
-        self.state.lock().unwrap().draft.clone()
+        self.state.borrow().draft.clone()
     }
 
     pub fn is_active(&self) -> bool {
-        self.state.lock().unwrap().execution.is_active()
+        self.state.borrow().execution.is_active()
     }
 
     pub fn start(&self, query: QueryId) -> bool {
-        let mut state = self.state.lock().unwrap();
-        if state.lifecycle != DocumentLifecycle::Open || state.execution.is_active() {
-            return false;
-        }
-        state.execution = DocumentExecution::Running(query);
-        state.plan = None;
-        true
+        self.state.send_if_modified(|state| {
+            if state.lifecycle != DocumentLifecycle::Open || state.execution.is_active() {
+                return false;
+            }
+            state.execution = DocumentExecution::Running(query);
+            state.plan = None;
+            state.operation = None;
+            state.completion = None;
+            true
+        })
     }
 
     pub fn finish(&self, query: QueryId) -> bool {
-        let mut state = self.state.lock().unwrap();
-        if !state.execution.is_active() || state.execution.query() != Some(query) {
-            return false;
-        }
-        state.execution = DocumentExecution::Finished(query);
-        true
+        self.state.send_if_modified(|state| {
+            if !state.execution.is_active() || state.execution.query() != Some(query) {
+                return false;
+            }
+            state.execution = DocumentExecution::Finished(query);
+            true
+        })
     }
 
     pub fn cancel(&self) -> Option<QueryId> {
-        let mut state = self.state.lock().unwrap();
-        let DocumentExecution::Running(query) = state.execution else {
-            return None;
-        };
-        state.execution = DocumentExecution::Canceling(query);
-        Some(query)
+        let mut query = None;
+        self.state.send_if_modified(|state| {
+            let (DocumentExecution::Running(id) | DocumentExecution::Planning(id)) =
+                state.execution
+            else {
+                return false;
+            };
+            state.execution = DocumentExecution::Canceling(id);
+            query = Some(id);
+            true
+        });
+        query
     }
 
     pub fn cancel_failed(&self, query: QueryId) -> bool {
-        let mut state = self.state.lock().unwrap();
-        if state.execution != DocumentExecution::Canceling(query) {
-            return false;
-        }
-        state.execution = DocumentExecution::Running(query);
-        true
+        self.state.send_if_modified(|state| {
+            if state.execution != DocumentExecution::Canceling(query) {
+                return false;
+            }
+            state.execution = match state.operation.as_ref().map(|operation| &operation.phase) {
+                Some(
+                    crate::execution::QueryPhase::Queued(_)
+                    | crate::execution::QueryPhase::Explaining(_),
+                ) => DocumentExecution::Planning(query),
+                _ => DocumentExecution::Running(query),
+            };
+            true
+        })
     }
 
     pub fn replace_output(&self) -> u64 {
-        let mut state = self.state.lock().unwrap();
-        state.output_generation = state.output_generation.checked_add(1).unwrap();
-        state.output_generation
+        let mut generation = 0;
+        self.state.send_modify(|state| {
+            state.output_generation = state.output_generation.checked_add(1).unwrap();
+            generation = state.output_generation;
+        });
+        generation
     }
 
     pub fn accepts_output(&self, generation: u64) -> bool {
-        let state = self.state.lock().unwrap();
+        let state = self.state.borrow();
         state.lifecycle == DocumentLifecycle::Open && state.output_generation == generation
     }
 
     pub fn set_execution_plan(&self, query: QueryId, plan: Option<QueryPlan>) -> bool {
-        let mut state = self.state.lock().unwrap();
-        if state.lifecycle != DocumentLifecycle::Open || state.execution.query() != Some(query) {
-            return false;
-        }
-        state.plan = plan;
-        true
+        self.state.send_if_modified(|state| {
+            if state.lifecycle != DocumentLifecycle::Open || state.execution.query() != Some(query)
+            {
+                return false;
+            }
+            state.plan = plan;
+            true
+        })
     }
 
     pub fn plan(&self) -> Option<QueryPlan> {
-        self.state.lock().unwrap().plan.clone()
+        self.state.borrow().plan.clone()
+    }
+
+    pub(crate) fn mutate(&self, mutation: impl FnOnce(&mut DocumentSnapshot) -> bool) -> bool {
+        self.state.send_if_modified(mutation)
     }
 
     fn close(&self) -> bool {
-        let mut state = self.state.lock().unwrap();
-        if state.execution.is_active() {
-            return false;
-        }
-        state.lifecycle = DocumentLifecycle::Closed;
-        state.plan = None;
-        true
+        self.state.send_if_modified(|state| {
+            if state.execution.is_active() {
+                return false;
+            }
+            state.lifecycle = DocumentLifecycle::Closed;
+            state.plan = None;
+            state.operation = None;
+            state.completion = None;
+            true
+        })
     }
 }
 
