@@ -985,6 +985,26 @@ impl DbConnection {
         Ok(rx)
     }
 
+    pub fn schedule_preview(
+        &self,
+        service: dzban_core::preview::PlanPreviewService,
+        document: dzban_core::documents::QueryDocument,
+        sql: String,
+    ) -> Result<dzban_core::preview::PreviewTarget, String> {
+        let connection = self
+            .imp()
+            .db_connection
+            .borrow()
+            .clone()
+            .ok_or_else(|| "Not connected".to_string())?;
+        self.imp()
+            .runtime_bridge
+            .get()
+            .expect("RuntimeBridge initialized")
+            .schedule_preview(connection, service, document, sql)
+            .map_err(|error| error.to_string())
+    }
+
     pub fn cancel_query(&self) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
         self.cancel_query_for(None)
     }

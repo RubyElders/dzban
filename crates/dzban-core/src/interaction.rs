@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::QueryPlan;
 
-pub const PREVIEW_HOLD_MS: u64 = 250;
+pub const PREVIEW_HOLD_MS: u64 = crate::preview::PREVIEW_HOLD.as_millis() as u64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum InputKey {

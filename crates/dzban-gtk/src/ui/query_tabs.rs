@@ -20,6 +20,7 @@ use super::query_history::{QueryHistoryOutcome, QueryResultSnapshot};
 use super::result_inspector::ResultInspector;
 use super::sidebar::{HistoryPlanAction, QueryHistory};
 use dzban_core::documents::{CloseDocument, QueryDocument, QueryDocuments};
+use dzban_core::query_selection::query_at_cursor as extract_query_at_cursor;
 
 type EmptyCallback = Rc<dyn Fn()>;
 use dzban_core::result_stream::{ResultPhase, ResultSnapshot, ResultTermination};
@@ -70,6 +71,7 @@ pub struct QueryTabManager {
     plan_inspector: PlanInspector,
     result_inspector: ResultInspector,
     empty_callback: Rc<RefCell<Option<EmptyCallback>>>,
+    preview_service: Rc<RefCell<Option<dzban_core::preview::PlanPreviewService>>>,
 }
 
 impl QueryTabManager {
@@ -125,6 +127,7 @@ impl QueryTabManager {
             plan_inspector,
             result_inspector,
             empty_callback: Rc::new(RefCell::new(None)),
+            preview_service: Rc::new(RefCell::new(None)),
         };
 
         let weak_tab_view = manager.tab_view.downgrade();
@@ -223,7 +226,11 @@ impl QueryTabManager {
         let plan_inspector = manager.plan_inspector.clone();
         let weak_tabs = Rc::downgrade(&manager.tabs);
         let documents = manager.documents.clone();
+        let preview_service = manager.preview_service.clone();
         manager.tab_view.connect_selected_page_notify(move |view| {
+            if let Some(service) = preview_service.borrow().as_ref() {
+                service.workspace_changed(&documents.borrow());
+            }
             if let Some(tabs) = weak_tabs.upgrade()
                 && let Some(page) = view.selected_page()
                 && let Some(tab) = tabs.borrow().values().find(|tab| tab.page == page)
@@ -279,6 +286,12 @@ impl QueryTabManager {
             },
         );
 
+        let cursor_document = document.clone();
+        editor
+            .buffer()
+            .connect_notify_local(Some("cursor-position"), move |_, _| {
+                cursor_document.query_context_changed();
+            });
         editor.buffer().connect_changed(move |buffer| {
             document.set_draft(
                 buffer
@@ -733,6 +746,10 @@ impl QueryTabManager {
         *self.empty_callback.borrow_mut() = Some(Rc::new(callback));
     }
 
+    pub fn bind_preview_service(&self, service: dzban_core::preview::PlanPreviewService) {
+        self.preview_service.replace(Some(service));
+    }
+
     pub fn select_next_tab(&self) -> bool {
         let next = self.documents.borrow_mut().select_relative(true);
         next.is_some_and(|document| self.select_tab(document.number()))
@@ -964,91 +981,6 @@ fn create_query_output(
         },
         |result| create_results_grid(result, result_inspector),
     )
-}
-
-/// Extract the SQL query at the cursor position
-/// Splits by semicolons and returns the query containing the cursor
-/// Returns (query_text, start_offset, end_offset)
-fn extract_query_at_cursor(text: &str, cursor_pos: usize) -> Option<(String, usize, usize)> {
-    // If cursor is beyond text, return None
-    if cursor_pos > text.len() {
-        return None;
-    }
-
-    // Split by semicolons and track positions
-    let mut queries = Vec::new();
-    let mut current_pos = 0;
-
-    for part in text.split(';') {
-        let part_len = part.len();
-        let query_start = current_pos;
-        let query_end = current_pos + part_len;
-
-        queries.push((query_start, query_end, part));
-        current_pos = query_end + 1; // +1 for the semicolon
-    }
-
-    // Strategy: Prefer the query before the cursor when at boundaries
-    // 1. First, check if cursor is within a query's content (not just whitespace)
-    for (start, _end, query_text) in &queries {
-        let trimmed = query_text.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        // Find actual content boundaries (skip leading/trailing whitespace)
-        let trim_start = query_text.find(|c: char| !c.is_whitespace()).unwrap_or(0);
-        let trim_end = query_text
-            .rfind(|c: char| !c.is_whitespace())
-            .map(|pos| pos + 1)
-            .unwrap_or(query_text.len());
-
-        let content_start = start + trim_start;
-        let content_end = start + trim_end;
-
-        // If cursor is within the actual content, this is our query
-        if cursor_pos >= content_start && cursor_pos < content_end {
-            return Some((trimmed.to_string(), content_start, content_end));
-        }
-    }
-
-    // 2. Cursor is not within content - prefer the query before cursor
-    for (start, _end, query_text) in queries.iter().rev() {
-        let trimmed = query_text.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let trim_start = query_text.find(|c: char| !c.is_whitespace()).unwrap_or(0);
-        let trim_end = query_text
-            .rfind(|c: char| !c.is_whitespace())
-            .map(|pos| pos + 1)
-            .unwrap_or(query_text.len());
-
-        let content_start = start + trim_start;
-        let content_end = start + trim_end;
-
-        // Use the last query whose content ends before or at cursor
-        if content_end <= cursor_pos {
-            return Some((trimmed.to_string(), content_start, content_end));
-        }
-    }
-
-    // 3. Still no match? Return the first non-empty query
-    for (start, _end, query_text) in &queries {
-        let trimmed = query_text.trim();
-        if !trimmed.is_empty() {
-            let trim_start = query_text.find(|c: char| !c.is_whitespace()).unwrap_or(0);
-            let trim_end = query_text
-                .rfind(|c: char| !c.is_whitespace())
-                .map(|pos| pos + 1)
-                .unwrap_or(query_text.len());
-
-            return Some((trimmed.to_string(), start + trim_start, start + trim_end));
-        }
-    }
-
-    None
 }
 
 fn create_query_editor_pane() -> (Box, SourceView, ScrolledWindow, Label) {
@@ -1665,6 +1597,11 @@ mod tests {
             .editor
             .buffer()
             .set_text("SELECT 1;");
+        assert_eq!(first.draft(), "SELECT 1;");
+        let revision = first.snapshot().draft_revision;
+        let buffer = manager.tabs.borrow().get(&1).unwrap().editor.buffer();
+        buffer.place_cursor(&buffer.start_iter());
+        assert!(first.snapshot().draft_revision > revision);
         assert_eq!(first.draft(), "SELECT 1;");
         assert!(manager.rename_current_tab("  First query  "));
         assert_eq!(first.snapshot().title, "First query");
