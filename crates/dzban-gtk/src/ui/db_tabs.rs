@@ -5,6 +5,7 @@ use libadwaita as adw;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+#[cfg(test)]
 use std::time::Duration;
 
 use super::connection_state::ConnectionStateWidget;
@@ -137,8 +138,6 @@ mod tests {
     }
 }
 
-const QUERY_PREVIEW_DELAY: Duration = Duration::from_millis(250);
-
 fn create_colored_dot_icon(css_class: &str) -> gtk4::gio::Icon {
     let label = gtk4::Label::new(Some("●"));
     label.add_css_class(css_class);
@@ -189,8 +188,7 @@ pub struct DatabaseTabManager {
     app_state: Rc<RefCell<AppState>>,
     published_app_state: Rc<RefCell<Option<AppState>>>,
     app_state_callbacks: Rc<RefCell<Vec<AppStateCallback>>>,
-    query_preview_generation: Rc<Cell<u64>>,
-    query_preview_timer: Rc<RefCell<Option<glib::SourceId>>>,
+    plan_preview: dzban_core::preview::PlanPreviewService,
     query_preview_manager: Rc<RefCell<Option<QueryTabManager>>>,
 }
 
@@ -236,8 +234,7 @@ impl DatabaseTabManager {
             app_state: Rc::new(RefCell::new(AppState::default())),
             published_app_state: Rc::new(RefCell::new(None)),
             app_state_callbacks: Rc::new(RefCell::new(Vec::new())),
-            query_preview_generation: Rc::new(Cell::new(0)),
-            query_preview_timer: Rc::new(RefCell::new(None)),
+            plan_preview: dzban_core::preview::PlanPreviewService::default(),
             query_preview_manager: Rc::new(RefCell::new(None)),
         };
 
@@ -279,6 +276,7 @@ impl DatabaseTabManager {
         // Handle tab selection changes to update statusbar
         let manager_clone = manager.clone();
         tab_view.connect_selected_page_notify(move |view| {
+            manager_clone.cancel_query_preview();
             if let Some(page) = view.selected_page() {
                 // First, find if this is a database tab
                 let connection = {
@@ -353,74 +351,81 @@ impl DatabaseTabManager {
         let Some(current_page) = self.tab_view.selected_page() else {
             return;
         };
-        let preview_target = self
+        let target = self
             .tabs
             .borrow()
             .values()
             .find(|(page, _, _, _)| page == &current_page)
-            .map(|(_, query_manager, config, _)| (query_manager.clone(), config.connection()));
-        let Some((query_manager, connection)) = preview_target else {
+            .map(|(_, queries, config, _)| (queries.clone(), config.connection()));
+        let Some((queries, connection)) = target else {
+            self.dispatch(AppEvent::PreviewFailed("No query to explain".into()));
             return;
         };
-        if self.query_preview_timer.borrow().is_some()
-            || self.query_preview_manager.borrow().is_some()
-        {
+        let Some((_, sql, document)) = queries.current_query() else {
+            self.dispatch(AppEvent::PreviewFailed("No query to explain".into()));
+            return;
+        };
+        if self.query_preview_manager.borrow().is_some() {
             return;
         }
-        let Some((_, sql, _)) = query_manager.current_query() else {
-            return;
-        };
-
-        let generation = self.query_preview_generation.get().wrapping_add(1);
-        self.query_preview_generation.set(generation);
-
-        let manager = self.clone();
-        let timer = glib::timeout_add_local_once(QUERY_PREVIEW_DELAY, move || {
-            manager.query_preview_timer.borrow_mut().take();
-            if manager.query_preview_generation.get() != generation {
-                return;
-            }
-            if connection.state() != ConnectionState::Connected {
-                manager.dispatch(AppEvent::PreviewFailed(
-                    "Database is not connected".to_string(),
-                ));
-                return;
-            }
-            let Ok(rx) = connection.explain_query(sql) else {
-                return;
-            };
-            if query_manager.highlight_current_query().is_none() {
-                return;
-            }
-            *manager.query_preview_manager.borrow_mut() = Some(query_manager);
-            manager.dispatch(AppEvent::PreviewLoading);
-            let manager_for_result = manager.clone();
-            glib::spawn_future_local(async move {
-                let event = match rx.await {
-                    Ok(Ok(plan)) => AppEvent::PreviewReady(plan),
-                    Ok(Err(error)) => AppEvent::PreviewFailed(error),
-                    Err(_) => AppEvent::PreviewFailed("EXPLAIN was cancelled".to_string()),
-                };
-                if manager_for_result.query_preview_generation.get() == generation {
-                    manager_for_result.dispatch(event);
+        let mut snapshots = self.plan_preview.subscribe();
+        let target =
+            match connection.schedule_preview(self.plan_preview.clone(), document.clone(), sql) {
+                Ok(target) => target,
+                Err(error) => {
+                    self.dispatch(AppEvent::PreviewFailed(error));
+                    return;
                 }
-            });
+            };
+        queries.highlight_current_query();
+        *self.query_preview_manager.borrow_mut() = Some(queries);
+        let manager = self.clone();
+        glib::spawn_future_local(async move {
+            loop {
+                let snapshot = snapshots.borrow_and_update().clone();
+                if snapshot.target != Some(target) {
+                    return;
+                }
+                if snapshot.phase == dzban_core::preview::PreviewPhase::Empty {
+                    manager.clear_preview_view();
+                    return;
+                }
+                if manager.plan_preview.accepts(&snapshot, &document) {
+                    let event = match snapshot.phase {
+                        dzban_core::preview::PreviewPhase::Scheduled => None,
+                        dzban_core::preview::PreviewPhase::Loading => {
+                            Some(AppEvent::PreviewLoading)
+                        }
+                        dzban_core::preview::PreviewPhase::Ready(plan) => {
+                            Some(AppEvent::PreviewReady(plan))
+                        }
+                        dzban_core::preview::PreviewPhase::Failed(error) => {
+                            Some(AppEvent::PreviewFailed(error.to_string()))
+                        }
+                        dzban_core::preview::PreviewPhase::Empty => None,
+                    };
+                    if let Some(event) = event {
+                        manager.dispatch(event);
+                    }
+                }
+                if snapshots.changed().await.is_err() {
+                    return;
+                }
+            }
         });
-        *self.query_preview_timer.borrow_mut() = Some(timer);
+    }
+
+    fn clear_preview_view(&self) {
+        if let Some(queries) = self.query_preview_manager.borrow_mut().take() {
+            queries.clear_query_highlight();
+            queries.close_plan();
+        }
+        self.dispatch(AppEvent::PreviewCancelled);
     }
 
     pub fn cancel_query_preview(&self) {
-        if let Some(timer) = self.query_preview_timer.borrow_mut().take() {
-            timer.remove();
-        }
-        self.query_preview_generation
-            .set(self.query_preview_generation.get().wrapping_add(1));
-        let query_manager = self.query_preview_manager.borrow_mut().take();
-        if let Some(query_manager) = query_manager {
-            query_manager.clear_query_highlight();
-            query_manager.close_plan();
-        }
-        self.dispatch(AppEvent::PreviewCancelled);
+        self.plan_preview.cancel();
+        self.clear_preview_view();
     }
 
     fn dispatch(&self, event: AppEvent) {
@@ -833,6 +838,7 @@ impl DatabaseTabManager {
     ) -> (TabPage, QueryTabManager, ConnectionStateWidget) {
         // Create query tab manager for this database
         let query_manager = QueryTabManager::new(db_name);
+        query_manager.bind_preview_service(self.plan_preview.clone());
         let content = query_manager.get_widget().clone();
 
         // Create connection state widget for tracking state (not displayed in tab)

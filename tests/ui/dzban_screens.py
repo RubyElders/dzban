@@ -248,6 +248,7 @@ password = "testpass"
         wait_for_node(application, "Unpin query plan", "button")
         slow_query = "SELECT pg_sleep(10), 1 AS value"
         editor.text = slow_query
+        wait_for_node_to_disappear(application, "Query Plan")
         run_button = wait_for_node(application, "Run query", "button")
         run_button.do_action_named("click")
         wait_for_node_to_disappear(application, "Query Plan")

@@ -1,88 +1,51 @@
 use gtk4::prelude::*;
 use std::cell::Cell;
 use std::rc::Rc;
-use std::time::Duration;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PreviewRelease {
-    Pin,
-    Hide,
-}
-
-pub const PREVIEW_HOLD: Duration = Duration::from_millis(250);
-
-pub fn preview_release(elapsed: Duration) -> PreviewRelease {
-    if elapsed < PREVIEW_HOLD {
-        PreviewRelease::Pin
-    } else {
-        PreviewRelease::Hide
-    }
-}
+use dzban_core::preview::PeekState;
+pub use dzban_core::preview::{PreviewRelease, preview_release};
 
 #[derive(Clone)]
 pub struct PreviewOverlay {
     widget: gtk4::Widget,
-    pinned: Rc<Cell<bool>>,
+    state: Rc<Cell<PeekState>>,
 }
 
 impl PreviewOverlay {
     pub fn new(widget: &impl IsA<gtk4::Widget>) -> Self {
         Self {
             widget: widget.clone().upcast(),
-            pinned: Rc::new(Cell::new(false)),
+            state: Rc::new(Cell::new(PeekState::default())),
         }
+    }
+
+    fn update(&self, transition: impl FnOnce(&mut PeekState)) {
+        let mut state = self.state.get();
+        transition(&mut state);
+        self.state.set(state);
+        self.widget.set_visible(state.is_visible());
     }
 
     pub fn show_transient(&self) {
-        self.widget.set_visible(true);
+        self.update(PeekState::show_transient);
     }
-
     pub fn hide_transient(&self) {
-        if !self.pinned.get() {
-            self.widget.set_visible(false);
-        }
+        self.update(PeekState::hide_transient);
     }
-
     pub fn pin(&self) -> bool {
-        if !self.widget.is_visible() {
-            return false;
-        }
-        self.pinned.set(true);
-        true
+        let mut accepted = false;
+        self.update(|state| accepted = state.pin());
+        accepted
     }
-
     pub fn close(&self) -> bool {
-        if !self.widget.is_visible() {
-            return false;
-        }
-        self.pinned.set(false);
-        self.widget.set_visible(false);
-        true
+        let mut accepted = false;
+        self.update(|state| accepted = state.close());
+        accepted
     }
-
     pub fn is_visible(&self) -> bool {
-        self.widget.is_visible()
+        self.state.get().is_visible()
     }
-
     pub fn is_pinned(&self) -> bool {
-        self.pinned.get()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn taps_pin_and_holds_hide_on_release() {
-        assert_eq!(
-            preview_release(Duration::from_millis(100)),
-            PreviewRelease::Pin
-        );
-        assert_eq!(preview_release(PREVIEW_HOLD), PreviewRelease::Hide);
-        assert_eq!(
-            preview_release(Duration::from_secs(1)),
-            PreviewRelease::Hide
-        );
+        self.state.get().is_pinned()
     }
 }

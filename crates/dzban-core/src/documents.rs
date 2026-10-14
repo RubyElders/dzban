@@ -50,6 +50,7 @@ pub struct DocumentSnapshot {
     pub lifecycle: DocumentLifecycle,
     pub title: String,
     pub draft: String,
+    pub draft_revision: u64,
     pub execution: DocumentExecution,
     pub session: Option<SessionId>,
     pub output_generation: u64,
@@ -71,6 +72,7 @@ impl QueryDocument {
             lifecycle: DocumentLifecycle::Open,
             title: format!("Query {number}"),
             draft: String::new(),
+            draft_revision: 0,
             execution: DocumentExecution::Idle,
             session: None,
             output_generation: 0,
@@ -119,12 +121,19 @@ impl QueryDocument {
                 return false;
             }
             state.draft = draft;
+            state.draft_revision = state.draft_revision.checked_add(1).unwrap();
             true
         })
     }
 
     pub fn draft(&self) -> String {
         self.state.borrow().draft.clone()
+    }
+
+    pub fn query_context_changed(&self) {
+        self.state.send_modify(|state| {
+            state.draft_revision = state.draft_revision.checked_add(1).unwrap();
+        });
     }
 
     pub fn is_active(&self) -> bool {

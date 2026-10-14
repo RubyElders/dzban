@@ -48,6 +48,22 @@ impl std::fmt::Debug for RuntimeBridge {
 }
 
 impl RuntimeBridge {
+    pub fn schedule_preview(
+        &self,
+        connection: InternalConnection,
+        service: dzban_core::preview::PlanPreviewService,
+        document: dzban_core::documents::QueryDocument,
+        sql: String,
+    ) -> Result<dzban_core::preview::PreviewTarget, dzban_core::error::ExecutionError> {
+        let _runtime = self.runtime.enter();
+        service.schedule(
+            connection.engine(),
+            document,
+            sql,
+            dzban_core::preview::PREVIEW_DELAY,
+        )
+    }
+
     pub fn start_streamed(
         &self,
         connection: InternalConnection,
