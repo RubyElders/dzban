@@ -956,6 +956,20 @@ impl DbConnection {
     }
 
     pub fn cancel_query(&self) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+        self.cancel_query_for(None)
+    }
+
+    pub fn cancel_query_identified(
+        &self,
+        query: dzban_core::execution::QueryId,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+        self.cancel_query_for(Some(query))
+    }
+
+    fn cancel_query_for(
+        &self,
+        query: Option<dzban_core::execution::QueryId>,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let Some(db_conn) = self.imp().db_connection.borrow().clone() else {
             let _ = tx.send(Err("Not connected".to_string()));
@@ -967,7 +981,10 @@ impl DbConnection {
             .get()
             .expect("RuntimeBridge not initialized")
             .clone();
-        let request = bridge.cancel_query(db_conn);
+        let request = match query {
+            Some(query) => bridge.cancel_query_identified(db_conn, query),
+            None => bridge.cancel_query(db_conn),
+        };
         glib::MainContext::ref_thread_default().spawn_local(async move {
             let result = request
                 .await

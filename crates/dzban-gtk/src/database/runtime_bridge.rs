@@ -531,7 +531,6 @@ impl RuntimeBridge {
     }
 
     pub fn cancel_query(&self, conn: InternalConnection) -> oneshot::Receiver<Result<(), String>> {
-        let (tx, rx) = oneshot::channel();
         let engine = conn.engine();
         let state = engine.subscribe();
         let id = match state.borrow().phase {
@@ -540,13 +539,23 @@ impl RuntimeBridge {
             | dzban_core::execution::QueryPhase::Executing(id) => Some(id),
             _ => None,
         };
+        if let Some(id) = id {
+            return self.cancel_query_identified(conn, id);
+        }
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(Ok(()));
+        rx
+    }
+
+    pub fn cancel_query_identified(
+        &self,
+        conn: InternalConnection,
+        id: dzban_core::execution::QueryId,
+    ) -> oneshot::Receiver<Result<(), String>> {
+        let (tx, rx) = oneshot::channel();
+        let engine = conn.engine();
         self.runtime.spawn(async move {
-            let result = if let Some(id) = id {
-                engine.cancel(id).await
-            } else {
-                Ok(())
-            };
-            let _ = tx.send(result);
+            let _ = tx.send(engine.cancel(id).await);
         });
         rx
     }
