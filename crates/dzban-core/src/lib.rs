@@ -6,6 +6,7 @@ pub mod config;
 pub mod error;
 pub mod execution;
 pub mod history;
+pub mod interaction;
 pub mod result;
 pub mod result_store;
 pub mod result_stream;
