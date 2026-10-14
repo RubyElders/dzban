@@ -21,20 +21,49 @@ fn plan_scroll(key: gtk4::gdk::Key) -> Option<PlanScroll> {
     }
 }
 
-fn input_key(key: gtk4::gdk::Key) -> Option<dzban_gtk::database::InputKey> {
+fn input_role(key: gtk4::gdk::Key) -> Option<dzban_gtk::database::InputRole> {
     match key {
-        gtk4::gdk::Key::Escape => Some(dzban_gtk::database::InputKey::Escape),
+        gtk4::gdk::Key::Escape => Some(dzban_gtk::database::InputRole::Cancel),
         gtk4::gdk::Key::Control_L | gtk4::gdk::Key::Control_R => {
-            Some(dzban_gtk::database::InputKey::Control)
+            Some(dzban_gtk::database::InputRole::PrimaryModifier)
         }
         gtk4::gdk::Key::Shift_L | gtk4::gdk::Key::Shift_R => {
-            Some(dzban_gtk::database::InputKey::Shift)
+            Some(dzban_gtk::database::InputRole::PreviewModifier)
         }
-        gtk4::gdk::Key::space => Some(dzban_gtk::database::InputKey::Space),
+        gtk4::gdk::Key::space => Some(dzban_gtk::database::InputRole::Inspect),
         gtk4::gdk::Key::Return | gtk4::gdk::Key::KP_Enter => {
-            Some(dzban_gtk::database::InputKey::Enter)
+            Some(dzban_gtk::database::InputRole::Submit)
         }
         _ => None,
+    }
+}
+
+#[derive(Default)]
+struct InputBindings {
+    pressed: std::collections::BTreeSet<gtk4::gdk::Key>,
+}
+
+impl InputBindings {
+    fn press(&mut self, key: gtk4::gdk::Key) -> Option<dzban_gtk::database::InputRole> {
+        let role = input_role(key)?;
+        self.pressed.insert(key);
+        Some(role)
+    }
+
+    fn release(&mut self, key: gtk4::gdk::Key) -> Option<dzban_gtk::database::InputRole> {
+        if !self.pressed.remove(&key) {
+            return None;
+        }
+        let role = input_role(key)?;
+        (!self
+            .pressed
+            .iter()
+            .any(|key| input_role(*key) == Some(role)))
+        .then_some(role)
+    }
+
+    fn reset(&mut self) {
+        self.pressed.clear();
     }
 }
 
@@ -79,8 +108,11 @@ pub fn build_ui(app: &Application) {
     let db_manager_for_preview = db_tab_manager.clone();
     let input_clock = std::rc::Rc::new(std::time::Instant::now());
     let press_clock = input_clock.clone();
+    let bindings = std::rc::Rc::new(std::cell::RefCell::new(InputBindings::default()));
+    let press_bindings = bindings.clone();
     query_preview_controller.connect_key_pressed(move |_, key, _, _| {
-        if let Some(key) = input_key(key)
+        let role = press_bindings.borrow_mut().press(key);
+        if let Some(key) = role
             && db_manager_for_preview
                 .handle_input_pressed(key, press_clock.elapsed().as_millis() as u64)
         {
@@ -94,8 +126,10 @@ pub fn build_ui(app: &Application) {
         gtk4::glib::Propagation::Proceed
     });
     let db_manager_for_preview = db_tab_manager.clone();
+    let release_bindings = bindings.clone();
     query_preview_controller.connect_key_released(move |_, key, _, _| {
-        if let Some(key) = input_key(key) {
+        let role = release_bindings.borrow_mut().release(key);
+        if let Some(key) = role {
             db_manager_for_preview
                 .handle_input_released(key, input_clock.elapsed().as_millis() as u64);
         }
@@ -104,6 +138,7 @@ pub fn build_ui(app: &Application) {
     let db_manager_for_focus = db_tab_manager.clone();
     window.connect_is_active_notify(move |window| {
         if !window.is_active() {
+            bindings.borrow_mut().reset();
             db_manager_for_focus.reset_input();
         }
     });
@@ -505,7 +540,7 @@ fn create_header_bar(
                 search_for_preview.set_tooltip_text(None);
                 clear_progress(&progress_for_preview);
             }
-            dzban_gtk::database::ActionHint::ControlGuide => {
+            dzban_gtk::database::ActionHint::PrimaryGuide => {
                 search_container_for_state.add_css_class("guidance");
                 search_for_preview.set_tooltip_text(Some("Ctrl is held"));
                 clear_progress(&progress_for_preview);
@@ -989,7 +1024,7 @@ fn create_header_bar(
 fn query_action_message(state: &dzban_gtk::database::AppState) -> String {
     match state.action_hint() {
         dzban_gtk::database::ActionHint::Default => default_action_hint(),
-        dzban_gtk::database::ActionHint::ControlGuide => {
+        dzban_gtk::database::ActionHint::PrimaryGuide => {
             "Enter: run - Shift: estimate - Shift+Enter: estimate and run".to_string()
         }
         dzban_gtk::database::ActionHint::Estimating => {
@@ -1176,26 +1211,51 @@ mod tests {
     #[test]
     fn keyboard_adapter_maps_interaction_keys() {
         assert_eq!(
-            input_key(gtk4::gdk::Key::Escape),
-            Some(dzban_gtk::database::InputKey::Escape)
+            input_role(gtk4::gdk::Key::Escape),
+            Some(dzban_gtk::database::InputRole::Cancel)
         );
         assert_eq!(
-            input_key(gtk4::gdk::Key::Control_L),
-            Some(dzban_gtk::database::InputKey::Control)
+            input_role(gtk4::gdk::Key::Control_L),
+            Some(dzban_gtk::database::InputRole::PrimaryModifier)
         );
         assert_eq!(
-            input_key(gtk4::gdk::Key::Shift_R),
-            Some(dzban_gtk::database::InputKey::Shift)
+            input_role(gtk4::gdk::Key::Shift_R),
+            Some(dzban_gtk::database::InputRole::PreviewModifier)
         );
         assert_eq!(
-            input_key(gtk4::gdk::Key::space),
-            Some(dzban_gtk::database::InputKey::Space)
+            input_role(gtk4::gdk::Key::space),
+            Some(dzban_gtk::database::InputRole::Inspect)
         );
         assert_eq!(
-            input_key(gtk4::gdk::Key::Return),
-            Some(dzban_gtk::database::InputKey::Enter)
+            input_role(gtk4::gdk::Key::Return),
+            Some(dzban_gtk::database::InputRole::Submit)
         );
-        assert_eq!(input_key(gtk4::gdk::Key::Down), None);
+        assert_eq!(input_role(gtk4::gdk::Key::Down), None);
+    }
+
+    #[test]
+    fn input_aliases_release_only_after_the_last_physical_key_and_reset_on_focus_loss() {
+        use dzban_gtk::database::InputRole;
+        use gtk4::gdk::Key;
+        let mut bindings = InputBindings::default();
+        for (left, right, role) in [
+            (Key::Control_L, Key::Control_R, InputRole::PrimaryModifier),
+            (Key::Shift_L, Key::Shift_R, InputRole::PreviewModifier),
+            (Key::Return, Key::KP_Enter, InputRole::Submit),
+        ] {
+            assert_eq!(bindings.press(left), Some(role));
+            assert_eq!(bindings.press(left), Some(role));
+            assert_eq!(bindings.press(right), Some(role));
+            assert_eq!(bindings.release(left), None);
+            assert_eq!(bindings.release(right), Some(role));
+            assert_eq!(bindings.release(right), None);
+            bindings.press(left);
+            bindings.reset();
+            assert_eq!(bindings.release(left), None);
+            assert_eq!(bindings.press(right), Some(role));
+            assert_eq!(bindings.release(right), Some(role));
+        }
+        assert_eq!(bindings.press(Key::a), None);
     }
 
     #[test]
@@ -1218,11 +1278,11 @@ mod tests {
             true,
         ));
         state.transition(dzban_gtk::database::AppEvent::KeyPressed {
-            key: dzban_gtk::database::InputKey::Control,
+            key: dzban_gtk::database::InputRole::PrimaryModifier,
             at_ms: 0,
         });
         state.transition(dzban_gtk::database::AppEvent::KeyPressed {
-            key: dzban_gtk::database::InputKey::Shift,
+            key: dzban_gtk::database::InputRole::PreviewModifier,
             at_ms: 1,
         });
         state.transition(dzban_gtk::database::AppEvent::PreviewReady(
@@ -1254,11 +1314,11 @@ mod tests {
             true,
         ));
         state.transition(dzban_gtk::database::AppEvent::KeyPressed {
-            key: dzban_gtk::database::InputKey::Control,
+            key: dzban_gtk::database::InputRole::PrimaryModifier,
             at_ms: 0,
         });
         state.transition(dzban_gtk::database::AppEvent::KeyPressed {
-            key: dzban_gtk::database::InputKey::Shift,
+            key: dzban_gtk::database::InputRole::PreviewModifier,
             at_ms: 1,
         });
         state.transition(dzban_gtk::database::AppEvent::PreviewReady(
@@ -1327,11 +1387,11 @@ mod tests {
             true,
         ));
         state.transition(dzban_gtk::database::AppEvent::KeyPressed {
-            key: dzban_gtk::database::InputKey::Control,
+            key: dzban_gtk::database::InputRole::PrimaryModifier,
             at_ms: 0,
         });
         state.transition(dzban_gtk::database::AppEvent::KeyPressed {
-            key: dzban_gtk::database::InputKey::Shift,
+            key: dzban_gtk::database::InputRole::PreviewModifier,
             at_ms: 1,
         });
         state.transition(dzban_gtk::database::AppEvent::PreviewFailed(

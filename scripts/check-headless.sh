@@ -10,5 +10,6 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$repo_root/target/headless}"
 toolchain="${DZBAN_TEST_TOOLCHAIN:-1.88.0}"
 
 cargo "+$toolchain" build --locked -p dzban-cli --bin dzb
+bash scripts/check-portable.sh
 cargo "+$toolchain" metadata --locked --format-version 1 > /dev/null
 cargo "+$toolchain" test --locked -p dzban-core -p dzban-db -p dzban-cli --all-targets

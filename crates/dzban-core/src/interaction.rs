@@ -5,21 +5,21 @@ use crate::QueryPlan;
 pub const PREVIEW_HOLD_MS: u64 = crate::preview::PREVIEW_HOLD.as_millis() as u64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum InputKey {
-    Control,
-    Shift,
-    Space,
-    Enter,
-    Escape,
+pub enum InputRole {
+    PrimaryModifier,
+    PreviewModifier,
+    Inspect,
+    Submit,
+    Cancel,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct KeyboardState {
-    pressed: BTreeMap<InputKey, u64>,
+    pressed: BTreeMap<InputRole, u64>,
 }
 
 impl KeyboardState {
-    pub fn is_pressed(&self, key: InputKey) -> bool {
+    pub fn is_pressed(&self, key: InputRole) -> bool {
         self.pressed.contains_key(&key)
     }
 }
@@ -73,11 +73,11 @@ pub enum AppEvent {
         execution: QueryExecutionState,
     },
     KeyPressed {
-        key: InputKey,
+        key: InputRole,
         at_ms: u64,
     },
     KeyReleased {
-        key: InputKey,
+        key: InputRole,
         at_ms: u64,
     },
     KeyboardReset,
@@ -178,7 +178,7 @@ pub enum AppCommand {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ActionHint {
     Default,
-    ControlGuide,
+    PrimaryGuide,
     Estimating,
     EstimateReady(QueryPlan),
     EstimateError(String),
@@ -256,7 +256,7 @@ impl AppState {
             AppEvent::PreviewReady(plan) => {
                 self.preview = PlanPreviewState::Ready(plan);
                 match self.plan_visibility {
-                    PlanVisibility::Transient if self.keyboard.is_pressed(InputKey::Space) => {
+                    PlanVisibility::Transient if self.keyboard.is_pressed(InputRole::Inspect) => {
                         vec![AppCommand::ShowPlan]
                     }
                     PlanVisibility::Pinned => {
@@ -316,16 +316,15 @@ impl AppState {
             QueryExecutionState::Canceling { plan } => return ActionHint::Canceling(plan.clone()),
             QueryExecutionState::Idle => {}
         }
-        if !self.keyboard.is_pressed(InputKey::Control) {
+        if !self.preview_available() || !self.keyboard.is_pressed(InputRole::PrimaryModifier) {
             return ActionHint::Default;
         }
-        if !self.keyboard.is_pressed(InputKey::Shift) {
-            return ActionHint::ControlGuide;
+        if !self.keyboard.is_pressed(InputRole::PreviewModifier) {
+            return ActionHint::PrimaryGuide;
         }
         match &self.preview {
-            PlanPreviewState::Empty | PlanPreviewState::Scheduled | PlanPreviewState::Loading => {
-                ActionHint::Estimating
-            }
+            PlanPreviewState::Empty => ActionHint::PrimaryGuide,
+            PlanPreviewState::Scheduled | PlanPreviewState::Loading => ActionHint::Estimating,
             PlanPreviewState::Ready(plan) => ActionHint::EstimateReady(plan.clone()),
             PlanPreviewState::Error(error) => ActionHint::EstimateError(error.clone()),
         }
@@ -342,26 +341,32 @@ impl AppState {
         }
     }
 
-    pub fn captures_key(&self, key: InputKey) -> bool {
-        if key == InputKey::Escape {
+    pub fn captures_key(&self, key: InputRole) -> bool {
+        if key == InputRole::Cancel {
             return self.execution != QueryExecutionState::Idle;
         }
-        self.keyboard.is_pressed(InputKey::Control)
-            && (key == InputKey::Enter
-                || (key == InputKey::Space && self.keyboard.is_pressed(InputKey::Shift)))
+        self.keyboard.is_pressed(InputRole::PrimaryModifier)
+            && (key == InputRole::Submit
+                || (key == InputRole::Inspect
+                    && self.keyboard.is_pressed(InputRole::PreviewModifier)))
     }
 
-    fn key_pressed(&mut self, key: InputKey, at_ms: u64) -> Vec<AppCommand> {
+    fn preview_available(&self) -> bool {
+        self.execution == QueryExecutionState::Idle
+            && (self.query_available || self.preview != PlanPreviewState::Empty)
+    }
+
+    fn key_pressed(&mut self, key: InputRole, at_ms: u64) -> Vec<AppCommand> {
         if self.keyboard.pressed.contains_key(&key) {
             return Vec::new();
         }
         self.keyboard.pressed.insert(key, at_ms);
-        let control = self.keyboard.is_pressed(InputKey::Control);
-        let shift = self.keyboard.is_pressed(InputKey::Shift);
+        let primary = self.keyboard.is_pressed(InputRole::PrimaryModifier);
+        let preview_modifier = self.keyboard.is_pressed(InputRole::PreviewModifier);
         match key {
-            InputKey::Escape => self.transition(AppEvent::CancelRequested),
-            InputKey::Shift | InputKey::Control
-                if control && shift && self.execution == QueryExecutionState::Idle =>
+            InputRole::Cancel => self.transition(AppEvent::CancelRequested),
+            InputRole::PreviewModifier | InputRole::PrimaryModifier
+                if primary && preview_modifier && self.preview_available() =>
             {
                 if matches!(self.preview, PlanPreviewState::Empty) {
                     self.preview = PlanPreviewState::Scheduled;
@@ -370,7 +375,7 @@ impl AppState {
                     Vec::new()
                 }
             }
-            InputKey::Space if control && shift && self.execution == QueryExecutionState::Idle => {
+            InputRole::Inspect if primary && preview_modifier && self.preview_available() => {
                 self.plan_visibility = PlanVisibility::Transient;
                 let mut commands = Vec::new();
                 if matches!(self.preview, PlanPreviewState::Empty) {
@@ -382,19 +387,19 @@ impl AppState {
                 }
                 commands
             }
-            InputKey::Enter if control && self.primary_action() == PrimaryAction::Run => {
+            InputRole::Submit if primary && self.primary_action() == PrimaryAction::Run => {
                 vec![AppCommand::RunQuery]
             }
             _ => Vec::new(),
         }
     }
 
-    fn key_released(&mut self, key: InputKey, at_ms: u64) -> Vec<AppCommand> {
+    fn key_released(&mut self, key: InputRole, at_ms: u64) -> Vec<AppCommand> {
         let Some(pressed_at) = self.keyboard.pressed.remove(&key) else {
             return Vec::new();
         };
         match key {
-            InputKey::Space if self.plan_visibility == PlanVisibility::Transient => {
+            InputRole::Inspect if self.plan_visibility == PlanVisibility::Transient => {
                 if at_ms.saturating_sub(pressed_at) < PREVIEW_HOLD_MS {
                     self.plan_visibility = PlanVisibility::Pinned;
                     vec![AppCommand::PinPlan]
@@ -403,7 +408,7 @@ impl AppState {
                     vec![AppCommand::HidePlan, AppCommand::CancelPreview]
                 }
             }
-            InputKey::Control | InputKey::Shift
+            InputRole::PrimaryModifier | InputRole::PreviewModifier
                 if self.plan_visibility != PlanVisibility::Pinned =>
             {
                 self.plan_visibility = PlanVisibility::Hidden;
@@ -431,19 +436,19 @@ mod tests {
     }
 
     #[test]
-    fn control_exposes_guidance_and_shift_requests_an_estimate() {
+    fn primary_exposes_guidance_and_preview_modifier_requests_an_estimate() {
         let mut state = AppState {
             query_available: true,
             ..AppState::default()
         };
         state.transition(AppEvent::KeyPressed {
-            key: InputKey::Control,
+            key: InputRole::PrimaryModifier,
             at_ms: 0,
         });
-        assert_eq!(state.action_hint(), ActionHint::ControlGuide);
+        assert_eq!(state.action_hint(), ActionHint::PrimaryGuide);
         assert_eq!(
             state.transition(AppEvent::KeyPressed {
-                key: InputKey::Shift,
+                key: InputRole::PreviewModifier,
                 at_ms: 10,
             }),
             vec![AppCommand::BeginPreview]
@@ -452,7 +457,7 @@ mod tests {
     }
 
     #[test]
-    fn space_tap_pins_but_hold_hides_the_plan() {
+    fn inspect_tap_pins_but_hold_hides_the_plan() {
         for (released_at, expected, visibility) in [
             (100, AppCommand::PinPlan, PlanVisibility::Pinned),
             (
@@ -462,18 +467,18 @@ mod tests {
             ),
         ] {
             let mut state = AppState::default();
-            state.keyboard.pressed.insert(InputKey::Control, 0);
-            state.keyboard.pressed.insert(InputKey::Shift, 0);
+            state.keyboard.pressed.insert(InputRole::PrimaryModifier, 0);
+            state.keyboard.pressed.insert(InputRole::PreviewModifier, 0);
             state.preview = PlanPreviewState::Ready(plan());
             assert_eq!(
                 state.transition(AppEvent::KeyPressed {
-                    key: InputKey::Space,
+                    key: InputRole::Inspect,
                     at_ms: 0,
                 }),
                 vec![AppCommand::ShowPlan]
             );
             let commands = state.transition(AppEvent::KeyReleased {
-                key: InputKey::Space,
+                key: InputRole::Inspect,
                 at_ms: released_at,
             });
             assert_eq!(commands[0], expected);
@@ -483,19 +488,22 @@ mod tests {
 
     #[test]
     fn a_tap_before_the_estimate_arrives_opens_and_pins_it_when_ready() {
-        let mut state = AppState::default();
-        state.keyboard.pressed.insert(InputKey::Control, 0);
-        state.keyboard.pressed.insert(InputKey::Shift, 0);
+        let mut state = AppState {
+            query_available: true,
+            ..AppState::default()
+        };
+        state.keyboard.pressed.insert(InputRole::PrimaryModifier, 0);
+        state.keyboard.pressed.insert(InputRole::PreviewModifier, 0);
         assert_eq!(
             state.transition(AppEvent::KeyPressed {
-                key: InputKey::Space,
+                key: InputRole::Inspect,
                 at_ms: 10,
             }),
             vec![AppCommand::BeginPreview]
         );
         assert_eq!(
             state.transition(AppEvent::KeyReleased {
-                key: InputKey::Space,
+                key: InputRole::Inspect,
                 at_ms: 100,
             }),
             vec![AppCommand::PinPlan]
@@ -539,7 +547,7 @@ mod tests {
     }
 
     #[test]
-    fn escape_cancels_active_work_and_leaves_idle_preview_handling_to_the_frontend() {
+    fn cancel_role_stops_active_work_and_leaves_idle_preview_handling_to_the_frontend() {
         for execution in [
             QueryExecutionState::Planning,
             QueryExecutionState::Running { plan: None },
@@ -548,10 +556,10 @@ mod tests {
                 execution,
                 ..AppState::default()
             };
-            assert!(state.captures_key(InputKey::Escape));
+            assert!(state.captures_key(InputRole::Cancel));
             assert_eq!(
                 state.transition(AppEvent::KeyPressed {
-                    key: InputKey::Escape,
+                    key: InputRole::Cancel,
                     at_ms: 0
                 }),
                 vec![AppCommand::CancelQuery]
@@ -559,35 +567,35 @@ mod tests {
             assert!(
                 state
                     .transition(AppEvent::KeyPressed {
-                        key: InputKey::Escape,
+                        key: InputRole::Cancel,
                         at_ms: 1
                     })
                     .is_empty()
             );
             state.transition(AppEvent::QueryCanceling);
             state.transition(AppEvent::KeyReleased {
-                key: InputKey::Escape,
+                key: InputRole::Cancel,
                 at_ms: 2,
             });
-            assert!(state.captures_key(InputKey::Escape));
+            assert!(state.captures_key(InputRole::Cancel));
             assert!(
                 state
                     .transition(AppEvent::KeyPressed {
-                        key: InputKey::Escape,
+                        key: InputRole::Cancel,
                         at_ms: 3
                     })
                     .is_empty()
             );
             state.transition(AppEvent::QueryFinished);
             state.transition(AppEvent::KeyReleased {
-                key: InputKey::Escape,
+                key: InputRole::Cancel,
                 at_ms: 4,
             });
-            assert!(!state.captures_key(InputKey::Escape));
+            assert!(!state.captures_key(InputRole::Cancel));
             assert!(
                 state
                     .transition(AppEvent::KeyPressed {
-                        key: InputKey::Escape,
+                        key: InputRole::Cancel,
                         at_ms: 5
                     })
                     .is_empty()
@@ -596,15 +604,18 @@ mod tests {
     }
 
     #[test]
-    fn one_chord_schedules_one_estimate_and_captures_space_repeats() {
-        let mut state = AppState::default();
+    fn one_chord_schedules_one_estimate_and_captures_inspect_repeats() {
+        let mut state = AppState {
+            query_available: true,
+            ..AppState::default()
+        };
         state.transition(AppEvent::KeyPressed {
-            key: InputKey::Control,
+            key: InputRole::PrimaryModifier,
             at_ms: 0,
         });
         assert_eq!(
             state.transition(AppEvent::KeyPressed {
-                key: InputKey::Shift,
+                key: InputRole::PreviewModifier,
                 at_ms: 1
             }),
             vec![AppCommand::BeginPreview]
@@ -613,23 +624,23 @@ mod tests {
         assert!(
             state
                 .transition(AppEvent::KeyPressed {
-                    key: InputKey::Space,
+                    key: InputRole::Inspect,
                     at_ms: 10
                 })
                 .is_empty()
         );
-        assert!(state.captures_key(InputKey::Space));
+        assert!(state.captures_key(InputRole::Inspect));
         assert!(
             state
                 .transition(AppEvent::KeyPressed {
-                    key: InputKey::Space,
+                    key: InputRole::Inspect,
                     at_ms: 500
                 })
                 .is_empty()
         );
         assert_eq!(
             state.transition(AppEvent::KeyReleased {
-                key: InputKey::Space,
+                key: InputRole::Inspect,
                 at_ms: 600
             }),
             vec![AppCommand::HidePlan, AppCommand::CancelPreview]
