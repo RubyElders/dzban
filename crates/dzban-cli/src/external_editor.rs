@@ -131,7 +131,10 @@ mod tests {
 
     #[test]
     fn edited_unicode_multiline_sql_is_returned_without_execution() {
-        assert_eq!(edit("/bin/true", "SELECT 1;\n").unwrap(), "SELECT 1;\n");
+        assert_eq!(
+            edit("/bin/sh -c 'exit 0'", "SELECT 1;\n").unwrap(),
+            "SELECT 1;\n"
+        );
         let command = r#"/bin/sh -c 'printf "SELECT 2;\n-- unicode: \303\251\n" > "$1"' editor"#;
         assert_eq!(
             edit(command, "old SQL").unwrap(),
@@ -144,7 +147,7 @@ mod tests {
         assert!(edit("'", "SQL").is_err());
         assert!(edit("", "SQL").is_err());
         assert!(
-            edit("/bin/false", "SQL")
+            edit("/bin/sh -c 'exit 1'", "SQL")
                 .unwrap_err()
                 .contains("Editor exited")
         );

@@ -123,7 +123,7 @@ async fn empty_schema_rows_and_pager_early_exit_preserve_contracts() {
     let decoded: ResultSet = serde_json::from_slice(&writer).unwrap();
     assert_eq!(decoded, fixture);
     let result = captured(&self::fixture(), 10_000).await;
-    dzban_cli::pager::run_streamed("/bin/true", &result, OutputFormat::Json)
+    dzban_cli::pager::run_streamed("/bin/sh -c 'exit 0'", &result, OutputFormat::Json)
         .await
         .unwrap();
     assert!(

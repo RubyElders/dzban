@@ -59,7 +59,7 @@ mod tests {
 
     #[test]
     fn early_exit_is_not_an_output_failure() {
-        run("/bin/true", &"large result\n".repeat(100_000)).unwrap();
+        run("/bin/sh -c 'exit 0'", &"large result\n".repeat(100_000)).unwrap();
     }
 
     #[test]
@@ -71,7 +71,7 @@ mod tests {
                 .contains("Cannot start pager")
         );
         assert!(
-            run("/bin/false", "result")
+            run("/bin/sh -c 'exit 1'", "result")
                 .unwrap_err()
                 .contains("Pager exited")
         );
