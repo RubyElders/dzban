@@ -1,0 +1,15 @@
+[package]
+name = "dzban-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+url = "2"
+async-trait.workspace = true
+uuid.workspace = true
+tracing.workspace = true

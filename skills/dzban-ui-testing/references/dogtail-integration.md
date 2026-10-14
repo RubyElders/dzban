@@ -18,4 +18,13 @@ Keep these invariants:
 - Poll observable UI state with bounded timeouts. Include `dump_tree()` in failures instead of adding fixed sleeps.
 - Exercise dynamic screens in the same application process when they are part of one workflow. Restarting an application within the same Python process can leave stale libatspi application objects.
 
-The maintained scenarios cover the empty connection state, shortcut reference, configured connection workspace, SQL editing, successful results, persisted history plan, plan inspector, and query failure state.
+The maintained scenarios cover the empty connection state, shortcut reference, configured PostgreSQL and ClickHouse workspaces, SQL editing, successful results, persisted history plan, plan inspector, and query failure state. The shutdown scenario requests window close during an active query, verifies that the application remains open with a retry message, cancels the query, and checks successful process exit after another close request.
+
+The `streaming-postgres` and `streaming-clickhouse` scenarios verify rows appearing
+while the query remains cancelable, cancellation and restart, the 10,000-row cutoff
+notice, the 32-MiB cutoff with wide values, and a row preview retaining values
+longer than the table projection. Hover coverage checks the full cell tooltip and
+its dismissal when moving away. Use the action menu to focus results before
+keyboard replay; a table's AT-SPI focus request alone does not prove GTK keyboard
+routing. Set explicit short input delays
+when testing tap-to-pin so the driver does not accidentally exercise hold-to-peek.

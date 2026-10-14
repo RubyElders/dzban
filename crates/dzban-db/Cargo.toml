@@ -9,8 +9,7 @@ name = "dzban_db"
 path = "src/lib.rs"
 
 [dependencies]
-# UI-independent - only GLib, no GTK!
-glib.workspace = true
+dzban-core = { path = "../dzban-core" }
 tokio.workspace = true
 tokio-postgres.workspace = true
 tokio-postgres-rustls.workspace = true
@@ -20,6 +19,7 @@ toml.workspace = true
 async-trait.workspace = true
 reqwest.workspace = true
 uuid.workspace = true
+futures-util = "=0.3.31"
 
 # Logging
 tracing.workspace = true

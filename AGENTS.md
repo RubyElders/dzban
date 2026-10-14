@@ -7,6 +7,10 @@
 
 ## Required validation
 
+The shared/frontend boundary is documented in `docs/frontend-integration.md`.
+Run `bash scripts/check-portable.sh` for the all-target dependency guard and
+`bash scripts/check-headless.sh` to build/test without native frontend libraries.
+
 Choose tests based on the behavior changed. Compilation is not runtime or visual validation.
 
 - Pure logic: add and run ordinary unit tests.
@@ -19,7 +23,11 @@ Choose tests based on the behavior changed. Compilation is not runtime or visual
 
 Run `skills/dzban-ui-testing/scripts/run-dogtail-integration.sh` for screen-level workflows. It uses pinned Dogtail through `uv`, a private Mutter/D-Bus/AT-SPI session, temporary application data, and disposable PostgreSQL and ClickHouse fixtures.
 
+Run `bash scripts/test-gtk.sh` for display-backed widget and injected-adapter lifecycle tests. It uses Xvfb, a private D-Bus session, empty configuration, and temporary application data without database services.
+
 Run the workspace test suite, strict Clippy, formatting check, and `git diff --check` before handoff. Report ignored and skipped coverage explicitly.
+
+Run `bash scripts/test-cli.sh` for ShellSpec CLI process contracts. The database runner enables its PTY case with `DZBAN_TEST_DATABASES=1`. Test actual terminal key sequences, not only editor reducer calls or `\g` submission; cover Enter, Ctrl+Enter, multiline input, quit, catalog listing, cancellation, and pager handoff.
 
 ## Adding tests
 

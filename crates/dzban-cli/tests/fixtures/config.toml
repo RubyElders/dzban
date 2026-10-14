@@ -1,0 +1,15 @@
+[[databases]]
+name = "pg"
+host = "localhost"
+port = 5415
+user = "testuser"
+password = "testpass"
+database = "testdb"
+
+[[databases]]
+name = "ch"
+backend = "clickhouse"
+url = "http://localhost:58123"
+user = "dzban"
+password = "dzban-test"
+database = "dzban_test"
