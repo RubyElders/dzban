@@ -16,6 +16,7 @@ pub type PlannedQueryReceivers = (
 
 pub struct StreamedQueryDelivery {
     pub id: dzban_core::execution::QueryId,
+    pub generation: Option<u64>,
     pub state: tokio::sync::watch::Receiver<dzban_core::execution::QuerySnapshot>,
     pub result: QueryReceiver<
         dzban_core::execution::StreamedQueryResult,
@@ -214,6 +215,22 @@ impl DbConnection {
         &self,
         sql: String,
     ) -> Result<StreamedQueryDelivery, String> {
+        self.execute_recorded_for_document(sql, None)
+    }
+
+    pub fn execute_document_query(
+        &self,
+        document: dzban_core::documents::QueryDocument,
+        sql: String,
+    ) -> Result<StreamedQueryDelivery, String> {
+        self.execute_recorded_for_document(sql, Some(document))
+    }
+
+    fn execute_recorded_for_document(
+        &self,
+        sql: String,
+        document: Option<dzban_core::documents::QueryDocument>,
+    ) -> Result<StreamedQueryDelivery, String> {
         let config = self
             .imp()
             .database_config
@@ -226,13 +243,22 @@ impl DbConnection {
                 None
             }
         };
-        self.execute_streamed_query(sql, history)
+        self.execute_streamed_for_document(sql, history, document)
     }
 
     pub fn execute_streamed_query(
         &self,
         sql: String,
         history: Option<dzban_core::history::QueryHistoryStore>,
+    ) -> Result<StreamedQueryDelivery, String> {
+        self.execute_streamed_for_document(sql, history, None)
+    }
+
+    fn execute_streamed_for_document(
+        &self,
+        sql: String,
+        history: Option<dzban_core::history::QueryHistoryStore>,
+        document: Option<dzban_core::documents::QueryDocument>,
     ) -> Result<StreamedQueryDelivery, String> {
         let connection = self
             .imp()
@@ -246,11 +272,14 @@ impl DbConnection {
             .get()
             .expect("RuntimeBridge initialized")
             .clone();
-        let delivery = bridge
-            .start_streamed(connection, sql.clone(), history)
-            .map_err(|error| error.to_string())?;
+        let delivery = match document {
+            Some(document) => bridge.start_document(connection, document, sql.clone(), history),
+            None => bridge.start_streamed(connection, sql.clone(), history),
+        }
+        .map_err(|error| error.to_string())?;
         self.begin_query(&sql);
         let id = delivery.id;
+        let generation = delivery.generation;
         let state = delivery.state;
         let (sender, result) = tokio::sync::oneshot::channel();
         let this = self.clone();
@@ -292,6 +321,7 @@ impl DbConnection {
         });
         Ok(StreamedQueryDelivery {
             id,
+            generation,
             state,
             result,
             bridge,
@@ -964,6 +994,32 @@ impl DbConnection {
         query: dzban_core::execution::QueryId,
     ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
         self.cancel_query_for(Some(query))
+    }
+
+    pub fn cancel_document(
+        &self,
+        document: dzban_core::documents::QueryDocument,
+    ) -> Result<QueryReceiver<()>, String> {
+        let connection = self
+            .imp()
+            .db_connection
+            .borrow()
+            .clone()
+            .ok_or_else(|| "Not connected".to_string())?;
+        self.imp()
+            .runtime_bridge
+            .get()
+            .expect("RuntimeBridge initialized")
+            .cancel_document(connection, document)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn query_scope(&self) -> Option<dzban_core::execution::QueryScope> {
+        self.imp()
+            .db_connection
+            .borrow()
+            .as_ref()
+            .map(|connection| connection.engine().subscribe().borrow().scope())
     }
 
     fn cancel_query_for(

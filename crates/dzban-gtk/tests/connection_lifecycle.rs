@@ -91,6 +91,18 @@ impl DatabaseSession for Session {
         }
         Ok(dzban_core::ExecutionOutcome::Rows(self.execute(sql).await?))
     }
+    async fn execute_streamed(
+        &self,
+        sql: &str,
+        sink: &mut dzban_core::result_stream::ResultSink,
+    ) -> Result<Option<dzban_core::CommandAcknowledgment>, ExecutionError> {
+        let result = self.execute(sql).await?;
+        sink.schema(result.columns).await?;
+        for row in result.rows {
+            sink.row(row).await?;
+        }
+        Ok(None)
+    }
     async fn cancel(&self) -> Result<(), String> {
         self.gate.cancellations.fetch_add(1, Ordering::SeqCst);
         Ok(())
@@ -212,6 +224,54 @@ async fn identified_gobject_cancel_cannot_target_a_restarted_query() {
     );
     gate.release.notify_one();
     result.await.unwrap().unwrap();
+    connection
+        .disconnect_with_completion()
+        .unwrap()
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[glib::async_test]
+async fn core_document_finishes_while_main_context_delivery_is_withheld() {
+    let (connection, context, gate) = fixture(Stage::Query);
+    connection.connect();
+    until(|| connection.state() == ConnectionState::Connected).await;
+    let engine = context
+        .session(context.session_ids().await[0])
+        .await
+        .unwrap();
+    let bridge = RuntimeBridge::with_context(context).unwrap();
+    let mut documents = dzban_core::documents::QueryDocuments::default();
+    let document = documents.open();
+    let delivery = bridge
+        .start_document(
+            dzban_gtk::database::InternalConnection::new(engine, DatabaseBackend::Postgresql),
+            document.clone(),
+            "external-wait".into(),
+            None,
+        )
+        .unwrap();
+    until(|| gate.entered.load(Ordering::SeqCst)).await;
+    drop(delivery);
+    gate.release.notify_one();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while document.is_active() {
+        assert!(
+            Instant::now() < deadline,
+            "Core completion depended on main-context delivery"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        document
+            .snapshot()
+            .completion
+            .unwrap()
+            .unwrap()
+            .result
+            .is_ok()
+    );
     connection
         .disconnect_with_completion()
         .unwrap()

@@ -646,14 +646,30 @@ impl QueryTabManager {
     }
 
     /// Show loading state in results area
+    #[cfg(test)]
     pub fn show_loading_for(&self, query_num: u32) -> Option<u64> {
-        if let Some(tab) = self.tabs.borrow().get(&query_num) {
+        let generation = self
+            .tabs
+            .borrow()
+            .get(&query_num)?
+            .document
+            .replace_output();
+        self.show_loading_generation(query_num, generation)
+            .then_some(generation)
+    }
+
+    pub fn show_loading_generation(&self, query_num: u32, output_generation: u64) -> bool {
+        if let Some(tab) = self
+            .tabs
+            .borrow()
+            .get(&query_num)
+            .filter(|tab| tab.document.accepts_output(output_generation))
+        {
             let has_results = find_result_view(tab.results_scroll.upcast_ref()).is_some();
             if has_results && !tab.result_scroll_restore_pending.get() {
                 tab.result_scroll_position
                     .set(Some(result_scroll_position(&tab.results_scroll)));
             }
-            let output_generation = tab.document.replace_output();
             tab.stream_status.set_visible(false);
             tab.stream_view.replace(StreamView::Empty);
             let loading_page = adw::StatusPage::new();
@@ -683,9 +699,9 @@ impl QueryTabManager {
                 horizontal.set_value(horizontal.lower());
                 vertical.set_value(vertical.lower());
             });
-            Some(output_generation)
+            true
         } else {
-            None
+            false
         }
     }
 

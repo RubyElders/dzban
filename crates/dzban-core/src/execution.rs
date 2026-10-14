@@ -16,6 +16,12 @@ pub struct QueryId(pub Uuid);
 pub struct SessionId(pub Uuid);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueryScope {
+    pub session: SessionId,
+    pub query: Option<QueryId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionPhase {
     Open,
     Closing,
@@ -104,6 +110,13 @@ pub struct QuerySnapshot {
 }
 
 impl QuerySnapshot {
+    pub fn scope(&self) -> QueryScope {
+        QueryScope {
+            session: self.session,
+            query: self.phase.id(),
+        }
+    }
+
     pub fn elapsed(&self) -> Duration {
         self.started_at.map_or(Duration::ZERO, |start| {
             self.finished_at
@@ -144,13 +157,14 @@ pub struct StreamedQueryHandle {
     task: tokio::task::JoinHandle<StreamedQueryCompletion>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct StreamedQueryResult {
     pub capture: ResultSnapshot,
     pub command: Option<crate::CommandAcknowledgment>,
     pub duration: Duration,
 }
 
+#[derive(Clone, Debug)]
 pub struct StreamedQueryCompletion {
     pub result: Result<StreamedQueryResult, crate::error::ExecutionError>,
     pub snapshot: QuerySnapshot,
