@@ -7,7 +7,7 @@ pub mod query_tab;
 pub mod runtime_bridge;
 
 pub use app_state::{
-    ActionHint, AppCommand, AppEvent, AppState, InputKey, KeyboardState, PlanPreviewState,
+    ActionHint, AppCommand, AppEvent, AppState, InputRole, KeyboardState, PlanPreviewState,
     PlanVisibility, PrimaryAction, QueryExecutionState,
 };
 pub use config_gobject::DbConfig;

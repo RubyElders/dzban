@@ -17,7 +17,7 @@ use super::plan_inspector::{PlanScroll, PlanState};
 use super::query_tabs::QueryTabManager;
 use super::statusbar::Statusbar;
 use dzban_gtk::database::{
-    AppCommand, AppEvent, AppState, Config, ConnectionState, DbConfig, DbManager, InputKey,
+    AppCommand, AppEvent, AppState, Config, ConnectionState, DbConfig, DbManager, InputRole,
     PlanPreviewState, RuntimeBridge,
 };
 
@@ -84,18 +84,19 @@ mod tests {
         let queries = QueryTabManager::new("preview-adapter-test");
         queries.new_query_tab();
         let widget = plan_widget(queries.get_widget().upcast_ref()).unwrap();
-        manager.handle_input_pressed(InputKey::Control, 0);
-        manager.handle_input_pressed(InputKey::Shift, 1);
+        manager.dispatch(AppEvent::QueryAvailabilityChanged(true));
+        manager.handle_input_pressed(InputRole::PrimaryModifier, 0);
+        manager.handle_input_pressed(InputRole::PreviewModifier, 1);
         *manager.query_preview_manager.borrow_mut() = Some(queries.clone());
         manager.dispatch(AppEvent::PreviewReady(dzban_gtk::database::QueryPlan {
             backend: dzban_gtk::database::DatabaseBackend::Postgresql,
             document: serde_json::json!([]),
             estimate: dzban_gtk::database::QueryEstimate::default(),
         }));
-        assert!(manager.handle_input_pressed(InputKey::Space, 10));
+        assert!(manager.handle_input_pressed(InputRole::Inspect, 10));
         assert!(widget.is_visible());
-        assert!(manager.handle_input_pressed(InputKey::Space, 500));
-        manager.handle_input_released(InputKey::Space, 600);
+        assert!(manager.handle_input_pressed(InputRole::Inspect, 500));
+        manager.handle_input_released(InputRole::Inspect, 600);
         assert!(!widget.is_visible());
 
         *manager.query_preview_manager.borrow_mut() = Some(queries);
@@ -104,10 +105,10 @@ mod tests {
             document: serde_json::json!([]),
             estimate: dzban_gtk::database::QueryEstimate::default(),
         }));
-        assert!(manager.handle_input_pressed(InputKey::Space, 700));
-        manager.handle_input_released(InputKey::Space, 750);
-        manager.handle_input_released(InputKey::Shift, 760);
-        manager.handle_input_released(InputKey::Control, 770);
+        assert!(manager.handle_input_pressed(InputRole::Inspect, 700));
+        manager.handle_input_released(InputRole::Inspect, 750);
+        manager.handle_input_released(InputRole::PreviewModifier, 760);
+        manager.handle_input_released(InputRole::PrimaryModifier, 770);
         assert!(widget.is_visible());
         manager.dispatch(AppEvent::QueryPlanning);
         assert!(!widget.is_visible());
@@ -582,7 +583,7 @@ impl DatabaseTabManager {
         }
     }
 
-    pub fn handle_input_pressed(&self, key: InputKey, at_ms: u64) -> bool {
+    pub fn handle_input_pressed(&self, key: InputRole, at_ms: u64) -> bool {
         let commands = self
             .app_state
             .borrow_mut()
@@ -595,7 +596,7 @@ impl DatabaseTabManager {
         handled
     }
 
-    pub fn handle_input_released(&self, key: InputKey, at_ms: u64) {
+    pub fn handle_input_released(&self, key: InputRole, at_ms: u64) {
         let commands = self
             .app_state
             .borrow_mut()

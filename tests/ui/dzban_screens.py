@@ -222,12 +222,14 @@ password = "testpass"
         editor.text = "SELECT 1 AS preview_value"
         editor.grab_focus()
         from dogtail import rawinput
-        for key in ("Control_L", "Shift_L", "space"):
+        for key in ("Control_L", "Control_R", "Shift_L", "space"):
             self.addCleanup(rawinput.release_key, key)
         from dogtail.config import config as dogtail_config
         dogtail_config.action_delay = 0.02
         dogtail_config.typing_delay = 0.02
         rawinput.hold_key("Control_L")
+        rawinput.hold_key("Control_R")
+        rawinput.release_key("Control_L")
         rawinput.hold_key("Shift_L")
         time.sleep(0.5)
         rawinput.hold_key("space")
@@ -236,7 +238,7 @@ password = "testpass"
         rawinput.release_key("space")
         wait_for_node_to_disappear(application, "Query Plan")
         rawinput.release_key("Shift_L")
-        rawinput.release_key("Control_L")
+        rawinput.release_key("Control_R")
 
         rawinput.hold_key("Control_L")
         rawinput.hold_key("Shift_L")

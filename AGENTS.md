@@ -7,6 +7,10 @@
 
 ## Required validation
 
+The shared/frontend boundary is documented in `docs/frontend-integration.md`.
+Run `bash scripts/check-portable.sh` for the all-target dependency guard and
+`bash scripts/check-headless.sh` to build/test without native frontend libraries.
+
 Choose tests based on the behavior changed. Compilation is not runtime or visual validation.
 
 - Pure logic: add and run ordinary unit tests.
