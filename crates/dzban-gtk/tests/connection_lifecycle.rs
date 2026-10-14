@@ -28,6 +28,7 @@ struct Gate {
     entered: AtomicBool,
     release: tokio::sync::Notify,
     closed: AtomicBool,
+    cancellations: AtomicUsize,
 }
 
 impl Gate {
@@ -91,6 +92,7 @@ impl DatabaseSession for Session {
         Ok(dzban_core::ExecutionOutcome::Rows(self.execute(sql).await?))
     }
     async fn cancel(&self) -> Result<(), String> {
+        self.gate.cancellations.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
     async fn version(&self) -> Result<String, String> {
@@ -174,6 +176,42 @@ async fn idle_gobject_cancel_cannot_target_a_later_query() {
     cancellation.await.unwrap().unwrap();
     gate.release.notify_one();
     assert!(result.await.unwrap().is_ok());
+    connection
+        .disconnect_with_completion()
+        .unwrap()
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[glib::async_test]
+async fn identified_gobject_cancel_cannot_target_a_restarted_query() {
+    let (connection, context, gate) = fixture(Stage::Query);
+    connection.connect();
+    until(|| connection.state() == ConnectionState::Connected).await;
+    let first = connection.execute_query_detailed("first".into());
+    first.await.unwrap().unwrap();
+    let engine = context
+        .session(context.session_ids().await[0])
+        .await
+        .unwrap();
+    let previous_query = engine.subscribe().borrow().phase.id().unwrap();
+    let result = connection.execute_query_detailed("external-wait".into());
+    until(|| gate.entered.load(Ordering::SeqCst)).await;
+    let running_query = engine.subscribe().borrow().phase.id().unwrap();
+    assert_ne!(previous_query, running_query);
+    connection
+        .cancel_query_identified(previous_query)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(gate.cancellations.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        engine.subscribe().borrow().phase,
+        dzban_core::execution::QueryPhase::Executing(running_query)
+    );
+    gate.release.notify_one();
+    result.await.unwrap().unwrap();
     connection
         .disconnect_with_completion()
         .unwrap()

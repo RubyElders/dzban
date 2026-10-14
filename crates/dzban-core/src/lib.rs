@@ -3,6 +3,7 @@ pub mod adapter;
 pub mod application;
 pub mod catalog;
 pub mod config;
+pub mod documents;
 pub mod error;
 pub mod execution;
 pub mod history;

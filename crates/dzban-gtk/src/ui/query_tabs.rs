@@ -17,9 +17,9 @@ use std::rc::Rc;
 use super::plan_inspector::{PlanInspector, PlanScroll, PlanState};
 use super::preview_overlay::{PreviewRelease, preview_release};
 use super::query_history::{QueryHistoryOutcome, QueryResultSnapshot};
-use super::query_state::QueryStateManager;
 use super::result_inspector::ResultInspector;
 use super::sidebar::{HistoryPlanAction, QueryHistory};
+use dzban_core::documents::{CloseDocument, QueryDocument, QueryDocuments};
 
 type EmptyCallback = Rc<dyn Fn()>;
 use dzban_core::result_stream::{ResultPhase, ResultSnapshot, ResultTermination};
@@ -45,9 +45,7 @@ struct QueryTab {
     editor: SourceView,
     results_scroll: ScrolledWindow,
     stream_status: Label,
-    state_manager: QueryStateManager,
-    running_plan: RefCell<Option<QueryPlan>>,
-    output_generation: Cell<u64>,
+    document: QueryDocument,
     result_scroll_position: Cell<Option<ResultScrollPosition>>,
     result_scroll_restore_pending: Rc<Cell<bool>>,
     stream_view: RefCell<StreamView>,
@@ -66,7 +64,7 @@ pub struct QueryTabManager {
     tab_view: TabView,
     tab_bar: TabBar,
     container: OverlaySplitView,
-    query_counter: Rc<RefCell<u32>>,
+    documents: Rc<RefCell<QueryDocuments>>,
     tabs: Rc<RefCell<HashMap<u32, QueryTab>>>, // Map query number to tab data
     history: QueryHistory,
     plan_inspector: PlanInspector,
@@ -121,7 +119,7 @@ impl QueryTabManager {
             tab_view,
             tab_bar,
             container: split_view,
-            query_counter: Rc::new(RefCell::new(0)),
+            documents: Rc::new(RefCell::new(QueryDocuments::default())),
             tabs: Rc::new(RefCell::new(HashMap::new())),
             history,
             plan_inspector,
@@ -146,8 +144,7 @@ impl QueryTabManager {
             let Some(tab) = tabs.values().find(|tab| tab.page == selected_page) else {
                 return;
             };
-            tab.output_generation
-                .set(tab.output_generation.get().wrapping_add(1));
+            tab.document.replace_output();
             tab.result_scroll_position.set(None);
             tab.result_scroll_restore_pending.set(false);
             tab.editor.buffer().set_text(&entry.sql);
@@ -196,25 +193,27 @@ impl QueryTabManager {
         });
 
         let weak_tabs = Rc::downgrade(&manager.tabs);
+        let documents = manager.documents.clone();
         let empty_callback = manager.empty_callback.clone();
         manager.tab_view.connect_close_page(move |view, page| {
             if let Some(tabs) = weak_tabs.upgrade() {
-                let query_num = {
+                let (query_num, last) = {
                     let tabs = tabs.borrow();
                     let Some((query_num, tab)) = tabs.iter().find(|(_, tab)| tab.page == *page)
                     else {
                         return glib::Propagation::Proceed;
                     };
-                    if tab.state_manager.is_active() {
-                        view.close_page_finish(page, false);
-                        return glib::Propagation::Stop;
+                    match documents.borrow_mut().close(tab.document.id()) {
+                        CloseDocument::Busy => {
+                            view.close_page_finish(page, false);
+                            return glib::Propagation::Stop;
+                        }
+                        CloseDocument::Closed { last } => (*query_num, last),
+                        CloseDocument::Missing => return glib::Propagation::Proceed,
                     }
-                    *query_num
                 };
                 tabs.borrow_mut().remove(&query_num);
-                if tabs.borrow().is_empty()
-                    && let Some(callback) = empty_callback.borrow().as_ref()
-                {
+                if last && let Some(callback) = empty_callback.borrow().as_ref() {
                     callback();
                 }
             }
@@ -222,9 +221,30 @@ impl QueryTabManager {
         });
 
         let plan_inspector = manager.plan_inspector.clone();
-        manager.tab_view.connect_selected_page_notify(move |_| {
+        let weak_tabs = Rc::downgrade(&manager.tabs);
+        let documents = manager.documents.clone();
+        manager.tab_view.connect_selected_page_notify(move |view| {
+            if let Some(tabs) = weak_tabs.upgrade()
+                && let Some(page) = view.selected_page()
+                && let Some(tab) = tabs.borrow().values().find(|tab| tab.page == page)
+            {
+                documents.borrow_mut().select(tab.document.id());
+            }
             plan_inspector.close();
         });
+        let weak_tabs = Rc::downgrade(&manager.tabs);
+        let documents = manager.documents.clone();
+        manager
+            .tab_view
+            .connect_page_reordered(move |_, page, position| {
+                if let Some(tabs) = weak_tabs.upgrade()
+                    && let Some(tab) = tabs.borrow().values().find(|tab| tab.page == *page)
+                {
+                    documents
+                        .borrow_mut()
+                        .reorder(tab.document.id(), position as usize);
+                }
+            });
 
         manager
     }
@@ -234,18 +254,14 @@ impl QueryTabManager {
     }
 
     pub fn new_query_tab(&self) {
-        let mut counter = self.query_counter.borrow_mut();
-        *counter += 1;
-        let query_num = *counter;
+        let document = self.documents.borrow_mut().open();
+        let query_num = document.number();
 
         let (content, editor, results_scroll, stream_status) = create_query_editor_pane();
 
-        // Create state manager for this tab
-        let state_manager = QueryStateManager::new();
-
         // Add to TabView
         let page = self.tab_view.append(&content);
-        page.set_title(&format!("Query {}", query_num));
+        page.set_title(&document.snapshot().title);
         page.set_icon(Some(&gtk4::gio::ThemedIcon::new("text-editor-symbolic")));
 
         // Store the tab data (without revealer)
@@ -256,14 +272,20 @@ impl QueryTabManager {
                 editor: editor.clone(),
                 results_scroll,
                 stream_status,
-                state_manager,
-                running_plan: RefCell::new(None),
-                output_generation: Cell::new(0),
+                document: document.clone(),
                 result_scroll_position: Cell::new(None),
                 result_scroll_restore_pending: Rc::new(Cell::new(false)),
                 stream_view: RefCell::new(StreamView::Empty),
             },
         );
+
+        editor.buffer().connect_changed(move |buffer| {
+            document.set_draft(
+                buffer
+                    .text(&buffer.start_iter(), &buffer.end_iter(), false)
+                    .to_string(),
+            );
+        });
 
         // Select the new tab
         self.tab_view.set_selected_page(&page);
@@ -304,19 +326,17 @@ impl QueryTabManager {
     }
 
     fn current_query_id(&self) -> Option<u32> {
-        let selected_page = self.tab_view.selected_page()?;
-        self.tabs
+        self.documents
             .borrow()
-            .iter()
-            .find(|(_, tab)| tab.page == selected_page)
-            .map(|(query_num, _)| *query_num)
+            .selected()
+            .map(|document| document.number())
     }
 
     pub fn is_query_selected(&self, query_num: u32) -> bool {
         self.current_query_id() == Some(query_num)
     }
 
-    pub fn current_query(&self) -> Option<(u32, String, QueryStateManager)> {
+    pub fn current_query(&self) -> Option<(u32, String, QueryDocument)> {
         let query_num = self.current_query_id()?;
         let tabs = self.tabs.borrow();
         let tab = tabs.get(&query_num)?;
@@ -325,27 +345,25 @@ impl QueryTabManager {
             let iter = buffer.iter_at_offset(buffer.cursor_position());
             (iter, iter)
         });
-        let full_text = buffer
-            .text(&buffer.start_iter(), &buffer.end_iter(), false)
-            .to_string();
+        let full_text = tab.document.draft();
         let query = extract_query_at_cursor(&full_text, cursor_iter.offset() as usize)?.0;
-        Some((query_num, query, tab.state_manager.clone()))
+        Some((query_num, query, tab.document.clone()))
     }
 
-    pub fn running_query(&self) -> Option<(u32, QueryStateManager)> {
+    pub fn running_query(&self) -> Option<(u32, QueryDocument)> {
         self.tabs
             .borrow()
             .iter()
-            .find(|(_, tab)| tab.state_manager.is_active())
-            .map(|(query_num, tab)| (*query_num, tab.state_manager.clone()))
+            .find(|(_, tab)| tab.document.is_active())
+            .map(|(query_num, tab)| (*query_num, tab.document.clone()))
     }
 
     pub fn running_plan(&self) -> Option<QueryPlan> {
         self.tabs
             .borrow()
             .values()
-            .find(|tab| tab.state_manager.is_active())
-            .and_then(|tab| tab.running_plan.borrow().clone())
+            .find(|tab| tab.document.is_active())
+            .and_then(|tab| tab.document.plan())
     }
 
     pub fn highlight_current_query(&self) -> Option<String> {
@@ -429,7 +447,7 @@ impl QueryTabManager {
         let tabs = self.tabs.borrow();
         let Some(tab) = tabs
             .get(&query_num)
-            .filter(|tab| tab.output_generation.get() == generation)
+            .filter(|tab| tab.document.accepts_output(generation))
         else {
             return;
         };
@@ -469,7 +487,7 @@ impl QueryTabManager {
                         .tabs
                         .borrow()
                         .get(&query_num)
-                        .is_some_and(|tab| tab.output_generation.get() == generation)
+                        .is_some_and(|tab| tab.document.accepts_output(generation))
                     {
                         manager.display_result_read_error(
                             query_num,
@@ -510,7 +528,7 @@ impl QueryTabManager {
             let tabs = manager.tabs.borrow();
             let Some(tab) = tabs
                 .get(&query_num)
-                .filter(|tab| tab.output_generation.get() == generation)
+                .filter(|tab| tab.document.accepts_output(generation))
             else {
                 return;
             };
@@ -525,7 +543,7 @@ impl QueryTabManager {
                     let tabs = tabs.borrow();
                     if let Some(tab) = tabs
                         .get(&query_num)
-                        .filter(|tab| tab.output_generation.get() == generation)
+                        .filter(|tab| tab.document.accepts_output(generation))
                     {
                         let error = values[1].get::<String>().unwrap();
                         tab.stream_view.replace(StreamView::Unreadable);
@@ -559,7 +577,7 @@ impl QueryTabManager {
         let tabs = self.tabs.borrow();
         if let Some(tab) = tabs
             .get(&query_num)
-            .filter(|tab| tab.output_generation.get() == generation)
+            .filter(|tab| tab.document.accepts_output(generation))
         {
             tab.stream_view.replace(StreamView::Unreadable);
             tab.results_scroll
@@ -593,13 +611,12 @@ impl QueryTabManager {
         explain_error: Option<&str>,
     ) {
         let tabs = self.tabs.borrow();
-        let Some(tab) = tabs
+        if !tabs
             .get(&query_num)
-            .filter(|tab| tab.output_generation.get() == output_generation)
-        else {
+            .is_some_and(|tab| tab.document.accepts_output(output_generation))
+        {
             return;
-        };
-        tab.running_plan.replace(plan.cloned());
+        }
         drop(tabs);
         if !self.is_query_selected(query_num) {
             return;
@@ -636,9 +653,7 @@ impl QueryTabManager {
                 tab.result_scroll_position
                     .set(Some(result_scroll_position(&tab.results_scroll)));
             }
-            let output_generation = tab.output_generation.get().wrapping_add(1);
-            tab.output_generation.set(output_generation);
-            tab.running_plan.replace(None);
+            let output_generation = tab.document.replace_output();
             tab.stream_status.set_visible(false);
             tab.stream_view.replace(StreamView::Empty);
             let loading_page = adw::StatusPage::new();
@@ -692,7 +707,7 @@ impl QueryTabManager {
     }
 
     pub fn tab_count(&self) -> i32 {
-        self.tab_view.n_pages()
+        self.documents.borrow().documents().len() as i32
     }
 
     pub fn set_empty_callback<F>(&self, callback: F)
@@ -703,26 +718,13 @@ impl QueryTabManager {
     }
 
     pub fn select_next_tab(&self) -> bool {
-        if self.tab_view.select_next_page() {
-            true
-        } else if self.tab_view.n_pages() > 1 {
-            self.tab_view.set_selected_page(&self.tab_view.nth_page(0));
-            true
-        } else {
-            false
-        }
+        let next = self.documents.borrow_mut().select_relative(true);
+        next.is_some_and(|document| self.select_tab(document.number()))
     }
 
     pub fn select_previous_tab(&self) -> bool {
-        if self.tab_view.select_previous_page() {
-            true
-        } else if self.tab_view.n_pages() > 1 {
-            self.tab_view
-                .set_selected_page(&self.tab_view.nth_page(self.tab_view.n_pages() - 1));
-            true
-        } else {
-            false
-        }
+        let next = self.documents.borrow_mut().select_relative(false);
+        next.is_some_and(|document| self.select_tab(document.number()))
     }
 
     pub fn current_tab_title(&self) -> Option<String> {
@@ -730,14 +732,10 @@ impl QueryTabManager {
         self.tabs
             .borrow()
             .get(&query_num)
-            .map(|tab| tab.page.title().to_string())
+            .map(|tab| tab.document.snapshot().title)
     }
 
     pub fn rename_current_tab(&self, title: &str) -> bool {
-        let title = title.trim();
-        if title.is_empty() {
-            return false;
-        }
         let Some(query_num) = self.current_query_id() else {
             return false;
         };
@@ -745,26 +743,22 @@ impl QueryTabManager {
         let Some(tab) = tabs.get(&query_num) else {
             return false;
         };
-        tab.page.set_title(title);
+        if !tab.document.rename(title) {
+            return false;
+        }
+        tab.page.set_title(&tab.document.snapshot().title);
         true
     }
 
     pub fn tab_titles(&self) -> Vec<(u32, String)> {
-        let mut tabs = self
-            .tabs
+        self.documents
             .borrow()
+            .documents()
             .iter()
-            .map(|(query_num, tab)| {
-                (
-                    self.tab_view.page_position(&tab.page),
-                    *query_num,
-                    tab.page.title().to_string(),
-                )
+            .map(|document| {
+                let snapshot = document.snapshot();
+                (snapshot.number, snapshot.title)
             })
-            .collect::<Vec<_>>();
-        tabs.sort_by_key(|(position, _, _)| *position);
-        tabs.into_iter()
-            .map(|(_, query_num, title)| (query_num, title))
             .collect()
     }
 
@@ -1635,6 +1629,50 @@ fn result_cell_preview(value: &str) -> String {
 mod tests {
     use super::*;
 
+    fn test_query_id() -> dzban_core::execution::QueryId {
+        let mut documents = QueryDocuments::default();
+        let document = documents.open();
+        dzban_core::execution::QueryId(document.id().0)
+    }
+
+    #[gtk4::test]
+    #[ignore = "requires a graphical display"]
+    fn shared_documents_follow_editor_selection_rename_and_reorder() {
+        let manager = QueryTabManager::new("document-projection-test");
+        manager.new_query_tab();
+        let first = manager.documents.borrow().selected().unwrap();
+        manager
+            .tabs
+            .borrow()
+            .get(&1)
+            .unwrap()
+            .editor
+            .buffer()
+            .set_text("SELECT 1;");
+        assert_eq!(first.draft(), "SELECT 1;");
+        assert!(manager.rename_current_tab("  First query  "));
+        assert_eq!(first.snapshot().title, "First query");
+        manager.new_query_tab();
+        let second = manager.documents.borrow().selected().unwrap();
+        assert_eq!(second.draft(), "");
+        assert!(manager.select_previous_tab());
+        assert_eq!(manager.current_query().unwrap().1, "SELECT 1");
+        assert_eq!(manager.current_tab_title().as_deref(), Some("First query"));
+        let second_page = manager.tabs.borrow().get(&2).unwrap().page.clone();
+        assert!(manager.tab_view.reorder_page(&second_page, 0));
+        assert_eq!(manager.tab_titles()[0].0, 2);
+        assert!(manager.select_next_tab());
+        assert_eq!(
+            manager.documents.borrow().selected().unwrap().id(),
+            second.id()
+        );
+        assert!(manager.close_current_tab());
+        assert_eq!(
+            manager.documents.borrow().selected().unwrap().id(),
+            first.id()
+        );
+    }
+
     #[gtk4::test]
     #[ignore = "requires a graphical display"]
     fn byte_cutoff_notice_stays_outside_the_virtual_table() {
@@ -2212,7 +2250,13 @@ mod tests {
     fn running_query_remains_addressable_after_selecting_another_tab() {
         let manager = QueryTabManager::new("background-query-test");
         manager.new_query_tab();
-        manager.tabs.borrow().get(&1).unwrap().state_manager.start();
+        manager
+            .tabs
+            .borrow()
+            .get(&1)
+            .unwrap()
+            .document
+            .start(test_query_id());
         manager.new_query_tab();
 
         assert!(manager.is_query_selected(2));
@@ -2582,13 +2626,14 @@ mod tests {
     fn running_query_tab_stays_open_until_the_operation_finishes() {
         let manager = QueryTabManager::new("running-tab-close-test");
         manager.new_query_tab();
-        let state = manager.tabs.borrow().get(&1).unwrap().state_manager.clone();
-        state.start();
+        let state = manager.tabs.borrow().get(&1).unwrap().document.clone();
+        let query = test_query_id();
+        state.start(query);
 
         assert!(manager.close_current_tab());
         assert_eq!(manager.tab_count(), 1);
 
-        state.finish();
+        state.finish(query);
         assert!(manager.close_current_tab());
         assert_eq!(manager.tab_count(), 0);
     }
