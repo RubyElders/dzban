@@ -680,6 +680,12 @@ impl DbConnection {
         dzban_core::error::ExecutionError,
     > {
         info!("Disconnecting...");
+        if matches!(
+            *self.imp().connection_selection.borrow(),
+            dzban_core::application::ConnectionSelection::Closing(_)
+        ) {
+            return Err(dzban_core::error::ExecutionError::Busy);
+        }
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
 
         let db_conn = self.imp().db_connection.borrow().clone();
@@ -699,18 +705,25 @@ impl DbConnection {
             };
             let generation = self.imp().disconnect_generation.get().wrapping_add(1);
             let version = self.version();
+            self.imp()
+                .connection_selection
+                .borrow_mut()
+                .begin_close(db_conn.engine().id());
             let this = self.clone();
             glib::MainContext::ref_thread_default().spawn_local(async move {
                 let result = rx
                     .await
                     .unwrap_or_else(|_| Err("Disconnect worker was dropped".to_string().into()));
+                if this.imp().disconnect_generation.get() == generation {
+                    this.imp()
+                        .connection_selection
+                        .borrow_mut()
+                        .finish_close(db_conn.engine().id(), &result);
+                }
                 if let Err(error) = &result
                     && this.imp().disconnect_generation.get() == generation
                     && this.state() == ConnectionState::Disconnected
                 {
-                    this.imp().connection_selection.replace(
-                        dzban_core::application::ConnectionSelection::Ready(db_conn.engine().id()),
-                    );
                     this.imp().db_connection.replace(Some(db_conn));
                     this.set_version(version);
                     this.set_state(ConnectionState::Connected);
@@ -720,10 +733,10 @@ impl DbConnection {
                 let _ = completion_tx.send(result);
             });
         } else {
+            self.imp().connection_selection.borrow_mut().clear();
             let _ = completion_tx.send(Ok(()));
         }
 
-        self.imp().connection_selection.borrow_mut().clear();
         if let Some(observer) = self.imp().core_observer.borrow_mut().take() {
             observer.abort();
         }
@@ -1040,6 +1053,28 @@ impl DbConnection {
             .borrow()
             .as_ref()
             .map(|connection| connection.engine().subscribe().borrow().scope())
+    }
+
+    pub fn session_interaction(&self) -> Option<dzban_core::interaction::SessionInteraction> {
+        self.imp()
+            .db_connection
+            .borrow()
+            .as_ref()
+            .map(|connection| {
+                dzban_core::interaction::SessionInteraction::from_engine(&connection.engine())
+            })
+    }
+
+    pub fn session_engine(&self) -> Option<std::sync::Arc<dzban_core::execution::QueryEngine>> {
+        self.imp()
+            .db_connection
+            .borrow()
+            .as_ref()
+            .map(|connection| connection.engine())
+    }
+
+    pub fn can_forget(&self) -> bool {
+        self.imp().connection_selection.borrow().can_forget()
     }
 
     fn cancel_query_for(

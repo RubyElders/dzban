@@ -369,6 +369,22 @@ async fn busy_shutdown_restores_admission_and_can_be_retried_after_cancellation(
     })
     .await
     .unwrap();
+    let interaction = dzban_core::interaction::SessionInteraction::from_engine(&engine);
+    assert_eq!(
+        interaction.execution,
+        dzban_core::interaction::QueryExecutionState::Running { plan: None }
+    );
+    assert!(!interaction.query_available);
+    let mut view = dzban_core::interaction::AppState::default();
+    view.transition(dzban_core::interaction::AppEvent::SessionSelected(Some(
+        interaction,
+    )));
+    view.transition(dzban_core::interaction::AppEvent::SessionSelected(None));
+    assert_eq!(
+        view.primary_action(),
+        dzban_core::interaction::PrimaryAction::Unavailable
+    );
+    assert!(!query.is_finished());
     assert!(matches!(
         context.start_shutdown().unwrap().wait().await,
         Err(ApplicationError::Operation(ExecutionError::Busy))
@@ -424,5 +440,48 @@ async fn failed_shutdown_keeps_the_failed_session_available_for_retry() {
         *context.subscribe_phase().borrow(),
         ApplicationPhase::Closed
     );
+    assert!(context.session_ids().await.is_empty());
+}
+
+#[tokio::test]
+async fn workspace_retirement_requires_successful_session_cleanup() {
+    use dzban_core::documents::{CloseDocument, DocumentLifecycle, QueryDocuments};
+    use dzban_core::interaction::SessionInteraction;
+    let mut registry = AdapterRegistry::default();
+    registry
+        .register(Arc::new(SessionFactory(Arc::new(Session {
+            fail_disconnect_once: std::sync::atomic::AtomicBool::new(true),
+            ..Default::default()
+        }))))
+        .unwrap();
+    let context = Arc::new(ApplicationContext::new(registry));
+    let engine = context
+        .connect_profile(DatabaseConfig::from_connection_string(
+            "host=localhost user=fixture dbname=fixture",
+        ))
+        .await
+        .unwrap();
+    let mut documents = QueryDocuments::default();
+    let document = documents.open();
+    document.set_draft("SELECT 1;".into());
+    assert_eq!(
+        documents.close_in_workspace(document.id()),
+        CloseDocument::CloseWorkspace
+    );
+    assert_eq!(
+        documents.retire_closed_session(&engine),
+        Err(ExecutionError::Busy)
+    );
+    assert!(context.close(engine.id()).await.is_err());
+    assert_eq!(document.snapshot().lifecycle, DocumentLifecycle::Open);
+    assert_eq!(document.draft(), "SELECT 1;");
+    assert!(SessionInteraction::from_engine(&engine).query_available);
+    context.close(engine.id()).await.unwrap();
+    assert!(!SessionInteraction::from_engine(&engine).query_available);
+    documents.retire_closed_session(&engine).unwrap();
+    assert!(documents.selected().is_none());
+    assert!(documents.documents().is_empty());
+    assert_eq!(document.snapshot().lifecycle, DocumentLifecycle::Closed);
+    assert!(!document.set_draft("SELECT 2;".into()));
     assert!(context.session_ids().await.is_empty());
 }
