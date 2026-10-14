@@ -246,7 +246,7 @@ password = "testpass"
         rawinput.release_key("Control_L")
         wait_for_node(application, "Query Plan")
         wait_for_node(application, "Unpin query plan", "button")
-        slow_query = "SELECT pg_sleep(10), 1 AS value"
+        slow_query = "SELECT pg_sleep(30), 1 AS value"
         editor.text = slow_query
         wait_for_node_to_disappear(application, "Query Plan")
         run_button = wait_for_node(application, "Run query", "button")
@@ -255,6 +255,18 @@ password = "testpass"
         wait_for_node(application, "Running Query", timeout=15)
         stop_button = wait_for_node(application, "Stop query", "button")
         self.assertTrue(stop_button.sensitive)
+
+        action_field.text = "show connections"
+        wait_for_node(
+            application, "Run action: Show Connections", "button"
+        ).do_action_named("click")
+        wait_for_node(application, "Database Connections")
+        self.assertFalse(wait_for_node(application, "Run query", "button").sensitive)
+        action_field.text = "database tab"
+        wait_for_node(
+            application, "Run action: Database tab: Integration PostgreSQL", "button"
+        ).do_action_named("click")
+        self.assertTrue(wait_for_node(application, "Stop query", "button").sensitive)
 
         action_field.text = "query tab"
         wait_for_node(

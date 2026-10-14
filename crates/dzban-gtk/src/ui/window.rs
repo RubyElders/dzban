@@ -1406,6 +1406,11 @@ mod tests {
             &shortcuts,
         ));
         assert!(window.is_visible());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !manager.open_database_tabs().is_empty() && std::time::Instant::now() < deadline {
+            glib::MainContext::default().iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         assert!(manager.open_database_tabs().is_empty());
 
         assert!(execute_shortcut_action(

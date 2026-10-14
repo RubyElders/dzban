@@ -265,6 +265,7 @@ impl QueryExecution {
 pub enum CloseDocument {
     Missing,
     Busy,
+    CloseWorkspace,
     Closed { last: bool },
 }
 
@@ -276,6 +277,51 @@ pub struct QueryDocuments {
 }
 
 impl QueryDocuments {
+    pub fn close_in_workspace(&mut self, id: DocumentId) -> CloseDocument {
+        let Some(document) = self.find(id) else {
+            return CloseDocument::Missing;
+        };
+        if document.is_active() {
+            return CloseDocument::Busy;
+        }
+        if self.documents.len() == 1 {
+            return CloseDocument::CloseWorkspace;
+        }
+        self.close(id)
+    }
+
+    pub fn retire_closed_session(
+        &mut self,
+        engine: &crate::execution::QueryEngine,
+    ) -> Result<(), crate::error::ExecutionError> {
+        if *engine.subscribe_session().borrow() != crate::execution::SessionPhase::Closed {
+            return Err(crate::error::ExecutionError::Busy);
+        }
+        if self.documents.iter().any(|document| {
+            document
+                .snapshot()
+                .session
+                .is_some_and(|id| id != engine.id())
+        }) {
+            return Err(crate::error::ExecutionError::Message(
+                "Workspace belongs to another session".into(),
+            ));
+        }
+        for document in &self.documents {
+            document.mutate(|state| {
+                state.lifecycle = DocumentLifecycle::Closed;
+                state.execution = DocumentExecution::Idle;
+                state.plan = None;
+                state.operation = None;
+                state.completion = None;
+                true
+            });
+        }
+        self.documents.clear();
+        self.selected = None;
+        Ok(())
+    }
+
     pub fn open(&mut self) -> QueryDocument {
         self.counter = self.counter.checked_add(1).unwrap();
         let document = QueryDocument::new(self.counter);

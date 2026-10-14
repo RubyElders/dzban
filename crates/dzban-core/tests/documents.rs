@@ -114,3 +114,28 @@ fn closed_document_handles_cannot_restart_or_accept_late_output() {
     assert!(!document.accepts_output(output));
     assert!(!document.set_execution_plan(query(), None));
 }
+
+#[test]
+fn last_document_requests_workspace_close_without_discarding_its_draft() {
+    let mut workspace = QueryDocuments::default();
+    let document = workspace.open();
+    document.set_draft("SELECT 42;".into());
+    assert_eq!(
+        workspace.close_in_workspace(document.id()),
+        CloseDocument::CloseWorkspace
+    );
+    assert_eq!(workspace.selected().unwrap().id(), document.id());
+    assert_eq!(document.draft(), "SELECT 42;");
+    let execution = QueryExecution::start(document.clone(), query()).unwrap();
+    assert_eq!(
+        workspace.close_in_workspace(document.id()),
+        CloseDocument::Busy
+    );
+    execution.finish();
+    let neighbor = workspace.open();
+    assert_eq!(
+        workspace.close_in_workspace(document.id()),
+        CloseDocument::Closed { last: false }
+    );
+    assert_eq!(workspace.selected().unwrap().id(), neighbor.id());
+}

@@ -1,8 +1,11 @@
+use adw::prelude::{AdwDialogExt, AlertDialogExt};
 use adw::{TabBar, TabPage, TabView};
 use gtk4::gdk;
 use gtk4::prelude::*;
 use libadwaita as adw;
-use std::cell::{Cell, RefCell};
+#[cfg(test)]
+use std::cell::Cell;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 #[cfg(test)]
@@ -14,8 +17,8 @@ use super::plan_inspector::{PlanScroll, PlanState};
 use super::query_tabs::QueryTabManager;
 use super::statusbar::Statusbar;
 use dzban_gtk::database::{
-    AppCommand, AppEvent, AppState, Config, ConnectionOperation, ConnectionState, DbConfig,
-    DbManager, InputKey, PlanPreviewState, RuntimeBridge,
+    AppCommand, AppEvent, AppState, Config, ConnectionState, DbConfig, DbManager, InputKey,
+    PlanPreviewState, RuntimeBridge,
 };
 
 type DatabaseTab = (TabPage, QueryTabManager, DbConfig, ConnectionStateWidget);
@@ -136,6 +139,70 @@ mod tests {
         assert_eq!(count.get(), 4);
         assert_eq!(second_count.get(), 3);
     }
+
+    fn disconnected_workspace(manager: &DatabaseTabManager) -> (TabPage, QueryTabManager) {
+        let name = "workspace-close-fixture";
+        assert!(manager.db_manager.add_config(
+            name.into(),
+            "host=localhost user=fixture dbname=fixture".into()
+        ));
+        let config = manager.db_manager.get_config(name).unwrap();
+        let (page, queries, state) = manager.create_database_tab(name);
+        manager
+            .tabs
+            .borrow_mut()
+            .insert(name.into(), (page.clone(), queries.clone(), config, state));
+        (page, queries)
+    }
+
+    #[gtk4::test]
+    #[ignore = "requires a graphical display"]
+    fn last_query_waits_for_workspace_close_and_chooser_clears_the_stop_action() {
+        use dzban_core::interaction::{PrimaryAction, QueryExecutionState, SessionInteraction};
+        let manager = DatabaseTabManager::new(super::super::statusbar::create_statusbar());
+        let (page, queries) = disconnected_workspace(&manager);
+        let weak_page = page.downgrade();
+        manager.dispatch(AppEvent::SessionSelected(Some(SessionInteraction {
+            scope: dzban_core::execution::QueryScope {
+                session: dzban_core::execution::SessionId(
+                    dzban_core::documents::QueryDocuments::default()
+                        .open()
+                        .id()
+                        .0,
+                ),
+                query: None,
+            },
+            execution: QueryExecutionState::Running { plan: None },
+            query_available: false,
+        })));
+        assert_eq!(
+            manager.app_state.borrow().primary_action(),
+            PrimaryAction::Stop
+        );
+        manager.open_connection_manager();
+        assert_eq!(
+            manager.app_state.borrow().primary_action(),
+            PrimaryAction::Unavailable
+        );
+        manager.tab_view.set_selected_page(&page);
+        assert!(manager.close_current_query_tab());
+        assert_eq!(queries.tab_count(), 1);
+        assert_eq!(manager.open_database_tabs().len(), 1);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !manager.open_database_tabs().is_empty() && std::time::Instant::now() < deadline {
+            glib::MainContext::default().iteration(false);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(manager.open_database_tabs().is_empty());
+        assert_eq!(manager.db_manager.config_count(), 0);
+        assert_eq!(manager.tab_view.n_pages(), 1);
+        drop(page);
+        assert!(weak_page.upgrade().is_none());
+        assert_eq!(
+            manager.app_state.borrow().primary_action(),
+            PrimaryAction::Unavailable
+        );
+    }
 }
 
 fn create_colored_dot_icon(css_class: &str) -> gtk4::gio::Icon {
@@ -243,8 +310,7 @@ impl DatabaseTabManager {
 
         // Handle tab close - if all DB tabs are closed, show connection manager
         let manager_clone = manager.clone();
-        tab_view.connect_close_page(move |_view, page| {
-            // Find and remove the database tab
+        tab_view.connect_close_page(move |view, page| {
             let db_name_to_remove = {
                 let tabs = manager_clone.tabs.borrow();
                 tabs.iter()
@@ -256,18 +322,51 @@ impl DatabaseTabManager {
                 if manager_clone.tab_view.selected_page().as_ref() == Some(page) {
                     manager_clone.cancel_query_preview();
                 }
-                manager_clone.tabs.borrow_mut().remove(&name);
-                manager_clone.db_manager.remove_config(&name);
-
-                // Check if any database tabs remain
-                let tabs_empty = manager_clone.tabs.borrow().is_empty();
-                if tabs_empty {
-                    // Select connection manager
-                    if let Some(conn_page) = manager_clone.connections_page.borrow().as_ref() {
-                        manager_clone.tab_view.set_selected_page(conn_page);
+                let retirement =
+                    manager_clone
+                        .tabs
+                        .borrow()
+                        .get(&name)
+                        .map(|(_, queries, config, _)| {
+                            (queries.clone(), config.connection().session_engine())
+                        });
+                let completion = match manager_clone.db_manager.request_remove_config(&name) {
+                    Ok(completion) => completion,
+                    Err(error) => {
+                        view.close_page_finish(page, false);
+                        manager_clone.report_close_error(&error.to_string());
+                        return glib::Propagation::Stop;
                     }
-                    manager_clone.statusbar.unbind();
-                }
+                };
+                let manager = manager_clone.clone();
+                let page = page.clone();
+                glib::spawn_future_local(async move {
+                    let result = completion.await.unwrap_or_else(|_| {
+                        Err(dzban_core::error::ExecutionError::Message(
+                            "Connection close delivery was dropped".into(),
+                        ))
+                    });
+                    match result {
+                        Ok(true) => {
+                            if let Some((queries, engine)) = retirement {
+                                queries.retire_closed_session(engine.as_deref());
+                            }
+                            manager.tabs.borrow_mut().remove(&name);
+                            manager.tab_view.close_page_finish(&page, true);
+                            // Check if any database tabs remain
+                            if manager.tabs.borrow().is_empty() {
+                                // Select connection manager
+                                manager.open_connection_manager();
+                            }
+                        }
+                        Ok(false) => manager.tab_view.close_page_finish(&page, false),
+                        Err(error) => {
+                            manager.tab_view.close_page_finish(&page, false);
+                            manager.report_close_error(&error.to_string());
+                        }
+                    }
+                });
+                return glib::Propagation::Stop;
             }
 
             gtk4::glib::Propagation::Proceed
@@ -283,32 +382,15 @@ impl DatabaseTabManager {
                     let tabs = manager_clone.tabs.borrow();
                     tabs.iter()
                         .find(|(_, (tab_page, _, _, _))| tab_page == &page)
-                        .map(|(name, (_, query_manager, config, _))| {
-                            (name.clone(), query_manager.clone(), config.connection())
-                        })
+                        .map(|(name, (_, _, config, _))| (name.clone(), config.connection()))
                 };
 
-                if let Some((name, query_manager, connection)) = connection {
+                if let Some((name, connection)) = connection {
                     manager_clone
                         .statusbar
                         .bind_to_connection(&name, &connection);
-                    let operation = connection.operation();
-                    manager_clone.emit_query_availability(connection.operation_available());
-                    match operation {
-                        ConnectionOperation::PlanningQuery => {
-                            manager_clone.dispatch(AppEvent::QueryPlanning)
-                        }
-                        ConnectionOperation::Query => manager_clone
-                            .dispatch(AppEvent::QueryRunning(query_manager.running_plan())),
-                        ConnectionOperation::Idle
-                        | ConnectionOperation::Ping
-                        | ConnectionOperation::Version
-                        | ConnectionOperation::Catalog
-                        | ConnectionOperation::Closing
-                        | ConnectionOperation::Explain => {
-                            manager_clone.dispatch(AppEvent::QueryFinished)
-                        }
-                    }
+                    manager_clone
+                        .dispatch(AppEvent::SessionSelected(connection.session_interaction()));
                     return;
                 }
 
@@ -324,7 +406,7 @@ impl DatabaseTabManager {
 
                 if is_connections_page {
                     manager_clone.statusbar.unbind();
-                    manager_clone.emit_query_availability(false);
+                    manager_clone.dispatch(AppEvent::SessionSelected(None));
                 }
             }
         });
@@ -334,6 +416,18 @@ impl DatabaseTabManager {
 
     pub fn get_widget(&self) -> &gtk4::Box {
         &self.container
+    }
+
+    fn report_close_error(&self, error: &str) {
+        tracing::error!("Could not close connection: {error}");
+        if self.container.root().is_some() {
+            let dialog = adw::AlertDialog::builder()
+                .heading("Could not close connection")
+                .body(error)
+                .build();
+            dialog.add_response("close", "Close");
+            dialog.present(Some(&self.container));
+        }
     }
 
     pub fn set_app_state_callback<F>(&self, callback: F)
@@ -518,10 +612,6 @@ impl DatabaseTabManager {
 
     pub fn activate_primary_action(&self) {
         self.dispatch(AppEvent::PrimaryActionRequested);
-    }
-
-    fn emit_query_availability(&self, available: bool) {
-        self.dispatch(AppEvent::QueryAvailabilityChanged(available));
     }
 
     fn current_query_manager(&self) -> Option<QueryTabManager> {
@@ -741,7 +831,7 @@ impl DatabaseTabManager {
 
                 if self.tab_view.selected_page().as_ref() == Some(&page) {
                     self.statusbar.bind_to_connection(db_name, &connection);
-                    self.emit_query_availability(connection.operation_available());
+                    self.dispatch(AppEvent::SessionSelected(connection.session_interaction()));
                 }
 
                 let page_for_state = page.clone();
@@ -771,46 +861,23 @@ impl DatabaseTabManager {
                         if manager_for_availability.tab_view.selected_page().as_ref()
                             == Some(&page_for_availability)
                         {
-                            manager_for_availability
-                                .emit_query_availability(connection.operation_available());
+                            manager_for_availability.dispatch(AppEvent::SessionSelected(
+                                connection.session_interaction(),
+                            ));
                         }
                     },
                 );
 
                 let manager_for_operation = self.clone();
                 let page_for_operation = page.clone();
-                let query_manager_for_operation = query_manager.clone();
-                let previous_operation = Rc::new(Cell::new(connection.operation()));
                 connection.connect_notify_local(Some("operation"), move |connection, _| {
-                    let operation = connection.operation();
-                    let previous = previous_operation.replace(operation);
                     if manager_for_operation.tab_view.selected_page().as_ref()
                         != Some(&page_for_operation)
                     {
                         return;
                     }
-                    match operation {
-                        ConnectionOperation::PlanningQuery => {
-                            manager_for_operation.dispatch(AppEvent::QueryPlanning)
-                        }
-                        ConnectionOperation::Query => manager_for_operation.dispatch(
-                            AppEvent::QueryRunning(query_manager_for_operation.running_plan()),
-                        ),
-                        ConnectionOperation::Idle
-                            if matches!(
-                                previous,
-                                ConnectionOperation::Query | ConnectionOperation::PlanningQuery
-                            ) =>
-                        {
-                            manager_for_operation.dispatch(AppEvent::QueryFinished)
-                        }
-                        ConnectionOperation::Idle
-                        | ConnectionOperation::Ping
-                        | ConnectionOperation::Version
-                        | ConnectionOperation::Catalog
-                        | ConnectionOperation::Closing
-                        | ConnectionOperation::Explain => {}
-                    }
+                    manager_for_operation
+                        .dispatch(AppEvent::SessionSelected(connection.session_interaction()));
                 });
 
                 let weak_connection = connection.downgrade();
@@ -862,9 +929,11 @@ impl DatabaseTabManager {
         self.tab_view.set_page_pinned(&page, false);
 
         let weak_tab_view = self.tab_view.downgrade();
-        let database_page = page.clone();
-        query_manager.set_empty_callback(move || {
-            if let Some(tab_view) = weak_tab_view.upgrade() {
+        let database_page = page.downgrade();
+        query_manager.set_workspace_close_callback(move || {
+            if let (Some(tab_view), Some(database_page)) =
+                (weak_tab_view.upgrade(), database_page.upgrade())
+            {
                 tab_view.close_page(&database_page);
             }
         });

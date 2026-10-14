@@ -98,6 +98,12 @@ impl DbManager {
     /// Remove a configuration by name
     pub fn remove_config(&self, config_name: &str) -> bool {
         let mut configs = self.imp().configs.borrow_mut();
+        if configs
+            .get(config_name)
+            .is_some_and(|config| !config.connection().can_forget())
+        {
+            return false;
+        }
 
         if let Some(config) = configs.remove(config_name) {
             drop(configs);
@@ -122,6 +128,34 @@ impl DbManager {
         } else {
             false
         }
+    }
+
+    pub fn request_remove_config(
+        &self,
+        config_name: &str,
+    ) -> Result<
+        super::connection_gobject::QueryReceiver<bool, dzban_core::error::ExecutionError>,
+        dzban_core::error::ExecutionError,
+    > {
+        let config = self.get_config(config_name).ok_or_else(|| {
+            dzban_core::error::ExecutionError::Message("Connection is no longer open".into())
+        })?;
+        let completion = config.connection().disconnect_with_completion()?;
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let manager = self.clone();
+        let name = config_name.to_string();
+        glib::spawn_future_local(async move {
+            let result = completion.await.unwrap_or_else(|_| {
+                Err(dzban_core::error::ExecutionError::Message(
+                    "Disconnect delivery was dropped".into(),
+                ))
+            });
+            let result = result.map(|()| {
+                manager.get_config(&name).as_ref() == Some(&config) && manager.remove_config(&name)
+            });
+            let _ = sender.send(result);
+        });
+        Ok(receiver)
     }
 
     /// Get a configuration by name

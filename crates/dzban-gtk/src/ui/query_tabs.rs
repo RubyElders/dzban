@@ -22,7 +22,7 @@ use super::sidebar::{HistoryPlanAction, QueryHistory};
 use dzban_core::documents::{CloseDocument, QueryDocument, QueryDocuments};
 use dzban_core::query_selection::query_at_cursor as extract_query_at_cursor;
 
-type EmptyCallback = Rc<dyn Fn()>;
+type WorkspaceCloseCallback = Rc<dyn Fn()>;
 use dzban_core::result_stream::{ResultPhase, ResultSnapshot, ResultTermination};
 use dzban_gtk::database::RuntimeBridge;
 use dzban_gtk::database::{QueryPlan, ResultSet};
@@ -70,7 +70,7 @@ pub struct QueryTabManager {
     history: QueryHistory,
     plan_inspector: PlanInspector,
     result_inspector: ResultInspector,
-    empty_callback: Rc<RefCell<Option<EmptyCallback>>>,
+    workspace_close_callback: Rc<RefCell<Option<WorkspaceCloseCallback>>>,
     preview_service: Rc<RefCell<Option<dzban_core::preview::PlanPreviewService>>>,
 }
 
@@ -126,7 +126,7 @@ impl QueryTabManager {
             history,
             plan_inspector,
             result_inspector,
-            empty_callback: Rc::new(RefCell::new(None)),
+            workspace_close_callback: Rc::new(RefCell::new(None)),
             preview_service: Rc::new(RefCell::new(None)),
         };
 
@@ -197,28 +197,37 @@ impl QueryTabManager {
 
         let weak_tabs = Rc::downgrade(&manager.tabs);
         let documents = manager.documents.clone();
-        let empty_callback = manager.empty_callback.clone();
+        let workspace_close_callback = manager.workspace_close_callback.clone();
         manager.tab_view.connect_close_page(move |view, page| {
             if let Some(tabs) = weak_tabs.upgrade() {
-                let (query_num, last) = {
+                let query_num = {
                     let tabs = tabs.borrow();
                     let Some((query_num, tab)) = tabs.iter().find(|(_, tab)| tab.page == *page)
                     else {
                         return glib::Propagation::Proceed;
                     };
-                    match documents.borrow_mut().close(tab.document.id()) {
+                    let outcome = if workspace_close_callback.borrow().is_some() {
+                        documents.borrow_mut().close_in_workspace(tab.document.id())
+                    } else {
+                        documents.borrow_mut().close(tab.document.id())
+                    };
+                    match outcome {
                         CloseDocument::Busy => {
                             view.close_page_finish(page, false);
                             return glib::Propagation::Stop;
                         }
-                        CloseDocument::Closed { last } => (*query_num, last),
+                        CloseDocument::CloseWorkspace => {
+                            view.close_page_finish(page, false);
+                            if let Some(callback) = workspace_close_callback.borrow().as_ref() {
+                                callback();
+                            }
+                            return glib::Propagation::Stop;
+                        }
+                        CloseDocument::Closed { .. } => *query_num,
                         CloseDocument::Missing => return glib::Propagation::Proceed,
                     }
                 };
                 tabs.borrow_mut().remove(&query_num);
-                if last && let Some(callback) = empty_callback.borrow().as_ref() {
-                    callback();
-                }
             }
             glib::Propagation::Proceed
         });
@@ -369,14 +378,6 @@ impl QueryTabManager {
             .iter()
             .find(|(_, tab)| tab.document.is_active())
             .map(|(query_num, tab)| (*query_num, tab.document.clone()))
-    }
-
-    pub fn running_plan(&self) -> Option<QueryPlan> {
-        self.tabs
-            .borrow()
-            .values()
-            .find(|tab| tab.document.is_active())
-            .and_then(|tab| tab.document.plan())
     }
 
     pub fn highlight_current_query(&self) -> Option<String> {
@@ -739,11 +740,29 @@ impl QueryTabManager {
         self.documents.borrow().documents().len() as i32
     }
 
-    pub fn set_empty_callback<F>(&self, callback: F)
+    pub fn set_workspace_close_callback<F>(&self, callback: F)
     where
         F: Fn() + 'static,
     {
-        *self.empty_callback.borrow_mut() = Some(Rc::new(callback));
+        *self.workspace_close_callback.borrow_mut() = Some(Rc::new(callback));
+    }
+
+    pub fn retire_closed_session(&self, engine: Option<&dzban_core::execution::QueryEngine>) {
+        let mut documents = self.documents.borrow_mut();
+        if let Some(engine) = engine {
+            if let Err(error) = documents.retire_closed_session(engine) {
+                tracing::error!("Could not retire query documents: {error}");
+            }
+        } else {
+            let ids = documents
+                .documents()
+                .iter()
+                .map(QueryDocument::id)
+                .collect::<Vec<_>>();
+            for id in ids {
+                documents.close(id);
+            }
+        }
     }
 
     pub fn bind_preview_service(&self, service: dzban_core::preview::PlanPreviewService) {

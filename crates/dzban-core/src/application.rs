@@ -51,12 +51,13 @@ pub enum ConnectionSelection {
     Empty,
     Pending(ConnectionRequestId),
     Ready(SessionId),
+    Closing(SessionId),
     Failed(ApplicationError),
 }
 
 impl ConnectionSelection {
     pub fn accepts_connection_request(&self) -> bool {
-        !matches!(self, Self::Ready(_))
+        !matches!(self, Self::Ready(_) | Self::Closing(_))
     }
 
     pub fn begin(&mut self, request: ConnectionRequestId) -> bool {
@@ -81,6 +82,34 @@ impl ConnectionSelection {
 
     pub fn clear(&mut self) {
         *self = Self::Empty;
+    }
+
+    pub fn can_forget(&self) -> bool {
+        matches!(self, Self::Empty | Self::Failed(_))
+    }
+
+    pub fn begin_close(&mut self, session: SessionId) -> bool {
+        if *self != Self::Ready(session) {
+            return false;
+        }
+        *self = Self::Closing(session);
+        true
+    }
+
+    pub fn finish_close(
+        &mut self,
+        session: SessionId,
+        result: &Result<(), ExecutionError>,
+    ) -> bool {
+        if *self != Self::Closing(session) {
+            return false;
+        }
+        *self = if result.is_ok() {
+            Self::Empty
+        } else {
+            Self::Ready(session)
+        };
+        true
     }
 }
 

@@ -21,6 +21,7 @@ enum Stage {
     Connect,
     Version,
     DisconnectFailure,
+    Disconnect,
 }
 
 #[derive(Default)]
@@ -53,6 +54,9 @@ impl DatabaseSession for Session {
         Ok(())
     }
     async fn disconnect(&self) -> Result<(), ExecutionError> {
+        if matches!(self.stage, Stage::Disconnect) {
+            self.gate.wait().await;
+        }
         if matches!(self.stage, Stage::DisconnectFailure)
             && !self.gate.closed.swap(true, Ordering::SeqCst)
         {
@@ -176,6 +180,91 @@ async fn until_session_count(context: &ApplicationContext, count: usize) {
         );
         glib::timeout_future(Duration::from_millis(5)).await;
     }
+}
+
+#[glib::async_test]
+async fn manager_removal_keeps_busy_and_failed_connections_until_cleanup_succeeds() {
+    use dzban_gtk::database::DbManager;
+    for stage in [Stage::Query, Stage::DisconnectFailure] {
+        let (_, context, gate) = fixture(stage);
+        let manager =
+            DbManager::with_runtime_bridge(RuntimeBridge::with_context(context.clone()).unwrap());
+        manager.add_config(
+            "fixture".into(),
+            "host=localhost user=fixture dbname=fixture".into(),
+        );
+        let config = manager.get_config("fixture").unwrap();
+        let connection = config.connection();
+        connection.connect();
+        until(|| connection.state() == ConnectionState::Connected).await;
+        assert!(!manager.remove_config("fixture"));
+        if matches!(stage, Stage::Query) {
+            let query = connection.execute_query_rows("external-wait".into());
+            until(|| gate.entered.load(Ordering::SeqCst)).await;
+            assert!(matches!(
+                manager.request_remove_config("fixture"),
+                Err(ExecutionError::Busy)
+            ));
+            assert_eq!(manager.get_config("fixture"), Some(config.clone()));
+            assert_eq!(connection.state(), ConnectionState::Connected);
+            gate.release.notify_one();
+            query.await.unwrap().unwrap();
+        } else {
+            assert_eq!(
+                manager
+                    .request_remove_config("fixture")
+                    .unwrap()
+                    .await
+                    .unwrap()
+                    .unwrap_err(),
+                ExecutionError::Message("Fixture disconnect failed".into())
+            );
+            assert_eq!(manager.get_config("fixture"), Some(config.clone()));
+            assert_eq!(connection.state(), ConnectionState::Connected);
+            assert_eq!(connection.last_error(), "Fixture disconnect failed");
+        }
+        assert!(
+            manager
+                .request_remove_config("fixture")
+                .unwrap()
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        assert_eq!(manager.config_count(), 0);
+        assert!(manager.get_config("fixture").is_none());
+        assert!(context.session_ids().await.is_empty());
+    }
+}
+
+#[glib::async_test]
+async fn dropped_removal_observers_do_not_lose_cleanup_or_allow_reconnection() {
+    use dzban_gtk::database::DbManager;
+    let (_, context, gate) = fixture(Stage::Disconnect);
+    let manager =
+        DbManager::with_runtime_bridge(RuntimeBridge::with_context(context.clone()).unwrap());
+    manager.add_config(
+        "fixture".into(),
+        "host=localhost user=fixture dbname=fixture".into(),
+    );
+    let connection = manager.get_config("fixture").unwrap().connection();
+    connection.connect();
+    until(|| connection.state() == ConnectionState::Connected).await;
+    let removal = manager.request_remove_config("fixture").unwrap();
+    until(|| gate.entered.load(Ordering::SeqCst)).await;
+    assert!(!manager.remove_config("fixture"));
+    assert!(matches!(
+        manager.request_remove_config("fixture"),
+        Err(ExecutionError::Busy)
+    ));
+    connection.connect();
+    assert_eq!(context.session_ids().await.len(), 1);
+    assert!(!connection.can_forget());
+    drop(removal);
+    gate.release.notify_one();
+    until(|| manager.config_count() == 0).await;
+    assert!(context.session_ids().await.is_empty());
+    assert!(connection.can_forget());
 }
 
 #[glib::async_test]

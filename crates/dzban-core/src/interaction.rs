@@ -57,6 +57,7 @@ pub enum PlanVisibility {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct AppState {
+    pub scope: Option<crate::execution::QueryScope>,
     pub keyboard: KeyboardState,
     pub execution: QueryExecutionState,
     pub preview: PlanPreviewState,
@@ -66,8 +67,19 @@ pub struct AppState {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AppEvent {
-    KeyPressed { key: InputKey, at_ms: u64 },
-    KeyReleased { key: InputKey, at_ms: u64 },
+    SessionSelected(Option<SessionInteraction>),
+    DocumentExecutionChanged {
+        scope: crate::execution::QueryScope,
+        execution: QueryExecutionState,
+    },
+    KeyPressed {
+        key: InputKey,
+        at_ms: u64,
+    },
+    KeyReleased {
+        key: InputKey,
+        at_ms: u64,
+    },
     KeyboardReset,
     QueryAvailabilityChanged(bool),
     PreviewLoading,
@@ -82,6 +94,45 @@ pub enum AppEvent {
     QueryFinished,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionInteraction {
+    pub scope: crate::execution::QueryScope,
+    pub execution: QueryExecutionState,
+    pub query_available: bool,
+}
+
+impl SessionInteraction {
+    pub fn from_engine(engine: &crate::execution::QueryEngine) -> Self {
+        use crate::execution::{OperationState, QueryPhase, SessionPhase};
+        let snapshot = engine.subscribe().borrow().clone();
+        let operation = *engine.subscribe_operation().borrow();
+        let phase = *engine.subscribe_session().borrow();
+        let scope = snapshot.scope();
+        let execution = match (&snapshot.phase, operation) {
+            (
+                QueryPhase::Queued(id) | QueryPhase::Explaining(id),
+                OperationState::Query(active),
+            ) if *id == active => QueryExecutionState::Planning,
+            (QueryPhase::Executing(id), OperationState::Query(active)) if *id == active => {
+                QueryExecutionState::Running {
+                    plan: snapshot.plan,
+                }
+            }
+            (QueryPhase::Canceling(id), OperationState::Query(active)) if *id == active => {
+                QueryExecutionState::Canceling {
+                    plan: snapshot.plan,
+                }
+            }
+            _ => QueryExecutionState::Idle,
+        };
+        Self {
+            scope,
+            execution,
+            query_available: phase == SessionPhase::Open && operation == OperationState::Idle,
+        }
+    }
+}
+
 impl AppEvent {
     pub fn scoped_document_execution(
         snapshot: &crate::documents::DocumentSnapshot,
@@ -92,16 +143,23 @@ impl AppEvent {
         {
             return None;
         }
-        Some(Self::document_execution(snapshot))
+        Some(Self::DocumentExecutionChanged {
+            scope: current,
+            execution: Self::document_execution(snapshot),
+        })
     }
 
-    pub fn document_execution(snapshot: &crate::documents::DocumentSnapshot) -> Self {
+    fn document_execution(snapshot: &crate::documents::DocumentSnapshot) -> QueryExecutionState {
         use crate::documents::DocumentExecution;
         match snapshot.execution {
-            DocumentExecution::Idle | DocumentExecution::Finished(_) => Self::QueryFinished,
-            DocumentExecution::Planning(_) => Self::QueryPlanning,
-            DocumentExecution::Running(_) => Self::QueryRunning(snapshot.plan.clone()),
-            DocumentExecution::Canceling(_) => Self::QueryCanceling,
+            DocumentExecution::Idle | DocumentExecution::Finished(_) => QueryExecutionState::Idle,
+            DocumentExecution::Planning(_) => QueryExecutionState::Planning,
+            DocumentExecution::Running(_) => QueryExecutionState::Running {
+                plan: snapshot.plan.clone(),
+            },
+            DocumentExecution::Canceling(_) => QueryExecutionState::Canceling {
+                plan: snapshot.plan.clone(),
+            },
         }
     }
 }
@@ -140,6 +198,37 @@ pub enum PrimaryAction {
 impl AppState {
     pub fn transition(&mut self, event: AppEvent) -> Vec<AppCommand> {
         match event {
+            AppEvent::SessionSelected(selection) => {
+                let scope = selection.as_ref().map(|selection| selection.scope);
+                let changed =
+                    self.scope.map(|scope| scope.session) != scope.map(|scope| scope.session);
+                self.scope = scope;
+                self.query_available = selection
+                    .as_ref()
+                    .is_some_and(|selection| selection.query_available);
+                self.execution =
+                    selection.map_or(QueryExecutionState::Idle, |selection| selection.execution);
+                if changed {
+                    self.preview = PlanPreviewState::Empty;
+                    self.plan_visibility = PlanVisibility::Hidden;
+                    vec![AppCommand::HidePlan, AppCommand::CancelPreview]
+                } else {
+                    Vec::new()
+                }
+            }
+            AppEvent::DocumentExecutionChanged { scope, execution } => {
+                if self.scope != Some(scope) {
+                    return Vec::new();
+                }
+                self.execution = execution;
+                if self.execution == QueryExecutionState::Planning {
+                    self.preview = PlanPreviewState::Empty;
+                    self.plan_visibility = PlanVisibility::Hidden;
+                    vec![AppCommand::HidePlan]
+                } else {
+                    Vec::new()
+                }
+            }
             AppEvent::PrimaryActionRequested => match self.primary_action() {
                 PrimaryAction::Run => vec![AppCommand::RunQuery],
                 PrimaryAction::Stop => vec![AppCommand::CancelQuery],
