@@ -11,14 +11,12 @@ public struct RootView: View {
     @State private var columns: NavigationSplitViewVisibility = .all
     @State private var actionsVisible = false
     @State private var actionSearch = ""
-    @FocusState private var actionSearchFocused: Bool
+    @State private var selectedAction = 0
 
     public init(store: ApplicationStore) { self.store = store }
 
     public var body: some View {
         VStack(spacing: 0) {
-            topbar
-            Divider()
             NavigationSplitView(columnVisibility: $columns) {
                 VStack(spacing: 0) {
                     List {
@@ -65,7 +63,7 @@ public struct RootView: View {
             }
         }
         .frame(minWidth: 900, minHeight: 500)
-        .background(WindowPolicy(store: store).frame(width: 0, height: 0))
+        .background(WindowPolicy(store: store, toolbar: toolbar).frame(width: 0, height: 0))
         .overlay {
             if actionsVisible {
                 ZStack(alignment: .top) {
@@ -74,7 +72,7 @@ public struct RootView: View {
                         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
                         .overlay(RoundedRectangle(cornerRadius: 10).stroke(.quaternary))
                         .shadow(radius: 12, y: 5)
-                        .padding(.top, 48)
+                        .padding(.top, 8)
                 }
             }
         }
@@ -89,45 +87,35 @@ public struct RootView: View {
         .task { await store.loadProfiles() }
     }
 
-    private var topbar: some View {
-        ZStack {
-            HStack(spacing: 12) {
-                Button { columns = columns == .detailOnly ? .all : .detailOnly } label: {
-                    Label("Query History", systemImage: "sidebar.left")
-                }
-                .help("Toggle query history")
-                .accessibilityIdentifier("history.open")
-                Spacer()
-                if store.closingSession != nil || store.isShuttingDown {
-                    ProgressView().controlSize(.small).accessibilityLabel("Closing connections")
-                }
-                PlanPreviewButton(store: store)
-                Button { Task { await store.newDocument() } } label: {
-                    Label("New Query", systemImage: "plus")
-                }
-                .disabled(store.selectedSession == nil || !store.navigationAvailable)
-                .accessibilityIdentifier("query.new")
-                Button(store.controls?.primaryAction == "stop" ? "Stop" : store.controls?.primaryAction == "stopping" ? "Stopping" : "Run") {
-                    store.sendEditorIntent(.primary)
-                }
-                .disabled(!store.navigationAvailable || store.controls?.primaryAction == "unavailable" || store.controls?.primaryAction == "stopping" || store.selectedSession == nil)
-                .accessibilityIdentifier("query.primary")
-            }
-            Button { actionSearch = ""; actionsVisible = true } label: {
-                HStack {
-                    Image(systemName: "magnifyingglass")
-                    Text("Search actions...").foregroundStyle(.secondary)
-                    Spacer()
-                    Image(systemName: "chevron.down").font(.caption)
-                }.frame(width: 220)
-            }
-            .keyboardShortcut("k", modifiers: [.command, .shift])
-            .accessibilityIdentifier("actions.open")
-        }
-        .buttonStyle(.bordered)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(.bar)
+    private var toolbar: NativeToolbarConfiguration {
+        NativeToolbarConfiguration(
+            history: AnyView(Button { columns = columns == .detailOnly ? .all : .detailOnly } label: {
+                Label("Query History", systemImage: "sidebar.left")
+            }.labelStyle(.iconOnly).help("Toggle query history").accessibilityIdentifier("history.open")),
+            plan: AnyView(PlanPreviewButton(store: store)),
+            newQuery: AnyView(Button { Task { await store.newDocument() } } label: {
+                Label("New Query", systemImage: "plus")
+            }.labelStyle(.iconOnly).disabled(store.selectedSession == nil || !store.navigationAvailable).accessibilityIdentifier("query.new")),
+            primary: AnyView(Button(store.controls?.primaryAction == "stop" ? "Stop" : store.controls?.primaryAction == "stopping" ? "Stopping" : "Run") {
+                store.sendEditorIntent(.primary)
+            }.disabled(!store.navigationAvailable || store.controls?.primaryAction == "unavailable" || store.controls?.primaryAction == "stopping" || store.selectedSession == nil).accessibilityIdentifier("query.primary")),
+            placeholder: store.isShuttingDown ? "Closing connections..." : store.controls?.primaryAction == "stopping" ? "Canceling query..." : store.controls?.primaryAction == "stop" ? "Query running..." : "Search actions...",
+            busy: store.isShuttingDown || store.controls?.primaryAction == "stop" || store.controls?.primaryAction == "stopping",
+            search: { text in actionSearch = text; selectedAction = 0; actionsVisible = true },
+            move: { direction in
+                let enabled = actions.filter(\.enabled)
+                guard !enabled.isEmpty else { return }
+                selectedAction = min(max(0, selectedAction + direction), enabled.count - 1)
+                actionsVisible = true
+            },
+            submit: {
+                let enabled = actions.filter(\.enabled)
+                guard enabled.indices.contains(selectedAction) else { return }
+                actionsVisible = false
+                enabled[selectedAction].perform()
+            },
+            dismiss: { actionsVisible = false }
+        )
     }
 
     private struct ActionItem: Identifiable {
@@ -164,13 +152,6 @@ public struct RootView: View {
 
     private var actionMenu: some View {
         VStack(spacing: 10) {
-            TextField("Search actions, connections, and queries", text: $actionSearch)
-                .textFieldStyle(.roundedBorder)
-                .accessibilityIdentifier("actions.search")
-                .focused($actionSearchFocused)
-                .onAppear { actionSearchFocused = true }
-                .onExitCommand { actionsVisible = false }
-                .onSubmit { if let action = actions.first(where: \.enabled) { actionsVisible = false; action.perform() } }
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 2) {
                     ForEach(actions) { action in
@@ -180,6 +161,7 @@ public struct RootView: View {
                                 Text(action.detail).font(.caption).foregroundStyle(.secondary)
                             }.frame(maxWidth: .infinity, alignment: .leading).padding(7)
                             .contentShape(Rectangle())
+                            .background(actions.filter(\.enabled).indices.contains(selectedAction) && actions.filter(\.enabled)[selectedAction].id == action.id ? Color.accentColor.opacity(0.15) : .clear, in: RoundedRectangle(cornerRadius: 5))
                         }
                         .buttonStyle(.plain)
                         .disabled(!action.enabled)
@@ -300,6 +282,5 @@ public struct RootView: View {
             .foregroundStyle(.secondary)
             .padding(8)
         }
-        .navigationTitle(workspace.profile)
     }
 }
