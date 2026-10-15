@@ -46,6 +46,7 @@ public struct DocumentSnapshot: Decodable, Sendable {
     public let termination: String?
     public let captureError: JSONValue?
     public let commandResult: CommandResult?
+    public let executionSeconds: Double?
     public let history: Bool?
     public let historyTotalRows: Int?
     public let historyPlanAvailable: Bool?
@@ -206,6 +207,8 @@ public struct BridgeCommand: Encodable, Sendable {
     var requestRevision: UInt64?
     var historyRevision: UUID?
     var index: Int?
+    var includeVersion: Bool?
+    var input: NativeInput?
 
     public static func connect(profile: String, revision: UInt64? = nil) -> Self { Self(command: "connect", profile: profile, revision: revision) }
     public static func selectSession(_ session: UUID?, revision: UInt64? = nil) -> Self { Self(command: "select_session", session: session, revision: revision) }

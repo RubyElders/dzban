@@ -5,6 +5,8 @@ struct NativeShortcutReference: View {
     private let shortcuts = [
         ("Command-Return / Command-Shift-Return", "Run selected SQL or the current statement"),
         ("Escape / Command-period", "Cancel the running query"),
+        ("Hold Command/Control + Shift", "Estimate the current query in the top bar"),
+        ("Command/Control-Shift-Space", "Tap to pin the query plan; hold to peek"),
         ("Command-Shift-P", "Tap to pin the query plan; hold to peek until release"),
         ("Space in results", "Tap to pin the selected row; hold to peek"),
         ("Return in results", "Inspect the selected cell's original value"),
@@ -32,7 +34,7 @@ struct NativeShortcutReference: View {
                     }
                 }
             }
-            Text("These are the native macOS controls. The GTK Ctrl+Shift modifier-only estimate chord is not implemented in this frontend; use Command-Shift-P for live plan preview.")
+            Text("Hold Command or Control for query actions, add Shift for an estimate, then Enter to execute or Space to inspect the plan. The footer probe refreshes measured database latency.")
                 .font(.caption).foregroundStyle(.secondary)
         }.padding(20).frame(width: 760, height: 530)
     }

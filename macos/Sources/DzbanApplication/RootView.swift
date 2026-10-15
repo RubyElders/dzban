@@ -70,12 +70,24 @@ public struct RootView: View {
     }
 
     private var actionPlaceholder: String {
-        if plan.loading { return "Estimating query..." }
-        if plan.visible, let value = plan.plan { return PlanFormatting.summary(value) }
         if store.isShuttingDown { return "Closing connections..." }
         if store.controls?.primaryAction == "stopping" { return "Canceling query..." }
-        if store.controls?.primaryAction == "stop" { return "Query running..." }
-        return store.selectedSession == nil ? "Search actions..." : "Cmd-Return: run | Cmd-Shift-P: plan"
+        if store.controls?.primaryAction == "stop" { return store.document?.execution == "planning" ? "Planning query..." : "Query running..." }
+        if let hint = store.sharedInput?.hint {
+            switch hint.kind {
+            case "primary_guide": return "Enter: run | Shift: estimate"
+            case "estimating": return "Estimating rows and cost... | Enter: run"
+            case "estimate_ready": return hint.plan.map { PlanFormatting.summary($0) + " | Enter: run | Space: plan" } ?? "Enter: run | Space: plan"
+            case "estimate_error": return hint.error ?? "Estimate failed"
+            case "planning": return "Planning query..."
+            case "running": return "Query running..."
+            case "canceling": return "Canceling query..."
+            default: break
+            }
+        }
+        if plan.loading { return "Estimating query..." }
+        if plan.visible, let value = plan.plan { return PlanFormatting.summary(value) }
+        return store.selectedSession == nil ? "Search actions..." : "Hold Cmd+Shift: estimate | Enter: run"
     }
 
     private var toolbar: NativeToolbarConfiguration {
@@ -130,6 +142,7 @@ public struct RootView: View {
             ActionItem(id: "disconnect", title: "Disconnect", detail: "Close the current workspace", enabled: store.selectedSession != nil && store.navigationAvailable) { if let session = store.selectedSession { Task { await store.closeSession(session) } } }
         ]
         items += [
+            ActionItem(id: "probe", title: "Test All Connections", detail: "Probe configured servers and measure delay", enabled: store.navigationAvailable) { Task { await store.probeAllProfiles() } },
             ActionItem(id: "shortcuts", title: "Keyboard Shortcuts", detail: "Show native keyboard controls", enabled: true) { store.shortcutsVisible = true },
             ActionItem(id: "close-query", title: "Close Query Tab", detail: "Close the selected query", enabled: store.document != nil && store.navigationAvailable) { if let document = store.document { Task { await store.closeDocument(document.document) } } },
             ActionItem(id: "next-query", title: "Next Query Tab", detail: "Select the next query", enabled: store.document != nil && store.navigationAvailable) { Task { await store.cycleDocument(1) } },
@@ -174,8 +187,8 @@ public struct RootView: View {
         }.padding(12).frame(width: 380, height: 360)
     }
 
-    private func backendSymbol(_ profile: String) -> String {
-        store.profiles.first { $0.name == profile }?.backend == "clickhouse" ? "chart.bar.xaxis" : "cylinder.split.1x2"
+    private func backend(_ profile: String) -> String {
+        store.profiles.first { $0.name == profile }?.backend ?? "postgresql"
     }
 
     private var connectionTabs: some View {
@@ -188,7 +201,7 @@ public struct RootView: View {
                     ForEach(store.workspaces) { workspace in
                         HStack(spacing: 6) {
                             Button { Task { await store.selectSession(workspace.id) } } label: {
-                                Label(workspace.profile, systemImage: backendSymbol(workspace.profile))
+                                HStack { DatabaseArtwork(backend: backend(workspace.profile)); Text(workspace.profile) }
                             }.accessibilityIdentifier("workspace.\(workspace.id)")
                             Button { Task { await store.closeSession(workspace.id) } } label: {
                                 Image(systemName: "xmark").font(.caption)
@@ -213,24 +226,44 @@ public struct RootView: View {
     }
 
     private var statusbar: some View {
-        HStack(spacing: 12) {
-            Label(store.workspace?.profile ?? "Disconnected", systemImage: store.workspace.map { backendSymbol($0.profile) } ?? "network.slash")
-                .accessibilityIdentifier("connection.status")
-            if let document = store.document {
-                Divider().frame(height: 14)
-                Label(document.execution.capitalized, systemImage: document.execution == "finished" ? (document.error == nil ? "checkmark.circle" : "exclamationmark.circle") : "waveform.path")
-                    .accessibilityIdentifier("query.execution")
-                if document.generation > 0 {
-                    Text("Run \(document.generation)").accessibilityIdentifier("query.generation")
-                    Label("\(document.rows) rows", systemImage: "tablecells").accessibilityIdentifier("status.rows")
-                    if let bytes = document.captureBytes { Label(ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .memory), systemImage: "internaldrive") }
-                }
-            }
+        let profile = store.workspace?.profile ?? store.pendingProfile
+        let status = store.selectedSession.flatMap { store.health[$0] } ?? profile.flatMap { store.profileHealth[$0] }
+        let state = store.pendingProfile != nil ? "connecting" : status?.state ?? "disconnected"
+        let name = profile ?? "No database"
+        let connectionText = state == "error" ? "\(name): \(status?.failure ?? "connection failed")" : name
+        return HStack(spacing: 12) {
+            HStack(spacing: 5) {
+                Circle().fill(state == "connected" || state == "reachable" ? Color.green : state == "error" ? Color.red : state == "connecting" ? Color.orange : Color.secondary)
+                    .frame(width: 7, height: 7)
+                    .accessibilityLabel(state.capitalized)
+                Text(connectionText).lineLimit(1).frame(maxWidth: 280, alignment: .leading)
+            }.help(state.capitalized + ": " + connectionText).accessibilityElement(children: .combine).accessibilityIdentifier("connection.status")
+            Divider().frame(height: 14)
+            HStack(spacing: 5) {
+                FooterArtwork(name: "dzban-query-time-symbolic")
+                Text(store.document?.executionSeconds.map { String(format: "%.2fs", $0) } ?? "--").accessibilityIdentifier("status.duration")
+            }.help("Query execution time")
+            Divider().frame(height: 14)
+            HStack(spacing: 5) {
+                FooterArtwork(name: "dzban-result-rows-symbolic")
+                Text(store.document.flatMap { $0.generation > 0 && $0.commandResult == nil ? "\($0.rows) rows" : nil } ?? "-- rows").accessibilityIdentifier("status.rows")
+            }.help("Returned rows")
             Spacer()
-            Text("Cmd-Return: Run | Cmd-Shift-P: Plan").foregroundStyle(.secondary)
-            Button { store.shortcutsVisible = true } label: {
-                Image(systemName: "keyboard")
-            }.help("Keyboard Shortcuts (F1)").accessibilityLabel("Keyboard Shortcuts").accessibilityIdentifier("shortcuts.open")
+            Button { if let session = store.selectedSession { Task { await store.probe(session: session) } } } label: {
+                HStack(spacing: 5) {
+                    if status?.probing == true { ProgressView().controlSize(.small) }
+                    else { FooterArtwork(name: "dzban-ping-symbolic") }
+                    Text(ConnectionHealth.latency(status?.latencyMicros)).accessibilityIdentifier("status.latency")
+                }
+            }.buttonStyle(.plain).disabled(store.selectedSession == nil || !store.navigationAvailable || status?.probing == true || store.controls?.primaryAction == "stop" || plan.loading)
+                .help("Database ping latency. Click to probe now.").accessibilityIdentifier("connection.probe").accessibilityValue(ConnectionHealth.latency(status?.latencyMicros))
+            Divider().frame(height: 14)
+            HStack(spacing: 5) {
+                if let profile { DatabaseArtwork(backend: backend(profile)) }
+                Text(status?.version.map { $0.split(whereSeparator: \.isWhitespace).prefix(2).joined(separator: " ") } ?? "--").lineLimit(1).accessibilityIdentifier("status.version")
+            }.help(status?.version ?? "Database server version")
+            Button { store.shortcutsVisible = true } label: { Image(systemName: "keyboard") }
+                .help("Keyboard Shortcuts (F1)").accessibilityLabel("Keyboard Shortcuts").accessibilityIdentifier("shortcuts.open")
         }.font(.caption).padding(.horizontal, 12).padding(.vertical, 7)
         .accessibilityElement(children: .contain).accessibilityIdentifier("workspace.statusbar")
     }
@@ -244,24 +277,42 @@ public struct RootView: View {
                 Button("Reload Profiles") { Task { await store.loadProfiles() } }
             } else {
                 ForEach(store.profiles) { profile in
-                    Button { Task { await store.connect(profile: profile.name) } } label: {
-                        HStack {
-                            Image(systemName: backendSymbol(profile.name))
-                            VStack(alignment: .leading) {
-                                Text(profile.name).font(.headline)
-                                Text(profile.backend == "postgresql" ? "PostgreSQL" : "ClickHouse").font(.caption).foregroundStyle(.secondary)
+                    HStack(spacing: 12) {
+                        Button { Task { await store.connect(profile: profile.name) } } label: {
+                            HStack {
+                                DatabaseArtwork(backend: backend(profile.name))
+                                VStack(alignment: .leading) {
+                                    Text(profile.name).font(.headline)
+                                    Text(profile.backend == "postgresql" ? "PostgreSQL" : "ClickHouse").font(.caption).foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                if store.pendingProfile == profile.name { ProgressView().controlSize(.small) }
+                                else { Image(systemName: "chevron.right") }
                             }
-                            Spacer()
-                            if store.pendingProfile == profile.name { ProgressView().controlSize(.small) }
-                            else { Image(systemName: "chevron.right") }
+                            .padding(8)
+                            .frame(width: 320)
                         }
-                        .padding(8)
-                        .frame(width: 320)
+                        .disabled(store.pendingProfile != nil || !store.navigationAvailable)
+                        .accessibilityIdentifier("connection.\(profile.name)")
+                        .accessibilityLabel("Connect to \(profile.name)")
+                        VStack(alignment: .leading, spacing: 5) {
+                            Button("Probe") { Task { await store.probeProfile(profile.name) } }
+                                .disabled(store.profileHealth[profile.name]?.probing == true || !store.navigationAvailable)
+                                .accessibilityIdentifier("connection.probe.\(profile.name)")
+                            if let health = store.profileHealth[profile.name] {
+                                if health.probing { ProgressView().controlSize(.small) }
+                                else {
+                                    Text(health.failure ?? "\(health.state.capitalized) - \(ConnectionHealth.latency(health.latencyMicros))")
+                                        .font(.caption).foregroundStyle(health.state == "error" ? Color.red : .secondary)
+                                        .lineLimit(2).help(health.failure ?? health.version ?? health.state)
+                                        .accessibilityIdentifier("connection.health.\(profile.name)")
+                                }
+                            }
+                        }.frame(width: 170, alignment: .leading)
                     }
-                    .disabled(store.pendingProfile != nil || !store.navigationAvailable)
-                    .accessibilityIdentifier("connection.\(profile.name)")
-                    .accessibilityLabel("Connect to \(profile.name)")
                 }
+                Button("Test All Connections") { Task { await store.probeAllProfiles() } }
+                    .disabled(!store.navigationAvailable).accessibilityIdentifier("connections.probe-all")
             }
         }
         .padding(32)

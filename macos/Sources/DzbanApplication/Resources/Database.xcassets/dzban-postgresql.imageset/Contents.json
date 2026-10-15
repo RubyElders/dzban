@@ -1,0 +1,14 @@
+{
+  "images": [
+    {
+      "filename": "dzban-postgresql.svg",
+      "idiom": "universal"
+    }
+  ],
+  "info": {
+    "version": 1
+  },
+  "properties": {
+    "preserves-vector-representation": true
+  }
+}

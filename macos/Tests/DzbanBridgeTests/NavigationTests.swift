@@ -2,6 +2,7 @@ import AppKit
 import DzbanBridge
 @testable import DzbanApplication
 import XCTest
+import SwiftUI
 
 @MainActor
 final class NavigationTests: XCTestCase {
@@ -184,7 +185,7 @@ final class NavigationTests: XCTestCase {
         let editor = store.editor(for: document)
         editor.edit(text: "SELECT 42", selection: NSRange(location: 0, length: 0))
         store.editorChanged(session: session, document: document.document)
-        let coordinator = WindowPolicy.Coordinator(store: store)
+        let coordinator = WindowPolicy.Coordinator(store: store, toolbar: NativeToolbarConfiguration(history: AnyView(EmptyView()), plan: AnyView(EmptyView()), newQuery: AnyView(EmptyView()), primary: AnyView(EmptyView()), placeholder: "", busy: false, shortcuts: {}, search: { _ in }, move: { _ in }, submit: {}, dismiss: {}))
         let window = NSWindow()
         coordinator.attach(window)
         defer { coordinator.detach() }
@@ -198,6 +199,86 @@ final class NavigationTests: XCTestCase {
         XCTAssertTrue(store.plan.visible)
         XCTAssertTrue(store.plan.pinned)
         await store.closeSession(session)
+        try await store.shutdown()
+    }
+
+    func testProbesReportLatencyAndVersionWithoutOpeningAWorkspace() async throws {
+        let bridge = try Bridge.fixture()
+        let store = ApplicationStore(bridge: bridge)
+        await store.loadProfiles()
+        await store.probeProfile("fixture")
+        XCTAssertEqual(store.profileHealth["fixture"]?.state, "reachable")
+        XCTAssertEqual(store.profileHealth["fixture"]?.version, "fixture")
+        XCTAssertNotNil(store.profileHealth["fixture"]?.latencyMicros)
+        XCTAssertTrue(store.workspaces.isEmpty)
+        XCTAssertNil(store.selectedSession)
+        await store.probeProfile("fixture-failure")
+        XCTAssertEqual(store.profileHealth["fixture-failure"]?.state, "error")
+        XCTAssertEqual(store.profileHealth["fixture-failure"]?.failure, "Fixture connection rejected")
+        XCTAssertTrue(store.workspaces.isEmpty)
+        let connected = await store.connect(profile: "fixture")
+        XCTAssertTrue(connected)
+        let session = try XCTUnwrap(store.selectedSession)
+        try await until { store.health[session]?.latencyMicros != nil }
+        XCTAssertEqual(store.health[session]?.state, "connected")
+        XCTAssertEqual(ConnectionHealth.latency(999), "999µs")
+        XCTAssertEqual(ConnectionHealth.latency(1250), "1ms")
+        XCTAssertEqual(ConnectionHealth.latency(1_250_000), "1.25s")
+        try await store.shutdown()
+    }
+
+    func testSharedChordEstimatesWithoutExecutingThenPinsAndRunsOnce() async throws {
+        let (_, store, session) = try await connected()
+        let document = try XCTUnwrap(store.document)
+        store.editor(for: document).edit(text: "SELECT 42", selection: NSRange(location: 0, length: 0))
+        store.editorChanged(session: session, document: document.document)
+        store.sendSharedKey(.primary, pressed: true, at: 1)
+        store.sendSharedKey(.preview, pressed: true, at: 2)
+        try await until { store.sharedInput?.hint.kind == "estimate_ready" }
+        XCTAssertEqual(store.document?.generation, 0)
+        XCTAssertFalse(store.plan.visible)
+        store.sendSharedKey(.inspect, pressed: true, at: 400)
+        try await until { store.plan.visible }
+        store.sendSharedKey(.inspect, pressed: false, at: 410)
+        try await until { store.plan.pinned }
+        store.sendSharedKey(.preview, pressed: false, at: 420)
+        store.sendSharedKey(.primary, pressed: false, at: 421)
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertTrue(store.plan.pinned)
+        store.plan.close()
+        store.sendSharedKey(.primary, pressed: true, at: 500)
+        store.sendSharedKey(.submit, pressed: true, at: 501)
+        store.sendSharedKey(.submit, pressed: true, at: 502)
+        store.sendSharedKey(.submit, pressed: false, at: 503)
+        store.sendSharedKey(.primary, pressed: false, at: 504)
+        try await until { store.document?.execution == "finished" }
+        XCTAssertEqual(store.document?.generation, 1)
+        XCTAssertNotNil(store.document?.executionSeconds)
+        try await store.shutdown()
+    }
+
+    func testSubmitDuringDelayedEstimateWaitsAndNavigationDropsLatePlan() async throws {
+        let (_, store, session) = try await connected()
+        let document = try XCTUnwrap(store.document)
+        store.editor(for: document).edit(text: "SELECT 'preview_delayed'", selection: NSRange(location: 0, length: 0))
+        store.editorChanged(session: session, document: document.document)
+        store.sendSharedKey(.primary, pressed: true, at: 1)
+        store.sendSharedKey(.preview, pressed: true, at: 2)
+        try await until { store.plan.loading }
+        store.sendSharedKey(.submit, pressed: true, at: 3)
+        store.sendSharedKey(.submit, pressed: false, at: 4)
+        try await until { store.document?.execution == "finished" }
+        XCTAssertEqual(store.document?.generation, 1)
+        XCTAssertNil(store.failure)
+        store.clearSharedInput()
+        store.sendSharedKey(.primary, pressed: true, at: 600)
+        store.sendSharedKey(.preview, pressed: true, at: 601)
+        try await until { store.plan.loading }
+        await store.newDocument()
+        try await Task.sleep(for: .milliseconds(650))
+        XCTAssertFalse(store.plan.visible)
+        XCTAssertNil(store.plan.plan)
+        XCTAssertEqual(store.document?.generation, 0)
         try await store.shutdown()
     }
 

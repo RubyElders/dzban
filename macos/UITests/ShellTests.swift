@@ -80,6 +80,38 @@ final class ShellTests: XCTestCase {
         XCTAssertTrue(app.wait(for: .notRunning, timeout: 10))
     }
 
+    func testSharedEstimateChordAndMeasuredFooter() throws {
+        app.launchArguments = ["--fixture-query", "SELECT 42"]
+        launchApp()
+        waitForValue("Complete - 500 rows", in: app.staticTexts["results.status"])
+        waitForValue("fixture", in: app.staticTexts["status.version"])
+        waitForValue("1µs", in: app.buttons["connection.probe"])
+        XCTAssertEqual(app.staticTexts["status.rows"].value as? String, "500 rows")
+        app.buttons["connection.probe"].click()
+        waitForValue("1µs", in: app.buttons["connection.probe"])
+        app.textViews["query.editor"].click()
+        app.textViews["query.editor"].typeText("SELECT 42")
+        XCUIElement.perform(withKeyModifiers: [.command, .shift]) {
+            app.typeKey(.shift, modifierFlags: [.command, .shift])
+            let search = app.toolbars.searchFields["actions.search"]
+            let ready = expectation(for: NSPredicate(format: "placeholderValue CONTAINS 'Space: plan'"), evaluatedWith: search)
+            wait(for: [ready], timeout: 10)
+            XCTAssertFalse(app.textViews["plan.value"].exists)
+            app.typeKey(" ", modifierFlags: [.command, .shift])
+            XCTAssertTrue(app.textViews["plan.value"].waitForExistence(timeout: 5))
+        }
+        XCTAssertTrue(app.buttons["plan.close"].exists)
+        let attachment = XCTAttachment(screenshot: app.windows.firstMatch.screenshot())
+        attachment.name = "Shared estimate chord and measured footer"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        app.buttons["plan.close"].click()
+        app.typeKey(.return, modifierFlags: [.command, .shift])
+        waitForValue("Complete - 500 rows", in: app.staticTexts["results.status"])
+        app.typeKey("q", modifierFlags: .command)
+        XCTAssertTrue(app.wait(for: .notRunning, timeout: 10))
+    }
+
     func testCenteredActionsAndLeftHistory() throws {
         app.launchArguments = ["--fixture-query", "SELECT 42"]
         launchApp()
@@ -585,11 +617,17 @@ final class ShellTests: XCTestCase {
         XCTAssertTrue(connect.waitForExistence(timeout: 10))
         connect.click()
         XCTAssertTrue(app.textViews["query.editor"].waitForExistence(timeout: 10))
+        let version = app.staticTexts["status.version"]
+        XCTAssertTrue(version.waitForExistence(timeout: 5))
+        XCTAssertTrue((version.value as? String)?.contains(postgres ? "PostgreSQL" : "25.") == true)
+        XCTAssertNotEqual(app.buttons["connection.probe"].value as? String, "--")
+        app.buttons["connection.probe"].click()
         let sql = postgres
             ? "SELECT 42 AS id, NULL::text AS missing, chr(382)||chr(10)||'value' AS value"
             : "SELECT 42 AS id, CAST(NULL, 'Nullable(String)') AS missing, concat(char(197,190),char(10),'value') AS value"
         submitResultQuery(sql)
         waitForValue("Complete - 1 rows", in: app.staticTexts["results.status"])
+        XCTAssertTrue((app.staticTexts["status.duration"].value as? String)?.contains("s") == true)
         waitForValue("42", in: app.descendants(matching: .any)["result.cell.0.0"])
         let null = app.descendants(matching: .any)["result.cell.0.1"]
         waitForValue("NULL", in: null)
