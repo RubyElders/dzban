@@ -41,7 +41,7 @@ Run `shutdown`, inspect its outcome, and then release the application. Releasing
 | `input` | `session`, `document`, draft `revision`, typed `input` event | Shared input reducer commands, action hint, and pinned state; rejects stale selection |
 | `await_idle` | `session` | Wait for preview/ping/version cleanup; report an active query without waiting; reject a closed session |
 | `probe_session` | `session`, `include_version` | Measured latency and optional server version; busy is distinct from failure |
-| `probe_profile` | `profile` | Probe a temporary connection and close it before returning; does not select a workspace |
+| `probe_profile` | `profile` | Probe a temporary connection and close it before returning; same `connected` result as a session probe; does not select a workspace |
 | `peek` | `session`, `surface`, `event`, optional `elapsed_ms` | Shared plan/row tap, hold, pin, close, and focus-reset visibility |
 | `observe_controls` | `session` | Coalesced shared control projection on session, operation, or query changes |
 | `observe_document` | `session`, `document` | Initial snapshot and subsequent coalesced snapshots |

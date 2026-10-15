@@ -9,7 +9,6 @@ public struct RootView: View {
         var id: String { switch self { case .catalog(let id): return "catalog-\(id)" } }
     }
     @State private var panel: WorkspacePanel?
-    @State private var columns: NavigationSplitViewVisibility = .all
     @State private var actionsVisible = false
     @State private var actionSearch = ""
     @State private var selectedAction = 0
@@ -20,23 +19,22 @@ public struct RootView: View {
         VStack(spacing: 0) {
             connectionTabs
             Divider()
-            NavigationSplitView(columnVisibility: $columns) {
-                VStack(spacing: 0) {
-                    if let session = store.selectedSession {
-                        HistoryBrowser(store: store, session: session) { store.historyVisible = false }
-                            .id(session)
-                    } else {
-                        ContentUnavailableView("Query History", systemImage: "clock", description: Text("Connect to a database to browse saved queries."))
+            HSplitView {
+                if store.historyVisible {
+                    VStack(spacing: 0) {
+                        if let session = store.selectedSession {
+                            HistoryBrowser(store: store, session: session) { store.historyVisible = false }
+                                .id(session)
+                        } else {
+                            ContentUnavailableView("Query History", systemImage: "clock", description: Text("Connect to a database to browse saved queries."))
+                        }
                     }
+                    .frame(minWidth: 240, idealWidth: 280, maxWidth: 320)
                 }
-                .navigationSplitViewColumnWidth(min: 260, ideal: 300, max: 420)
-                .toolbar(removing: .sidebarToggle)
-            } detail: {
-                if let workspace = store.workspace {
-                    workspaceView(workspace)
-                } else {
-                    chooser
-                }
+                Group {
+                    if let workspace = store.workspace { workspaceView(workspace) }
+                    else { chooser }
+                }.frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             Divider()
             statusbar
@@ -56,8 +54,6 @@ public struct RootView: View {
             }
         }
         .sheet(isPresented: $store.shortcutsVisible) { NativeShortcutReference() }
-        .onChange(of: store.historyVisible) { _, visible in columns = visible ? .all : .detailOnly }
-        .onChange(of: columns) { _, value in store.historyVisible = value != .detailOnly }
         .sheet(item: $panel) { panel in
             switch panel {
             case .catalog(let session): CatalogBrowser(bridge: store.bridge, session: session)
@@ -75,9 +71,9 @@ public struct RootView: View {
         if store.controls?.primaryAction == "stop" { return store.document?.execution == "planning" ? "Planning query..." : "Query running..." }
         if let hint = store.sharedInput?.hint {
             switch hint.kind {
-            case "primary_guide": return "Enter: run | Shift: estimate"
-            case "estimating": return "Estimating rows and cost... | Enter: run"
-            case "estimate_ready": return hint.plan.map { PlanFormatting.summary($0) + " | Enter: run | Space: plan" } ?? "Enter: run | Space: plan"
+            case "primary_guide": return "Enter: run - Shift: estimate - Shift+Enter: estimate and run"
+            case "estimating": return "Enter: run - Space: plan - estimating rows and cost..."
+            case "estimate_ready": return hint.plan.map { "Enter: run - Space: plan - " + PlanFormatting.compact($0) } ?? "Enter: run | Space: plan"
             case "estimate_error": return hint.error ?? "Estimate failed"
             case "planning": return "Planning query..."
             case "running": return "Query running..."
@@ -86,7 +82,7 @@ public struct RootView: View {
             }
         }
         if plan.loading { return "Estimating query..." }
-        if plan.visible, let value = plan.plan { return PlanFormatting.summary(value) }
+        if plan.visible, let value = plan.plan { return PlanFormatting.compact(value) }
         return store.selectedSession == nil ? "Search actions..." : "Hold Cmd+Shift: estimate | Enter: run"
     }
 
@@ -221,6 +217,7 @@ public struct RootView: View {
             .disabled(store.pendingProfile != nil)
         }
         .padding(.horizontal, 10).padding(.vertical, 6)
+        .buttonStyle(.borderless)
         .disabled(!store.navigationAvailable)
         .accessibilityElement(children: .contain).accessibilityIdentifier("connection.tabs")
     }
@@ -228,27 +225,27 @@ public struct RootView: View {
     private var statusbar: some View {
         let profile = store.workspace?.profile ?? store.pendingProfile
         let status = store.selectedSession.flatMap { store.health[$0] } ?? profile.flatMap { store.profileHealth[$0] }
-        let state = store.pendingProfile != nil ? "connecting" : status?.state ?? "disconnected"
+        let state: ConnectionState = store.pendingProfile != nil ? .connecting : status?.state ?? .disconnected
         let name = profile ?? "No database"
-        let connectionText = state == "error" ? "\(name): \(status?.failure ?? "connection failed")" : name
+        let connectionText = state == .error ? "\(name): \(status?.failure ?? "connection failed")" : name
         return HStack(spacing: 12) {
             HStack(spacing: 5) {
-                Circle().fill(state == "connected" || state == "reachable" ? Color.green : state == "error" ? Color.red : state == "connecting" ? Color.orange : Color.secondary)
+                Circle().fill(state == .connected ? Color.green : state == .error ? Color.red : state == .connecting ? Color.orange : Color.secondary)
                     .frame(width: 7, height: 7)
-                    .accessibilityLabel(state.capitalized)
-                Text(connectionText).lineLimit(1).frame(maxWidth: 280, alignment: .leading)
-            }.help(state.capitalized + ": " + connectionText).accessibilityElement(children: .combine).accessibilityIdentifier("connection.status")
+                    .accessibilityLabel(state.label)
+                Text(connectionText).lineLimit(1).truncationMode(.middle).frame(maxWidth: 200, alignment: .leading).fixedSize(horizontal: true, vertical: false)
+            }.help(state.label + ": " + connectionText).accessibilityElement(children: .combine).accessibilityIdentifier("connection.status")
             Divider().frame(height: 14)
             HStack(spacing: 5) {
                 FooterArtwork(name: "dzban-query-time-symbolic")
                 Text(store.document?.executionSeconds.map { String(format: "%.2fs", $0) } ?? "--").accessibilityIdentifier("status.duration")
-            }.help("Query execution time")
+            }.fixedSize().help("Query execution time")
             Divider().frame(height: 14)
             HStack(spacing: 5) {
                 FooterArtwork(name: "dzban-result-rows-symbolic")
                 Text(store.document.flatMap { $0.generation > 0 && $0.commandResult == nil ? "\($0.rows) rows" : nil } ?? "-- rows").accessibilityIdentifier("status.rows")
-            }.help("Returned rows")
-            Spacer()
+            }.fixedSize().help("Returned rows")
+            Spacer(minLength: 16)
             Button { if let session = store.selectedSession { Task { await store.probe(session: session) } } } label: {
                 HStack(spacing: 5) {
                     if status?.probing == true { ProgressView().controlSize(.small) }
@@ -256,15 +253,15 @@ public struct RootView: View {
                     Text(ConnectionHealth.latency(status?.latencyMicros)).accessibilityIdentifier("status.latency")
                 }
             }.buttonStyle(.plain).disabled(store.selectedSession == nil || !store.navigationAvailable || status?.probing == true || store.controls?.primaryAction == "stop" || plan.loading)
-                .help("Database ping latency. Click to probe now.").accessibilityIdentifier("connection.probe").accessibilityValue(ConnectionHealth.latency(status?.latencyMicros))
+                .help("Database ping latency. Click to probe now.").accessibilityIdentifier("connection.probe").accessibilityValue(ConnectionHealth.latency(status?.latencyMicros)).frame(width: 86, alignment: .trailing)
             Divider().frame(height: 14)
             HStack(spacing: 5) {
                 if let profile { DatabaseArtwork(backend: backend(profile)) }
                 Text(status?.version.map { $0.split(whereSeparator: \.isWhitespace).prefix(2).joined(separator: " ") } ?? "--").lineLimit(1).accessibilityIdentifier("status.version")
-            }.help(status?.version ?? "Database server version")
+            }.fixedSize().help(status?.version ?? "Database server version")
             Button { store.shortcutsVisible = true } label: { Image(systemName: "keyboard") }
                 .help("Keyboard Shortcuts (F1)").accessibilityLabel("Keyboard Shortcuts").accessibilityIdentifier("shortcuts.open")
-        }.font(.caption).padding(.horizontal, 12).padding(.vertical, 7)
+        }.font(.caption).monospacedDigit().buttonStyle(.borderless).frame(height: 30).padding(.horizontal, 12)
         .accessibilityElement(children: .contain).accessibilityIdentifier("workspace.statusbar")
     }
 
@@ -302,9 +299,9 @@ public struct RootView: View {
                             if let health = store.profileHealth[profile.name] {
                                 if health.probing { ProgressView().controlSize(.small) }
                                 else {
-                                    Text(health.failure ?? "\(health.state.capitalized) - \(ConnectionHealth.latency(health.latencyMicros))")
-                                        .font(.caption).foregroundStyle(health.state == "error" ? Color.red : .secondary)
-                                        .lineLimit(2).help(health.failure ?? health.version ?? health.state)
+                                    Text(health.failure ?? "\(health.state.label) - \(ConnectionHealth.latency(health.latencyMicros))")
+                                        .font(.caption).foregroundStyle(health.state == .error ? Color.red : .secondary)
+                                        .lineLimit(2).help(health.failure ?? health.version ?? health.state.label)
                                         .accessibilityIdentifier("connection.health.\(profile.name)")
                                 }
                             }
@@ -335,6 +332,7 @@ public struct RootView: View {
                             .accessibilityLabel("Close \(document.title)")
                             .accessibilityIdentifier("query.close.\(document.document)")
                         }
+                        .buttonStyle(.borderless)
                         .padding(7)
                         .background(workspace.selectedDocument == document.document ? Color.accentColor.opacity(0.15) : Color.clear, in: RoundedRectangle(cornerRadius: 6))
                     }
@@ -343,8 +341,7 @@ public struct RootView: View {
             .disabled(!store.navigationAvailable)
             Divider()
             if let document = store.document {
-                VStack(alignment: .leading, spacing: 14) {
-                    Text(document.title).font(.title2)
+                VStack(alignment: .leading, spacing: 10) {
                     VSplitView {
                         SQLEditor(buffer: store.editor(for: document), editable: store.navigationAvailable, changed: { [weak store] in
                             store?.editorChanged(session: workspace.id, document: document.document)
@@ -372,7 +369,7 @@ public struct RootView: View {
                             .accessibilityIdentifier("query.error")
                     }
                 }
-                .padding(24)
+                .padding(12)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 .accessibilityElement(children: .contain)
                 .accessibilityIdentifier("query.document")

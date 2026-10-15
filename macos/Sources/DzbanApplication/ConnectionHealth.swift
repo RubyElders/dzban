@@ -1,7 +1,8 @@
 import Foundation
+import DzbanBridge
 
 public struct ConnectionHealth: Sendable {
-    public var state = "unknown"
+    public var state: ConnectionState = .unknown
     public var latencyMicros: UInt64?
     public var version: String?
     public var failure: String?

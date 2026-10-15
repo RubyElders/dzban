@@ -192,14 +192,11 @@ impl State {
             Ok(engine) => engine,
             Err(error) => return Ok(json!({"state":"error","error":error.to_string()})),
         };
-        let mut result = probe(&engine, true).await;
+        let result = probe(&engine, true).await;
         self.context
             .close(engine.id())
             .await
             .map_err(|error| application_error("probe_cleanup", error))?;
-        if result["state"] == "connected" {
-            result["state"] = json!("reachable");
-        }
         Ok(result)
     }
 }

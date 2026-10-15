@@ -228,7 +228,7 @@ public final class ApplicationStore: ObservableObject {
             await refreshActions(session: connection.session)
             await refreshControls()
             var status = ConnectionHealth()
-            status.state = "connected"
+            status.state = .connected
             health[connection.session] = status
             await probe(session: connection.session)
             startHealth(connection.session)
@@ -236,7 +236,7 @@ public final class ApplicationStore: ObservableObject {
         } catch {
             if connectionIntent == intent {
                 var status = ConnectionHealth()
-                status.state = "error"
+                status.state = .error
                 status.failure = (error as? BridgeFailure)?.message ?? error.localizedDescription
                 profileHealth[profile] = status
                 show(error)
@@ -517,7 +517,7 @@ extension ApplicationStore {
                 guard let self, self.workspaces.contains(where: { $0.id == session }) else { return }
                 var status = self.health[session] ?? ConnectionHealth()
                 status.probing = false
-                if result.state != "busy" {
+                if result.state != .busy {
                     status.state = result.state
                     status.latencyMicros = result.latencyMicros
                     status.failure = result.error
@@ -530,7 +530,7 @@ extension ApplicationStore {
                 guard let self, self.workspaces.contains(where: { $0.id == session }) else { return }
                 var status = self.health[session] ?? ConnectionHealth()
                 status.probing = false
-                status.state = "error"
+                status.state = .error
                 status.latencyMicros = nil
                 status.failure = (error as? BridgeFailure)?.message ?? error.localizedDescription
                 self.health[session] = status
@@ -559,7 +559,7 @@ extension ApplicationStore {
             } catch {
                 guard let self else { return }
                 var status = ConnectionHealth()
-                status.state = "error"
+                status.state = .error
                 status.failure = (error as? BridgeFailure)?.message ?? error.localizedDescription
                 self.profileHealth[profile] = status
             }

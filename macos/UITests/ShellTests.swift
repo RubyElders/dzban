@@ -133,6 +133,7 @@ final class ShellTests: XCTestCase {
         XCTAssertTrue(app.buttons["action.new"].waitForExistence(timeout: 5))
         search.click()
         search.typeText("query")
+        waitForValue("query", in: search)
         XCTAssertTrue(app.buttons["action.new"].exists)
         XCTAssertFalse(app.buttons["action.disconnect"].exists)
         search.typeKey(.downArrow, modifierFlags: [])
@@ -147,6 +148,47 @@ final class ShellTests: XCTestCase {
         XCTAssertTrue(app.buttons["history.restore.0"].waitForExistence(timeout: 5))
         let attachment = XCTAttachment(screenshot: app.windows.firstMatch.screenshot())
         attachment.name = "Native centered actions and left history"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        app.typeKey("q", modifierFlags: .command)
+        XCTAssertTrue(app.wait(for: .notRunning, timeout: 10))
+    }
+
+    func testToolbarAndFooterStayAlignedDuringProgress() throws {
+        app.launchArguments = ["--fixture-query", "waiting"]
+        launchApp()
+        waitForValue("Running", in: app.staticTexts["query.execution"])
+        let window = app.windows.firstMatch
+        let corner = window.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 1)).withOffset(CGVector(dx: -2, dy: -2))
+        corner.press(forDuration: 0.1, thenDragTo: corner.withOffset(CGVector(dx: 960 - window.frame.width, dy: 620 - window.frame.height)))
+        let field = app.toolbars.searchFields["actions.search"]
+        let history = app.toolbars.buttons["history.open"]
+        let progress = app.progressIndicators["query.progress"]
+        XCTAssertTrue(progress.waitForExistence(timeout: 5))
+        XCTAssertEqual(field.frame.midX, window.frame.midX, accuracy: 3)
+        XCTAssertLessThan(history.frame.maxX, window.frame.minX + 180)
+        XCTAssertGreaterThan(field.frame.minX, history.frame.maxX)
+        XCTAssertLessThan(field.frame.maxX, app.buttons["plan.open"].frame.minX)
+        XCTAssertLessThanOrEqual(progress.frame.height, 4)
+        XCTAssertEqual(progress.frame.midX, field.frame.midX, accuracy: 2)
+        for identifier in ["plan.open", "query.new", "query.primary", "connection.probe", "shortcuts.open"] {
+            let button = app.buttons[identifier]
+            XCTAssertTrue(button.exists)
+            XCTAssertGreaterThanOrEqual(button.frame.minX, window.frame.minX)
+            XCTAssertLessThanOrEqual(button.frame.maxX, window.frame.maxX)
+        }
+        for frame in 0..<2 {
+            let attachment = XCTAttachment(screenshot: window.screenshot())
+            attachment.name = "Native progress frame \(frame)"
+            attachment.lifetime = .keepAlways
+            add(attachment)
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+        app.typeKey(".", modifierFlags: .command)
+        let complete = expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: progress)
+        wait(for: [complete], timeout: 10)
+        let attachment = XCTAttachment(screenshot: window.screenshot())
+        attachment.name = "Native progress reset"
         attachment.lifetime = .keepAlways
         add(attachment)
         app.typeKey("q", modifierFlags: .command)
