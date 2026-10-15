@@ -4,80 +4,191 @@ import SwiftUI
 public struct RootView: View {
     @ObservedObject var store: ApplicationStore
     private enum WorkspacePanel: Identifiable {
-        case catalog(UUID), history(UUID)
-        var id: String { switch self { case .catalog(let id): return "catalog-\(id)"; case .history(let id): return "history-\(id)" } }
+        case catalog(UUID)
+        var id: String { switch self { case .catalog(let id): return "catalog-\(id)" } }
     }
     @State private var panel: WorkspacePanel?
+    @State private var columns: NavigationSplitViewVisibility = .all
+    @State private var actionsVisible = false
+    @State private var actionSearch = ""
+    @FocusState private var actionSearchFocused: Bool
 
     public init(store: ApplicationStore) { self.store = store }
 
     public var body: some View {
-        NavigationSplitView {
-            List {
-                Button { Task { await store.chooseConnections() } } label: {
-                    Label("Connections", systemImage: "externaldrive.connected.to.line.below")
-                }
-                .accessibilityIdentifier("connections.show")
-                Section("Workspaces") {
-                    ForEach(store.workspaces) { workspace in
-                        Button { Task { await store.selectSession(workspace.id) } } label: {
-                            HStack {
-                                Label(workspace.profile, systemImage: "externaldrive")
-                                Spacer()
-                                if store.selectedSession == workspace.id { Image(systemName: "checkmark") }
+        VStack(spacing: 0) {
+            topbar
+            Divider()
+            NavigationSplitView(columnVisibility: $columns) {
+                VStack(spacing: 0) {
+                    List {
+                        Button { Task { await store.chooseConnections() } } label: {
+                            Label("Connections", systemImage: "externaldrive.connected.to.line.below")
+                        }
+                        .accessibilityIdentifier("connections.show")
+                        Section("Workspaces") {
+                            ForEach(store.workspaces) { workspace in
+                                Button { Task { await store.selectSession(workspace.id) } } label: {
+                                    HStack {
+                                        Label(workspace.profile, systemImage: "externaldrive")
+                                        Spacer()
+                                        if store.selectedSession == workspace.id { Image(systemName: "checkmark") }
+                                    }
+                                }
+                                .accessibilityIdentifier("workspace.\(workspace.id)")
+                                .contextMenu {
+                                    Button("Disconnect") { Task { await store.closeSession(workspace.id) } }
+                                }
                             }
                         }
-                        .accessibilityIdentifier("workspace.\(workspace.id)")
-                        .contextMenu {
-                            Button("Disconnect") { Task { await store.closeSession(workspace.id) } }
-                        }
+                    }
+                    .listStyle(.sidebar)
+                    .frame(maxHeight: store.selectedSession == nil ? .infinity : 145)
+                    .disabled(!store.navigationAvailable)
+                    if let session = store.selectedSession {
+                        Divider()
+                        HistoryBrowser(store: store, session: session) { columns = .detailOnly }
+                            .id(session)
+                    } else {
+                        Divider()
+                        ContentUnavailableView("Query History", systemImage: "clock", description: Text("Connect to a database to browse saved queries."))
                     }
                 }
-            }
-            .listStyle(.sidebar)
-            .navigationSplitViewColumnWidth(min: 190, ideal: 230)
-            .disabled(!store.navigationAvailable)
-        } detail: {
-            if let workspace = store.workspace {
-                workspaceView(workspace)
-            } else {
-                chooser
+                .navigationSplitViewColumnWidth(min: 260, ideal: 300, max: 420)
+                .toolbar(removing: .sidebarToggle)
+            } detail: {
+                if let workspace = store.workspace {
+                    workspaceView(workspace)
+                } else {
+                    chooser
+                }
             }
         }
-        .frame(minWidth: 760, minHeight: 500)
+        .frame(minWidth: 900, minHeight: 500)
         .background(WindowPolicy(store: store).frame(width: 0, height: 0))
-        .toolbar {
-            if store.closingSession != nil || store.isShuttingDown {
-                ProgressView().controlSize(.small).accessibilityLabel("Closing connections")
+        .overlay {
+            if actionsVisible {
+                ZStack(alignment: .top) {
+                    Color.clear.contentShape(Rectangle()).onTapGesture { actionsVisible = false }
+                    actionMenu
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+                        .overlay(RoundedRectangle(cornerRadius: 10).stroke(.quaternary))
+                        .shadow(radius: 12, y: 5)
+                        .padding(.top, 48)
+                }
             }
-            Button(store.controls?.primaryAction == "stop" ? "Stop" : store.controls?.primaryAction == "stopping" ? "Stopping" : "Run") {
-                store.sendEditorIntent(.primary)
-            }
-            .disabled(!store.navigationAvailable || store.controls?.primaryAction == "unavailable" || store.controls?.primaryAction == "stopping" || store.selectedSession == nil)
-            .accessibilityIdentifier("query.primary")
-            PlanPreviewButton(store: store)
-            Button("Catalog") { if let session = store.selectedSession { panel = .catalog(session) } }
-                .disabled(store.selectedSession == nil || !store.navigationAvailable)
-                .accessibilityIdentifier("catalog.open")
-            Button("History") { if let session = store.selectedSession { panel = .history(session) } }
-                .disabled(store.selectedSession == nil || !store.navigationAvailable)
-                .accessibilityIdentifier("history.open")
-            Button { Task { await store.newDocument() } } label: {
-                Label("New Query", systemImage: "plus")
-            }
-            .disabled(store.selectedSession == nil || !store.navigationAvailable)
-            .accessibilityIdentifier("query.new")
         }
         .sheet(item: $panel) { panel in
             switch panel {
             case .catalog(let session): CatalogBrowser(bridge: store.bridge, session: session)
-            case .history(let session): HistoryBrowser(store: store, session: session)
             }
         }
         .alert("Dzban", isPresented: Binding(get: { store.failure != nil }, set: { if !$0 { store.failure = nil } })) {
             Button("OK") { store.failure = nil }
         } message: { Text(store.failure ?? "") }
         .task { await store.loadProfiles() }
+    }
+
+    private var topbar: some View {
+        ZStack {
+            HStack(spacing: 12) {
+                Button { columns = columns == .detailOnly ? .all : .detailOnly } label: {
+                    Label("Query History", systemImage: "sidebar.left")
+                }
+                .help("Toggle query history")
+                .accessibilityIdentifier("history.open")
+                Spacer()
+                if store.closingSession != nil || store.isShuttingDown {
+                    ProgressView().controlSize(.small).accessibilityLabel("Closing connections")
+                }
+                PlanPreviewButton(store: store)
+                Button { Task { await store.newDocument() } } label: {
+                    Label("New Query", systemImage: "plus")
+                }
+                .disabled(store.selectedSession == nil || !store.navigationAvailable)
+                .accessibilityIdentifier("query.new")
+                Button(store.controls?.primaryAction == "stop" ? "Stop" : store.controls?.primaryAction == "stopping" ? "Stopping" : "Run") {
+                    store.sendEditorIntent(.primary)
+                }
+                .disabled(!store.navigationAvailable || store.controls?.primaryAction == "unavailable" || store.controls?.primaryAction == "stopping" || store.selectedSession == nil)
+                .accessibilityIdentifier("query.primary")
+            }
+            Button { actionSearch = ""; actionsVisible = true } label: {
+                HStack {
+                    Image(systemName: "magnifyingglass")
+                    Text("Search actions...").foregroundStyle(.secondary)
+                    Spacer()
+                    Image(systemName: "chevron.down").font(.caption)
+                }.frame(width: 220)
+            }
+            .keyboardShortcut("k", modifiers: [.command, .shift])
+            .accessibilityIdentifier("actions.open")
+        }
+        .buttonStyle(.bordered)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(.bar)
+    }
+
+    private struct ActionItem: Identifiable {
+        let id: String
+        let title: String
+        let detail: String
+        let enabled: Bool
+        let perform: () -> Void
+    }
+
+    private var actions: [ActionItem] {
+        var items = [
+            ActionItem(id: "connections", title: "Show Connections", detail: "Choose a database connection", enabled: store.navigationAvailable) { Task { await store.chooseConnections() } },
+            ActionItem(id: "history", title: "Query History", detail: "Show saved queries on the left", enabled: true) { columns = .all },
+            ActionItem(id: "new", title: "New Query", detail: "Open a query tab", enabled: store.selectedSession != nil && store.navigationAvailable) { Task { await store.newDocument() } },
+            ActionItem(id: "run", title: store.controls?.primaryAction == "stop" ? "Stop Query" : "Run Query", detail: "Run or cancel the current query", enabled: store.controls?.primaryAction == "run" || store.controls?.primaryAction == "stop") { store.sendEditorIntent(.primary) },
+            ActionItem(id: "plan", title: "Preview Query Plan", detail: "Estimate the current query", enabled: store.canPreview) { Task { await store.previewCurrent(pinned: true) } },
+            ActionItem(id: "catalog", title: "Database Catalog", detail: "Browse tables, columns, and database objects", enabled: store.selectedSession != nil && store.navigationAvailable) { if let session = store.selectedSession { panel = .catalog(session) } },
+            ActionItem(id: "disconnect", title: "Disconnect", detail: "Close the current workspace", enabled: store.selectedSession != nil && store.navigationAvailable) { if let session = store.selectedSession { Task { await store.closeSession(session) } } }
+        ]
+        items += store.profiles.map { profile in
+            ActionItem(id: "connect.\(profile.name)", title: profile.name, detail: "Open database connection", enabled: store.pendingProfile == nil && store.navigationAvailable) { Task { await store.connect(profile: profile.name) } }
+        }
+        items += store.workspaces.map { workspace in
+            ActionItem(id: "workspace.\(workspace.id)", title: workspace.profile, detail: "Select open workspace", enabled: store.navigationAvailable) { Task { await store.selectSession(workspace.id) } }
+        }
+        if let workspace = store.workspace {
+            items += workspace.documents.map { document in
+                ActionItem(id: "query.\(document.document)", title: document.title, detail: "Select query tab", enabled: store.navigationAvailable) { Task { await store.selectDocument(document.document) } }
+            }
+        }
+        return items.filter { actionSearch.isEmpty || "\($0.title) \($0.detail)".localizedCaseInsensitiveContains(actionSearch) }
+    }
+
+    private var actionMenu: some View {
+        VStack(spacing: 10) {
+            TextField("Search actions, connections, and queries", text: $actionSearch)
+                .textFieldStyle(.roundedBorder)
+                .accessibilityIdentifier("actions.search")
+                .focused($actionSearchFocused)
+                .onAppear { actionSearchFocused = true }
+                .onExitCommand { actionsVisible = false }
+                .onSubmit { if let action = actions.first(where: \.enabled) { actionsVisible = false; action.perform() } }
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 2) {
+                    ForEach(actions) { action in
+                        Button { actionsVisible = false; action.perform() } label: {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(action.title)
+                                Text(action.detail).font(.caption).foregroundStyle(.secondary)
+                            }.frame(maxWidth: .infinity, alignment: .leading).padding(7)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(!action.enabled)
+                        .accessibilityIdentifier("action.\(action.id)")
+                    }
+                    if actions.isEmpty { Text("No matching actions").foregroundStyle(.secondary).padding(7) }
+                }
+            }
+        }.padding(12).frame(width: 380, height: 360)
     }
 
     private var chooser: some View {

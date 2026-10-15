@@ -38,6 +38,42 @@ final class ShellTests: XCTestCase {
         }
     }
 
+    func testCenteredActionsAndLeftHistory() throws {
+        app.launchArguments = ["--fixture-query", "SELECT 42"]
+        launchApp()
+        waitForValue("Complete - 500 rows", in: app.staticTexts["results.status"])
+        let restore = app.buttons["history.restore.0"]
+        XCTAssertTrue(restore.waitForExistence(timeout: 10))
+        let editor = app.textViews["query.editor"]
+        XCTAssertLessThan(restore.frame.maxX, editor.frame.minX)
+        let actions = app.buttons["actions.open"]
+        let run = app.buttons["query.primary"]
+        XCTAssertLessThan(app.buttons["history.open"].frame.maxX, actions.frame.minX)
+        XCTAssertLessThan(actions.frame.maxX, run.frame.minX)
+        actions.click()
+        let search = app.textFields["actions.search"]
+        XCTAssertTrue(search.waitForExistence(timeout: 5))
+        search.click()
+        search.typeText("new query")
+        XCTAssertTrue(app.buttons["action.new"].exists)
+        XCTAssertFalse(app.buttons["action.disconnect"].exists)
+        search.typeKey(.return, modifierFlags: [])
+        XCTAssertTrue(app.buttons["Query 2"].waitForExistence(timeout: 5))
+        restore.click()
+        waitForValue("Saved - 200 of 500 rows", in: app.staticTexts["results.status"])
+        XCTAssertTrue(app.textViews["query.editor"].isHittable)
+        app.buttons["history.close"].click()
+        XCTAssertFalse(app.buttons["history.close"].exists)
+        app.buttons["history.open"].click()
+        XCTAssertTrue(app.buttons["history.restore.0"].waitForExistence(timeout: 5))
+        let attachment = XCTAttachment(screenshot: app.windows.firstMatch.screenshot())
+        attachment.name = "Native centered actions and left history"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        app.typeKey("q", modifierFlags: .command)
+        XCTAssertTrue(app.wait(for: .notRunning, timeout: 10))
+    }
+
     func testConnectionQueryMenuAndQuit() throws {
         launchApp()
         let connect = app.buttons["connection.fixture"]
@@ -341,7 +377,11 @@ final class ShellTests: XCTestCase {
         launchApp()
         app.buttons["connection.fixture"].click()
         XCTAssertTrue(app.textViews["query.editor"].waitForExistence(timeout: 10))
-        app.buttons["catalog.open"].click()
+        app.buttons["actions.open"].click()
+        let actionSearch = app.textFields["actions.search"]
+        actionSearch.click()
+        actionSearch.typeText("catalog")
+        app.buttons["action.catalog"].click()
         XCTAssertTrue(app.sheets.buttons["catalog.describe.žluť table"].waitForExistence(timeout: 5))
         capture("Native catalog list")
         app.sheets.buttons["catalog.describe.žluť table"].click()
@@ -438,7 +478,7 @@ final class ShellTests: XCTestCase {
         app.launchArguments = ["--fixture-query", "SELECT 42"]
         launchApp()
         waitForValue("Complete - 500 rows", in: app.staticTexts["results.status"])
-        app.buttons["history.open"].click()
+        if !app.buttons["history.close"].exists { app.buttons["history.open"].click() }
         let restore = app.buttons["history.restore.0"]
         XCTAssertTrue(restore.waitForExistence(timeout: 10))
         let historyAttachment = XCTAttachment(screenshot: app.screenshot())
@@ -547,7 +587,7 @@ final class ShellTests: XCTestCase {
         submitResultQuery("SELECT 44")
         waitForValue("Complete - 1 rows", in: app.staticTexts["results.status"])
         waitForValue("44", in: app.descendants(matching: .any)["result.cell.0.0"])
-        app.buttons["history.open"].click()
+        if !app.buttons["history.close"].exists { app.buttons["history.open"].click() }
         let restore = app.buttons["history.restore.0"]
         XCTAssertTrue(restore.waitForExistence(timeout: 5))
         restore.click()
@@ -588,7 +628,7 @@ final class ShellTests: XCTestCase {
             row.lifetime = .keepAlways
             add(row)
             app.buttons["row.close"].click()
-            app.buttons["history.open"].click()
+            if !app.buttons["history.close"].exists { app.buttons["history.open"].click() }
             XCTAssertTrue(app.buttons["history.restore.0"].waitForExistence(timeout: 5))
             let history = XCTAttachment(screenshot: window.screenshot())
             history.name = "Native \(appearance) resized history"
