@@ -20,6 +20,52 @@ struct Fixture {
 
 #[async_trait]
 impl DatabaseSession for Fixture {
+    fn capabilities(&self) -> dzban_core::catalog::Capabilities {
+        use dzban_core::catalog::{CatalogAction, ObjectKind};
+        dzban_core::catalog::Capabilities {
+            catalog: [
+                CatalogAction::List(ObjectKind::Table),
+                CatalogAction::Describe(ObjectKind::Table),
+            ]
+            .into(),
+            ..Default::default()
+        }
+    }
+    async fn catalog(
+        &self,
+        request: dzban_core::catalog::CatalogRequest,
+    ) -> Result<Vec<dzban_core::catalog::CatalogEntry>, dzban_core::catalog::CatalogError> {
+        use dzban_core::catalog::{CatalogEntry, CatalogRequest, ObjectIdentity, ObjectKind};
+        let identity = ObjectIdentity {
+            database: "fixture".into(),
+            schema: Some("public".into()),
+            kind: ObjectKind::Table,
+            name: "žluť table".into(),
+        };
+        match request {
+            CatalogRequest::List { glob, .. } => {
+                if glob
+                    .as_ref()
+                    .is_some_and(|glob| !dzban_core::catalog::matches_glob(glob, &identity.name))
+                {
+                    return Ok(vec![]);
+                }
+                Ok(vec![CatalogEntry {
+                    identity,
+                    attributes: [("comment".into(), ResultCell::Null)].into(),
+                }])
+            }
+            CatalogRequest::Describe { object, .. } => Ok(vec![CatalogEntry {
+                identity: object,
+                attributes: [
+                    ("column_name".into(), ResultCell::Text("id".into())),
+                    ("data_type".into(), ResultCell::Text("integer".into())),
+                ]
+                .into(),
+            }]),
+            _ => Ok(vec![]),
+        }
+    }
     async fn connect(&self) -> Result<(), String> {
         if self.slow_connect {
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -51,10 +97,16 @@ impl DatabaseSession for Fixture {
         self.canceled.notify_one();
         Ok(())
     }
-    async fn explain(&self, _: &str) -> Result<QueryPlan, String> {
+    async fn explain(&self, sql: &str) -> Result<QueryPlan, String> {
+        if sql.contains("preview_delayed") {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        if sql.contains("preview_error") {
+            return Err("Fixture plan rejected".into());
+        }
         Ok(QueryPlan {
             backend: DatabaseBackend::Postgresql,
-            document: serde_json::json!({"fixture": true}),
+            document: serde_json::json!({"fixture": true, "sql": sql}),
             estimate: Default::default(),
         })
     }

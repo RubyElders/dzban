@@ -32,9 +32,14 @@ Run `shutdown`, inspect its outcome, and then release the application. Releasing
 | `close_document` | `session`, `document` | Selected replacement snapshot or workspace-closed acknowledgment; busy work and failed cleanup preserve the document |
 | `editor_action` | `session`, `document`, `draft`, scalar `start`/`end`, `intent` | Shared submit/primary/cancel/reset semantics; optional submission identity and cancellation acknowledgment |
 | `set_draft` | `session`, `document`, `draft` | Retained document snapshot |
-| `preview` | `session`, `document`, `sql`, `revision` | Accepted plan and target identity; rejects stale draft revisions |
-| `cancel_preview` | `session` | Preview invalidation acknowledgment; transport cleanup may still be active |
+| `preview` | `session`, `document`, `sql`, `revision`, optional paired `start`/`end` and `request_revision` | Accepted plan and target identity; rejects stale draft revisions |
+| `cancel_preview` | `session`, optional `request_revision` | Preview invalidation acknowledgment; transport cleanup may still be active |
 | `history` | `session` | A fresh read of shared history entries for the selected profile name |
+| `actions` | `session` | Backend-capability-filtered action IDs, names, descriptions, effects, and argument contracts |
+| `catalog` | `session`, typed `request` | Typed identities and ordered catalog entries, retaining SQL null attributes |
+| `context_changed` | `session`, `document` | Advance cursor/selection context revision and invalidate stale estimates |
+| `peek` | `session`, `surface`, `event`, optional `elapsed_ms` | Shared plan/row tap, hold, pin, close, and focus-reset visibility |
+| `observe_controls` | `session` | Coalesced shared control projection on session, operation, or query changes |
 | `observe_document` | `session`, `document` | Initial snapshot and subsequent coalesced snapshots |
 | `submit` | `session`, `document`, `sql` | Query UUID and output generation after admission |
 | `cancel` | `session`, `document` | Cancellation acknowledgment; terminal completion arrives on the document stream |
@@ -53,7 +58,7 @@ Viewport cells carry nullable `text`, original scalar `length`, and `truncated`.
 
 Result reads acquire one of 16 bridge read permits. Successful document/session close and shutdown drain admitted reads before retiring their result ownership. A retired native viewport discards late responses by both source identity and a local epoch; canceling its Swift task alone does not cancel Rust storage reads.
 
-Navigation revisions reject stale selection commands; late connection completions report whether selection accepted them so a detached native view can explicitly close the resulting session. Catalog actions and document rename commands remain to be added. Query submission loads a fresh shared history store off the caller thread. Fixtures use a private disposable history directory instead of user configuration/data. The fixture lifecycle exercises preview, submission, early pages, history, cancellation/restart, and cleanup; native widget behavior remains a separate integration layer.
+Navigation revisions reject stale selection commands; late connection completions report whether selection accepted them so a detached native view can explicitly close the resulting session. Document rename commands remain to be added. Query submission loads a fresh shared history store off the caller thread. Fixtures use a private disposable history directory instead of user configuration/data. The fixture lifecycle exercises preview, submission, early pages, history, cancellation/restart, and cleanup; native widget behavior remains a separate integration layer.
 
 The native editor converts AppKit UTF-16 selections to Unicode scalar offsets before `editor_action`. Explicit nonempty selections execute their original text; an empty selection uses the shared current-statement selector. Bounds are validated in Rust. Command-Return and Command-Shift-Return submit the selection/current statement; Escape requests cancellation. The toolbar primary action uses the shared run/stop projection. Busy submission is suppressed by shared interaction policy and core admission remains authoritative. Cancellation targets the active document in the specified session even when another tab is selected.
 
@@ -68,3 +73,7 @@ bash scripts/test-macos-bridge.sh
 The runner isolates configuration/data, builds the fixture-enabled static archive, runs Rust transport/C-ABI tests, and executes shared lifecycle scenarios through a standalone Swift consumer. If XCTest is available it also runs those scenarios through XCTest; otherwise it explicitly reports that coverage as skipped. The standalone consumer is not a substitute for native window or XCUITest validation.
 
 The `test-fixtures` Cargo feature and `DZBAN_TEST_FIXTURES` Swift/C compilation definitions enable the fixture constructor and check scenarios. Production builds must omit them. `bash scripts/build-macos-bridge.sh` builds the default archive without fixtures. The development linker arguments correspond to Rust's `--print native-static-libs` output: CoreFoundation, SystemConfiguration, Security, CoreFoundation, iconv, System, c, and m. Recheck that output when dependencies or build targets change.
+
+Catalog requests use an `operation` of `list` or `describe`. Listing supplies a typed object `kind`, optional exact database/schema and glob, and `include_system`. Description supplies the returned database/schema/kind/name identity and a `full` flag. The bridge calls the core catalog API; Swift contains no backend catalog SQL. Catalog failures and record-size rejection remain explicit errors. Canceling native observation does not imply backend catalog cancellation.
+
+Preview requests accept optional paired scalar `start`/`end` bounds so the shared selector chooses the selected/current statement. Replies retain request, session, document, and draft revision. Native context updates are coalesced and drained before requesting a preview. Monotonic preview intents let cancellation reject an older request even if runtime admission is delayed. Preview admission and cancellation update that revision under the workspace lock. Presentation epochs reject late replies, and close/reset uses the core preview and peek policies. Submitted result plans remain separate from transient previews. Row inspection reads one row and at most 16 columns of bounded previews; full cells use the existing chunked inspector.

@@ -83,16 +83,18 @@ public struct SQLEditor: NSViewRepresentable {
     @ObservedObject var buffer: EditorBuffer
     let editable: Bool
     let changed: () -> Void
+    let contextChanged: () -> Void
     let action: (EditorIntent) -> Bool
 
-    public init(buffer: EditorBuffer, editable: Bool, changed: @escaping () -> Void, action: @escaping (EditorIntent) -> Bool) {
+    public init(buffer: EditorBuffer, editable: Bool, changed: @escaping () -> Void, contextChanged: @escaping () -> Void = {}, action: @escaping (EditorIntent) -> Bool) {
         self.buffer = buffer
         self.editable = editable
         self.changed = changed
+        self.contextChanged = contextChanged
         self.action = action
     }
 
-    public func makeCoordinator() -> Coordinator { Coordinator(buffer: buffer, changed: changed) }
+    public func makeCoordinator() -> Coordinator { Coordinator(buffer: buffer, changed: changed, contextChanged: contextChanged) }
     public func makeNSView(context: Context) -> NSScrollView {
         let view = buffer.textView
         view.delegate = context.coordinator
@@ -101,6 +103,7 @@ public struct SQLEditor: NSViewRepresentable {
     }
     public func updateNSView(_ scroll: NSScrollView, context: Context) {
         context.coordinator.changed = changed
+        context.coordinator.contextChanged = contextChanged
         buffer.textView.intent = action
         if buffer.textView.isEditable != editable { buffer.textView.isEditable = editable }
     }
@@ -109,13 +112,16 @@ public struct SQLEditor: NSViewRepresentable {
     public final class Coordinator: NSObject, NSTextViewDelegate {
         let buffer: EditorBuffer
         var changed: () -> Void
-        init(buffer: EditorBuffer, changed: @escaping () -> Void) { self.buffer = buffer; self.changed = changed }
+        var contextChanged: () -> Void
+        init(buffer: EditorBuffer, changed: @escaping () -> Void, contextChanged: @escaping () -> Void = {}) { self.buffer = buffer; self.changed = changed; self.contextChanged = contextChanged }
         public func textDidChange(_ notification: Notification) {
             buffer.edit(text: buffer.textView.string, selection: buffer.textView.selectedRange())
             changed()
         }
         public func textViewDidChangeSelection(_ notification: Notification) {
+            let previous = buffer.selection
             buffer.edit(text: buffer.textView.string, selection: buffer.textView.selectedRange())
+            if previous != buffer.selection { contextChanged() }
         }
     }
 }

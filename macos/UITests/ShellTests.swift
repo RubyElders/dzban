@@ -337,6 +337,84 @@ final class ShellTests: XCTestCase {
         XCTAssertTrue(app.wait(for: .notRunning, timeout: 10))
     }
 
+    func testCatalogNavigationAndPreviewFailureRestart() throws {
+        launchApp()
+        app.buttons["connection.fixture"].click()
+        XCTAssertTrue(app.textViews["query.editor"].waitForExistence(timeout: 10))
+        app.buttons["catalog.open"].click()
+        XCTAssertTrue(app.sheets.buttons["catalog.describe.žluť table"].waitForExistence(timeout: 5))
+        capture("Native catalog list")
+        app.sheets.buttons["catalog.describe.žluť table"].click()
+        XCTAssertTrue(app.sheets.staticTexts["column_name: id"].waitForExistence(timeout: 5))
+        let pattern = app.sheets.textFields["catalog.pattern"]
+        pattern.click()
+        pattern.typeText("missing*")
+        app.sheets.buttons["catalog.list"].click()
+        XCTAssertTrue(app.sheets.staticTexts["No catalog entries"].waitForExistence(timeout: 5))
+        app.sheets.buttons["catalog.close"].click()
+        let editor = app.textViews["query.editor"]
+        editor.click()
+        editor.typeText("SELECT 'preview_error'")
+        app.buttons["plan.open"].click()
+        XCTAssertTrue(app.staticTexts["plan.error"].waitForExistence(timeout: 5))
+        app.buttons["plan.close"].click()
+        editor.click()
+        app.typeKey("a", modifierFlags: .command)
+        editor.typeText("SELECT 42")
+        app.buttons["plan.open"].click()
+        XCTAssertTrue(app.textViews["plan.value"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["plan.pin"].exists)
+        capture("Native query plan")
+        app.buttons["plan.close"].click()
+        app.typeKey("q", modifierFlags: .command)
+        XCTAssertTrue(app.wait(for: .notRunning, timeout: 10))
+    }
+
+    func testNativeRowInspectionPreservesValuesAndOpensFullCell() throws {
+        app.launchArguments = ["--fixture-query", "wait"]
+        launchApp()
+        waitForValue("Receiving - 5 rows", in: app.staticTexts["results.status"])
+        app.descendants(matching: .any)["result.cell.0.1"].click()
+        XCTAssertTrue(app.buttons["results.inspect-row"].isEnabled)
+        app.buttons["results.inspect-row"].click()
+        XCTAssertTrue(app.buttons["row.close"].waitForExistence(timeout: 5))
+        waitForValue("žluť\nNULL😀", in: app.staticTexts["row.value.1"])
+        capture("Native row inspection")
+        app.buttons["row.inspect.1"].click()
+        waitForValue("žluť\nNULL😀", in: app.sheets.textViews["cell.value"])
+        app.sheets.buttons["cell.close"].click()
+        app.buttons["query.primary"].click()
+        waitForValue("Canceled - 5 rows", in: app.staticTexts["results.status"])
+        app.typeKey("q", modifierFlags: .command)
+        XCTAssertTrue(app.wait(for: .notRunning, timeout: 10))
+    }
+
+    func testPlanAndRowTapUseNativeKeyEvents() throws {
+        app.launchArguments = ["--fixture-query", "wide"]
+        launchApp()
+        waitForValue("Complete - 500 rows", in: app.staticTexts["results.status"])
+        let editor = app.textViews["query.editor"]
+        editor.click()
+        editor.typeText("SELECT 42")
+        app.typeKey("p", modifierFlags: [.command, .shift])
+        XCTAssertTrue(app.textViews["plan.value"].waitForExistence(timeout: 5))
+        waitForLabel("Pinned", in: app.buttons["plan.pin"])
+        app.buttons["plan.close"].click()
+        app.descendants(matching: .any)["result.cell.0.1"].click()
+        app.typeKey(" ", modifierFlags: [])
+        XCTAssertTrue(app.buttons["row.close"].waitForExistence(timeout: 5))
+        waitForLabel("Pinned", in: app.buttons["row.pin"])
+        app.buttons["row.close"].click()
+        app.typeKey("q", modifierFlags: .command)
+        XCTAssertTrue(app.wait(for: .notRunning, timeout: 10))
+    }
+
+    private func capture(_ name: String) {
+        let attachment = XCTAttachment(screenshot: app.screenshot())
+        attachment.name = name
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
     private func recordViewportMetrics(_ name: String) throws {
         app.menuBars.menuBarItems["Testing"].click()
         app.menuItems["Record Viewport Metrics"].click()
