@@ -186,6 +186,16 @@ do not silently copy credentials or introduce a native history format. No native
 toolkit, ABI, supported macOS version/architecture matrix, signing or notarization
 is selected by this extraction.
 
+## Native history and TLS gates
+
+The macOS bridge lists at most 100 history summaries with SQL previews bounded to 256 Unicode scalars. Each list has an opaque revision; restore requires that revision and its entry index. Refresh invalidates previous selections. Restored results retain their loaded history snapshot under the document's new output generation, independently of a live query that may still be finishing. A new submission replaces the saved output. Saved plans are fetched separately from document snapshots and remain subject to the bridge record-size limit.
+
+The shared legacy history format stores sample cells as text, without original types or SQL null identity. Native saved samples label this limitation and preserve the literal text `NULL`. Live results retain typed SQL nulls. History keeps the selected profile name and existing XDG paths; restoring a query does not execute it or migrate files.
+
+`bash scripts/check-macos-launch.sh APP_BUNDLE direct` copies a production app outside the checkout and starts it from a different working directory with a minimal environment and disposable HOME/config/data. The `launchservices` mode opens the same isolated copy through macOS LaunchServices. For each mode, verify the empty connection chooser and quit normally with Command-Q; process survival alone is insufficient. The UI test runner is sandboxed and cannot launch an arbitrary copied executable, so these launch checks run separately from XCUITest. They do not prove installation on a clean Mac.
+
+`python3 scripts/test-macos-tls.py` creates disposable PostgreSQL and ClickHouse TLS services and certificates, runs the macOS adapters serially, and removes its resources. It checks private-CA rejection with the default macOS roots, rejection with an unrelated explicit CA, hostname mismatch, and trusted execution/cancellation/recovery with a process-local `SSL_CERT_FILE`. The trusted case verifies an explicit test anchor; it does not prove that a private CA was installed in the user's macOS keychain. The runner does not modify keychain trust or disable certificate verification.
+
 ## Executable contracts
 
 The platform-free end-to-end example is a public integration test:

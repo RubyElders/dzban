@@ -434,6 +434,36 @@ final class ShellTests: XCTestCase {
         print("Native viewport measurements: \(String(decoding: data, as: UTF8.self))")
     }
 
+    func testHistoryRestoresSampleAndSavedPlanWithoutRunning() throws {
+        app.launchArguments = ["--fixture-query", "SELECT 42"]
+        launchApp()
+        waitForValue("Complete - 500 rows", in: app.staticTexts["results.status"])
+        app.buttons["history.open"].click()
+        let restore = app.buttons["history.restore.0"]
+        XCTAssertTrue(restore.waitForExistence(timeout: 10))
+        let historyAttachment = XCTAttachment(screenshot: app.screenshot())
+        historyAttachment.name = "Native history list"
+        historyAttachment.lifetime = .keepAlways
+        add(historyAttachment)
+        restore.click()
+        waitForValue("Saved - 200 of 500 rows", in: app.staticTexts["results.status"])
+        waitForValue("SELECT 42", in: app.textViews["query.editor"])
+        XCTAssertTrue(app.staticTexts["history.sample-note"].exists)
+        app.buttons["history.plan"].click()
+        XCTAssertTrue(app.textViews["history.plan.value"].waitForExistence(timeout: 5))
+        let attachment = XCTAttachment(screenshot: app.screenshot())
+        attachment.name = "Saved history plan"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        app.buttons["history.plan.close"].click()
+        app.textViews["query.editor"].click()
+        app.typeKey(.return, modifierFlags: .command)
+        waitForValue("Complete - 500 rows", in: app.staticTexts["results.status"])
+        XCTAssertFalse(app.staticTexts["history.sample-note"].exists)
+        app.typeKey("q", modifierFlags: .command)
+        XCTAssertTrue(app.wait(for: .notRunning, timeout: 10))
+    }
+
     private func submitResultQuery(_ sql: String) {
         let editor = app.textViews["query.editor"]
         editor.click()
@@ -459,6 +489,33 @@ final class ShellTests: XCTestCase {
         XCTAssertTrue(element.waitForExistence(timeout: 5))
         let ready = expectation(for: NSPredicate(format: "label == %@", label), evaluatedWith: element)
         wait(for: [ready], timeout: 5)
+    }
+
+    func testExplicitConfigurationAndMalformedConfigurationLaunch() throws {
+        let configuration = fixtureDirectory.appendingPathComponent("explicit.toml")
+        try """
+        [[databases]]
+        name = "disposable-platform-profile"
+        host = "localhost"
+        port = 1
+        user = "fixture"
+        database = "fixture"
+        """.write(to: configuration, atomically: true, encoding: .utf8)
+        app.launchArguments = ["--empty-config", "YES"]
+        app.launchEnvironment["DZBAN_CONFIG"] = configuration.path
+        launchApp()
+        XCTAssertTrue(app.buttons["connection.disposable-platform-profile"].waitForExistence(timeout: 10))
+        XCTAssertFalse(app.buttons["connection.fixture"].exists)
+        app.typeKey("q", modifierFlags: .command)
+        XCTAssertTrue(app.wait(for: .notRunning, timeout: 10))
+        try "[[databases]\nname = 42".write(to: configuration, atomically: true, encoding: .utf8)
+        app.launch()
+        XCTAssertTrue(app.windows.buttons["OK"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts.containing(NSPredicate(format: "value CONTAINS %@ OR label CONTAINS %@", "Failed to parse TOML", "Failed to parse TOML")).firstMatch.exists)
+        XCTAssertFalse(app.buttons["connection.disposable-platform-profile"].exists)
+        app.windows.buttons["OK"].click()
+        app.typeKey("q", modifierFlags: .command)
+        XCTAssertTrue(app.wait(for: .notRunning, timeout: 10))
     }
 
     func testEmptyConfigurationLaunch() throws {

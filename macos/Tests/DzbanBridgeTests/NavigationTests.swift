@@ -20,6 +20,44 @@ final class NavigationTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(5))
         }
     }
+    func testHistoryRestoresSavedOutputWithoutSubmittingAndRefreshRetiresSelection() async throws {
+        let (bridge, store, session) = try await connected()
+        let original = try XCTUnwrap(store.document)
+        let editor = store.editor(for: original)
+        editor.edit(text: "SELECT 'saved 😀'", selection: NSRange(location: 0, length: 0))
+        await store.performEditorIntent(.submit)
+        try await until { store.document?.execution == "finished" && store.document?.rows == 500 }
+        let model = HistoryBrowserModel(bridge: bridge)
+        model.refresh(session: session)
+        try await until { !model.loading }
+        let list = try XCTUnwrap(model.list)
+        let entry = try XCTUnwrap(list.entries.first)
+        XCTAssertEqual(entry.sqlPreview, "SELECT 'saved 😀'")
+        XCTAssertEqual(entry.rows, 500)
+        let generation = try XCTUnwrap(store.document).generation
+        editor.textView.string = "SELECT 'unsent draft'"
+        editor.edit(text: editor.textView.string, selection: NSRange(location: 0, length: 0))
+        let restored = await store.restoreHistory(session: session, revision: list.revision, index: entry.index)
+        XCTAssertTrue(restored)
+        let saved = try XCTUnwrap(store.document)
+        XCTAssertEqual(saved.generation, generation + 1)
+        XCTAssertEqual(saved.history, true)
+        XCTAssertEqual(saved.rows, 200)
+        XCTAssertEqual(saved.historyTotalRows, 500)
+        XCTAssertEqual(editor.textView.string, "SELECT 'saved 😀'")
+        XCTAssertEqual(saved.execution, "finished")
+        model.refresh(session: session)
+        try await until { !model.loading }
+        XCTAssertNotEqual(model.list?.revision, list.revision)
+        model.retire()
+        XCTAssertNil(model.list)
+        XCTAssertFalse(model.loading)
+        await store.performEditorIntent(.submit)
+        try await until { store.document?.execution == "finished" && store.document?.rows == 500 }
+        XCTAssertNil(store.document?.history)
+        try await store.shutdown()
+    }
+
     func testCatalogListsDescribesFiltersAndRetires() async throws {
         let (bridge, store, session) = try await connected()
         let model = CatalogBrowserModel(bridge: bridge)

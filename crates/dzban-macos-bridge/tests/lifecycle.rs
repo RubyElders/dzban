@@ -376,3 +376,104 @@ fn preview_intent_tombstones_reject_late_admission_and_old_cancellation() {
     request(app, json!({"command":"shutdown"}));
     assert!(dzban_release(app));
 }
+
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn saved_history_replacement_keeps_background_execution_and_rejects_stale_pages() {
+    let app = dzban_macos_bridge::dzban_create_fixture();
+    let session = request(app, json!({"command":"connect","profile":"fixture"}))["session"].clone();
+    let document =
+        request(app, json!({"command":"open_document","session":session}))["document"].clone();
+    let snapshot = || {
+        request(
+            app,
+            json!({"command":"observe_document","session":session,"document":document}),
+        )
+    };
+    let wait = |phase: &str, rows: u64| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let current = snapshot();
+            if current["execution"] == phase && current["rows"] == rows {
+                break current;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "document did not reach {phase}: {current}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    };
+    let sql = "ž".repeat(600);
+    request(
+        app,
+        json!({"command":"submit","session":session,"document":document,"sql":sql}),
+    );
+    wait("finished", 500);
+    let history = request(app, json!({"command":"history_list","session":session}));
+    let revision = &history["revision"];
+    assert_eq!(history["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        history["entries"][0]["sql_preview"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .count(),
+        256
+    );
+    request(
+        app,
+        json!({"command":"submit","session":session,"document":document,"sql":"wait"}),
+    );
+    wait("running", 5);
+    let restored = request(
+        app,
+        json!({"command":"restore_history","session":session,"document":document,"history_revision":revision,"index":0}),
+    );
+    assert_eq!(restored["history"], true);
+    assert_eq!(restored["execution"], "running");
+    assert_eq!(restored["rows"], 200);
+    assert_eq!(restored["history_total_rows"], 500);
+    assert_eq!(restored["draft"], sql);
+    let generation = &restored["generation"];
+    let page = request(
+        app,
+        json!({"command":"read_page","session":session,"document":document,"generation":generation,"start":199,"count":1}),
+    );
+    assert_eq!(page["page"]["rows"][0][0], "199");
+    let null_text = request(
+        app,
+        json!({"command":"read_cell","session":session,"document":document,"generation":generation,"row":1,"column":1,"offset":0,"count":10}),
+    );
+    assert_eq!(null_text["text"], "NULL");
+    let stale = request(
+        app,
+        json!({"command":"read_page","session":session,"document":document,"generation":2,"start":0,"count":1}),
+    );
+    assert_eq!(stale["failure"]["kind"], "stale_output");
+    request(
+        app,
+        json!({"command":"cancel","session":session,"document":document}),
+    );
+    let finished = wait("finished", 200);
+    assert_eq!(finished["history"], true);
+    let plan = request(
+        app,
+        json!({"command":"saved_plan","session":session,"document":document,"generation":generation}),
+    );
+    assert_eq!(plan["plan"]["document"]["sql"], sql);
+    request(app, json!({"command":"history_list","session":session}));
+    let old = request(
+        app,
+        json!({"command":"restore_history","session":session,"document":document,"history_revision":revision,"index":0}),
+    );
+    assert_eq!(old["failure"]["kind"], "stale_history");
+    request(
+        app,
+        json!({"command":"submit","session":session,"document":document,"sql":"restart"}),
+    );
+    let restarted = wait("finished", 500);
+    assert!(restarted.get("history").is_none());
+    request(app, json!({"command":"shutdown"}));
+    assert!(dzban_release(app));
+}

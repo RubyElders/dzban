@@ -138,6 +138,26 @@ public final class ApplicationStore: ObservableObject {
         await plan.show(session: session, document: current, text: text, selection: selection, pinned: pinned)
     }
 
+    @discardableResult
+    public func restoreHistory(session: UUID, revision: UUID, index: Int) async -> Bool {
+        guard navigationAvailable, session == selectedSession, let document else { return false }
+        let id = document.document
+        let editor = editor(for: document)
+        guard !editor.textView.hasMarkedText() else { return false }
+        await draftWorkers[id]?.value
+        await contextWorkers[id]?.value
+        guard !Task.isCancelled, navigationAvailable, selectedSession == session,
+              self.document?.document == id, !editor.textView.hasMarkedText() else { return false }
+        do {
+            let snapshot = try await bridge.request(.restoreHistory(session: session, document: id, revision: revision, index: index), as: DocumentSnapshot.self)
+            guard workspaces.contains(where: { $0.id == session && $0.documents.contains(where: { $0.document == id }) }) else { return false }
+            apply(snapshot, session: session)
+            editor.restore(text: snapshot.draft)
+            plan.dismiss()
+            return true
+        } catch { show(error); return false }
+    }
+
     public func loadProfiles() async {
         do { profiles = try await bridge.request(.profiles, as: Profiles.self).profiles }
         catch { show(error) }

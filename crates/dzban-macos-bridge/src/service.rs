@@ -54,6 +54,20 @@ pub enum Command {
     History {
         session: Uuid,
     },
+    HistoryList {
+        session: Uuid,
+    },
+    RestoreHistory {
+        session: Uuid,
+        document: Uuid,
+        history_revision: Uuid,
+        index: usize,
+    },
+    SavedPlan {
+        session: Uuid,
+        document: Uuid,
+        generation: u64,
+    },
     Profiles {},
     Connections {},
     SelectSession {
@@ -205,6 +219,8 @@ struct State {
     selection: Mutex<NativeSelection>,
     interaction: Mutex<AppState>,
     readers: tokio::sync::Semaphore,
+    history_views: Mutex<HashMap<SessionId, crate::history::HistoryView>>,
+    saved_outputs: Mutex<HashMap<DocumentId, crate::history::SavedOutput>>,
 }
 
 struct Observer {
@@ -254,6 +270,8 @@ impl App {
                 selection: Mutex::new(NativeSelection::default()),
                 interaction: Mutex::new(AppState::default()),
                 readers: tokio::sync::Semaphore::new(16),
+                history_views: Mutex::new(HashMap::new()),
+                saved_outputs: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -332,6 +350,7 @@ impl State {
         let query = document
             .submit(engine, sql, ResultLimits::default(), Some(history))
             .map_err(execution_error)?;
+        self.saved_outputs.lock().unwrap().remove(&document.id());
         let result = json!({"query": query.query.0, "document": query.document.0, "session": query.session.0, "generation": query.generation});
         tokio::spawn(async move {
             let _ = query.wait().await;
@@ -456,12 +475,26 @@ impl State {
         let _readers = self.readers.acquire_many(16).await.unwrap();
         let mut workspaces = self.workspaces.lock().unwrap();
         if let Some(workspace) = workspaces.get_mut(&SessionId(session)) {
+            let documents: Vec<_> = workspace
+                .documents
+                .documents()
+                .iter()
+                .map(QueryDocument::id)
+                .collect();
             workspace
                 .documents
                 .retire_closed_session(&workspace.engine)
                 .map_err(execution_error)?;
+            let mut saved = self.saved_outputs.lock().unwrap();
+            for document in documents {
+                saved.remove(&document);
+            }
         }
         workspaces.remove(&SessionId(session));
+        self.history_views
+            .lock()
+            .unwrap()
+            .remove(&SessionId(session));
         Ok(())
     }
     fn controls(&self) -> Value {
@@ -509,6 +542,57 @@ impl State {
         .map_err(|_| failure("worker_failed", "History worker failed"))?
         .map_err(|error| failure("history", error))
     }
+    fn snapshot(&self, document: &QueryDocument) -> Value {
+        let snapshot = document_snapshot(document);
+        let saved = self.saved_outputs.lock().unwrap();
+        match saved
+            .get(&document.id())
+            .filter(|saved| snapshot["generation"] == saved.generation)
+        {
+            Some(saved) => saved.project(snapshot),
+            None => snapshot,
+        }
+    }
+
+    async fn result_page(
+        &self,
+        session: Uuid,
+        id: Uuid,
+        generation: u64,
+        start: usize,
+        count: usize,
+    ) -> Result<dzban_core::ResultSet, Value> {
+        let (_, document) = self.document(session, id)?;
+        let snapshot = document.snapshot();
+        if snapshot.output_generation != generation {
+            return Err(failure("stale_output", "Output generation has changed"));
+        }
+        let saved = self
+            .saved_outputs
+            .lock()
+            .unwrap()
+            .get(&document.id())
+            .filter(|saved| saved.generation == generation)
+            .cloned();
+        let page = if let Some(saved) = saved {
+            saved.page(start, count)
+        } else {
+            let result = snapshot
+                .operation
+                .and_then(|operation| operation.capture)
+                .and_then(|capture| capture.result)
+                .ok_or_else(|| failure("result_unavailable", "Result is not available"))?;
+            result
+                .read_page(start, count)
+                .await
+                .map_err(execution_error)?
+        };
+        if !document.accepts_output(generation) {
+            return Err(failure("stale_output", "Output generation has changed"));
+        }
+        Ok(page)
+    }
+
     async fn observe_controls(&self, session: Uuid, stream: Arc<Stream>) {
         let engine = self
             .workspaces
@@ -542,13 +626,13 @@ impl State {
             }
         };
         let mut receiver = document.subscribe();
-        stream.publish(document_snapshot(&document));
+        stream.publish(self.snapshot(&document));
         loop {
             tokio::select! {
                 _ = stream.closed() => break,
                 changed = receiver.changed() => {
                     if changed.is_err() { break; }
-                    stream.publish(document_snapshot(&document));
+                    stream.publish(self.snapshot(&document));
                 }
             }
         }
@@ -589,6 +673,9 @@ impl State {
                 | Command::ReadViewport { .. }
                 | Command::ReadPage { .. }
                 | Command::ReadCell { .. }
+                | Command::HistoryList { .. }
+                | Command::RestoreHistory { .. }
+                | Command::SavedPlan { .. }
         ) {
             let permit = self.readers.acquire().await.unwrap();
             if *self.context.subscribe_phase().borrow() != ApplicationPhase::Running {
@@ -705,7 +792,7 @@ impl State {
                 if let Some(revision) = revision {
                     workspace.selection_revision = revision;
                 }
-                Ok(document_snapshot(&workspace.documents.selected().unwrap()))
+                Ok(self.snapshot(&workspace.documents.selected().unwrap()))
             }
             Command::CloseDocument { session, document } => {
                 let outcome = {
@@ -726,12 +813,16 @@ impl State {
                         Ok(json!({"workspace_closed":true, "document":document, "selected":null}))
                     }
                     CloseDocument::Closed { .. } => {
+                        self.saved_outputs
+                            .lock()
+                            .unwrap()
+                            .remove(&DocumentId(document));
                         let workspaces = self.workspaces.lock().unwrap();
                         let selected = workspaces
                             .get(&SessionId(session))
                             .and_then(|workspace| workspace.documents.selected());
                         Ok(
-                            json!({"workspace_closed":false, "document":document, "selected":selected.as_ref().map(document_snapshot)}),
+                            json!({"workspace_closed":false, "document":document, "selected":selected.as_ref().map(|document| self.snapshot(document))}),
                         )
                     }
                 }
@@ -822,12 +913,12 @@ impl State {
                 } else if let Some(revision) = revision {
                     workspace.selection_revision = revision;
                 }
-                Ok(document_snapshot(&document))
+                Ok(self.snapshot(&document))
             }
             Command::ContextChanged { session, document } => {
                 let (_, document) = self.document(session, document)?;
                 document.query_context_changed();
-                Ok(document_snapshot(&document))
+                Ok(self.snapshot(&document))
             }
             Command::SetDraft {
                 session,
@@ -836,7 +927,7 @@ impl State {
             } => {
                 let (_, document) = self.document(session, document)?;
                 document.set_draft(draft);
-                Ok(document_snapshot(&document))
+                Ok(self.snapshot(&document))
             }
             Command::ObserveDocument { .. } | Command::ObserveControls { .. } => Err(failure(
                 "invalid_command",
@@ -862,23 +953,10 @@ impl State {
                 document,
                 generation,
             } => {
-                let (_, document) = self.document(session, document)?;
-                let snapshot = document.snapshot();
-                if snapshot.output_generation != generation {
-                    return Err(failure("stale_output", "Output generation has changed"));
-                }
-                let result = snapshot
-                    .operation
-                    .and_then(|operation| operation.capture)
-                    .and_then(|capture| capture.result)
-                    .ok_or_else(|| failure("result_unavailable", "Result is not available"))?;
-                let page = result.read_page(0, 0).await.map_err(execution_error)?;
-                if !document.accepts_output(generation) {
-                    return Err(failure("stale_output", "Output generation has changed"));
-                }
-                Ok(
-                    json!({"document":document.id().0,"generation":generation,"columns":page.columns}),
-                )
+                let page = self
+                    .result_page(session, document, generation, 0, 0)
+                    .await?;
+                Ok(json!({"document":document,"generation":generation,"columns":page.columns}))
             }
             Command::ReadViewport {
                 session,
@@ -898,20 +976,9 @@ impl State {
                         "Viewport exceeds the row or column limit",
                     ));
                 }
-                let (_, document) = self.document(session, document)?;
-                let snapshot = document.snapshot();
-                if snapshot.output_generation != generation {
-                    return Err(failure("stale_output", "Output generation has changed"));
-                }
-                let result = snapshot
-                    .operation
-                    .and_then(|operation| operation.capture)
-                    .and_then(|capture| capture.result)
-                    .ok_or_else(|| failure("result_unavailable", "Result is not available"))?;
-                let page = result
-                    .read_page(start, count)
-                    .await
-                    .map_err(execution_error)?;
+                let page = self
+                    .result_page(session, document, generation, start, count)
+                    .await?;
                 if column_start >= page.columns.len()
                     || column_count > page.columns.len() - column_start
                 {
@@ -920,11 +987,8 @@ impl State {
                         "Viewport columns are outside the schema",
                     ));
                 }
-                if !document.accepts_output(generation) {
-                    return Err(failure("stale_output", "Output generation has changed"));
-                }
                 Ok(
-                    json!({"document":document.id().0,"generation":generation,"start":start,"column_start":column_start,"rows":crate::viewport::cells(page,column_start,column_count)}),
+                    json!({"document":document,"generation":generation,"start":start,"column_start":column_start,"rows":crate::viewport::cells(page,column_start,column_count)}),
                 )
             }
             Command::ReadPage {
@@ -937,24 +1001,10 @@ impl State {
                 if count > MAX_PAGE_ROWS {
                     return Err(failure("invalid_page", "Page exceeds MAX_PAGE_ROWS"));
                 }
-                let (_, document) = self.document(session, document)?;
-                let snapshot = document.snapshot();
-                if snapshot.output_generation != generation {
-                    return Err(failure("stale_output", "Output generation has changed"));
-                }
-                let result = snapshot
-                    .operation
-                    .and_then(|operation| operation.capture)
-                    .and_then(|capture| capture.result)
-                    .ok_or_else(|| failure("result_unavailable", "Result is not available"))?;
-                let page = result
-                    .read_page(start, count)
-                    .await
-                    .map_err(execution_error)?;
-                if !document.accepts_output(generation) {
-                    return Err(failure("stale_output", "Output generation has changed"));
-                }
-                let payload = json!({"document": document.id().0, "generation": generation, "start": start, "page": page});
+                let page = self
+                    .result_page(session, document, generation, start, count)
+                    .await?;
+                let payload = json!({"document": document, "generation": generation, "start": start, "page": page});
                 if serde_json::to_vec(&payload).unwrap().len()
                     > crate::transport::MAX_RECORD_BYTES - 256
                 {
@@ -972,6 +1022,65 @@ impl State {
             Command::History { session } => {
                 let history = self.history(session).await?;
                 Ok(json!({"entries": history.entries()}))
+            }
+            Command::HistoryList { session } => {
+                let store = Arc::new(self.history(session).await?);
+                let view = crate::history::HistoryView {
+                    revision: Uuid::new_v4(),
+                    store,
+                };
+                let response = crate::history::summaries(&view);
+                self.history_views
+                    .lock()
+                    .unwrap()
+                    .insert(SessionId(session), view);
+                Ok(response)
+            }
+            Command::RestoreHistory {
+                session,
+                document,
+                history_revision,
+                index,
+            } => {
+                let (_, document) = self.document(session, document)?;
+                let store = {
+                    let views = self.history_views.lock().unwrap();
+                    let view = views
+                        .get(&SessionId(session))
+                        .filter(|view| view.revision == history_revision)
+                        .ok_or_else(|| failure("stale_history", "History has been refreshed"))?;
+                    if index >= view.store.entries().len() {
+                        return Err(failure("history_entry", "History entry is missing"));
+                    }
+                    view.store.clone()
+                };
+                let mut saved = self.saved_outputs.lock().unwrap();
+                document.set_draft(store.entries()[index].sql.clone());
+                let generation = document.replace_output();
+                let output = crate::history::SavedOutput {
+                    generation,
+                    store,
+                    index,
+                };
+                let snapshot = output.project(document_snapshot(&document));
+                saved.insert(document.id(), output);
+                Ok(snapshot)
+            }
+            Command::SavedPlan {
+                session,
+                document,
+                generation,
+            } => {
+                let (_, document) = self.document(session, document)?;
+                if !document.accepts_output(generation) {
+                    return Err(failure("stale_output", "Output generation has changed"));
+                }
+                let saved = self.saved_outputs.lock().unwrap();
+                let output = saved
+                    .get(&document.id())
+                    .filter(|saved| saved.generation == generation)
+                    .ok_or_else(|| failure("history_entry", "Saved output is not selected"))?;
+                Ok(json!({"plan":output.plan()}))
             }
             Command::Peek {
                 session,
@@ -1130,20 +1239,9 @@ impl State {
                         "Cell chunks are limited to 65536 Unicode scalars",
                     ));
                 }
-                let (_, document) = self.document(session, document)?;
-                let snapshot = document.snapshot();
-                if snapshot.output_generation != generation {
-                    return Err(failure("stale_output", "Output generation has changed"));
-                }
-                let result = snapshot
-                    .operation
-                    .and_then(|operation| operation.capture)
-                    .and_then(|capture| capture.result)
-                    .ok_or_else(|| failure("result_unavailable", "Result is not available"))?;
-                let page = result.read_page(row, 1).await.map_err(execution_error)?;
-                if !document.accepts_output(generation) {
-                    return Err(failure("stale_output", "Output generation has changed"));
-                }
+                let page = self
+                    .result_page(session, document, generation, row, 1)
+                    .await?;
                 let cell = page
                     .rows
                     .first()
@@ -1160,7 +1258,7 @@ impl State {
                     return Err(failure("invalid_chunk", "Cell offset is outside the value"));
                 }
                 Ok(
-                    json!({"document":document.id().0, "generation":generation, "row":row, "column":column, "offset":offset, "total":total, "text":text}),
+                    json!({"document":document, "generation":generation, "row":row, "column":column, "offset":offset, "total":total, "text":text}),
                 )
             }
             Command::Shutdown {} => {
@@ -1180,6 +1278,8 @@ impl State {
                             .map_err(execution_error)?;
                     }
                     workspaces.clear();
+                    self.saved_outputs.lock().unwrap().clear();
+                    self.history_views.lock().unwrap().clear();
                 }
                 let observers = std::mem::take(&mut *self.observers.lock().unwrap());
                 for observer in observers {
@@ -1261,4 +1361,68 @@ fn document_snapshot(document: &QueryDocument) -> Value {
         "cutoff": capture.and_then(|capture| capture.cutoff),
         "error": error,
     })
+}
+
+#[cfg(all(test, feature = "test-fixtures"))]
+mod tests {
+    use super::*;
+    use dzban_core::history::QueryHistoryEntry;
+
+    #[test]
+    fn native_history_refresh_observes_external_publication_without_retargeting_saved_entries() {
+        let app = crate::fixture::app().unwrap();
+        let runtime = app.runtime.as_ref().unwrap();
+        let request = |value: Value| {
+            runtime
+                .block_on(app.state.execute(serde_json::from_value(value).unwrap()))
+                .unwrap()
+        };
+        let session = request(json!({"command":"connect","profile":"fixture"}))["session"].clone();
+        let document =
+            request(json!({"command":"open_document","session":session}))["document"].clone();
+        let path = app
+            .state
+            .history_directory
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .0
+            .join("history.json");
+        let legacy = json!({"version":1,"database":"fixture","entries":[QueryHistoryEntry::failure("legacy CLI query".into(),"legacy failure".into(),None,None)]});
+        let original_bytes = serde_json::to_vec(&legacy).unwrap();
+        std::fs::write(&path, &original_bytes).unwrap();
+        let before = request(json!({"command":"history_list","session":session}));
+        assert_eq!(before["entries"][0]["sql_preview"], "legacy CLI query");
+        let mut writer = QueryHistoryStore::load_from_path(path.clone(), "fixture").unwrap();
+        writer
+            .add(QueryHistoryEntry::failure(
+                "external CLI query".into(),
+                "external failure".into(),
+                None,
+                None,
+            ))
+            .unwrap();
+        let restored = request(
+            json!({"command":"restore_history","session":session,"document":document,"history_revision":before["revision"],"index":0}),
+        );
+        assert_eq!(restored["draft"], "legacy CLI query");
+        assert_eq!(restored["termination"], "failed");
+        assert_eq!(restored["rows"], 0);
+        let refreshed = request(json!({"command":"history_list","session":session}));
+        assert_eq!(refreshed["entries"].as_array().unwrap().len(), 2);
+        assert_eq!(refreshed["entries"][0]["sql_preview"], "external CLI query");
+        assert_ne!(before["revision"], refreshed["revision"]);
+        let visible = app
+            .state
+            .document(
+                serde_json::from_value(session).unwrap(),
+                serde_json::from_value(document).unwrap(),
+            )
+            .unwrap()
+            .1;
+        assert_eq!(app.state.snapshot(&visible)["draft"], "legacy CLI query");
+        assert_eq!(std::fs::read(path).unwrap(), original_bytes);
+        request(json!({"command":"shutdown"}));
+    }
 }

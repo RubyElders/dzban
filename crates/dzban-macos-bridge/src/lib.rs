@@ -3,6 +3,7 @@ mod editor;
 #[cfg(feature = "test-fixtures")]
 mod fixture;
 mod handles;
+mod history;
 mod service;
 mod transport;
 mod viewport;
