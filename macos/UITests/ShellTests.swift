@@ -53,9 +53,10 @@ final class ShellTests: XCTestCase {
         let run = app.buttons["query.primary"]
         XCTAssertLessThan(app.buttons["history.open"].frame.maxX, actions.frame.minX)
         XCTAssertLessThan(actions.frame.maxX, run.frame.minX)
-        actions.click()
+        app.typeKey("k", modifierFlags: [.command, .shift])
         let search = app.toolbars.searchFields["actions.search"]
         XCTAssertTrue(search.waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["action.new"].waitForExistence(timeout: 5))
         search.click()
         search.typeText("query")
         XCTAssertTrue(app.buttons["action.new"].exists)
