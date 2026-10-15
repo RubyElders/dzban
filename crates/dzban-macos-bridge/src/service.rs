@@ -15,7 +15,7 @@ use dzban_core::interaction::{
 };
 use dzban_core::preview::{PREVIEW_DELAY, PlanPreviewService, PreviewPhase};
 use dzban_core::result_store::{MAX_PAGE_ROWS, ResultLimits};
-use dzban_core::result_stream::ResultPhase;
+use dzban_core::result_stream::{ResultPhase, ResultTermination};
 use dzban_core::{Config, ConnectionProfileId};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -30,6 +30,8 @@ use crate::transport::Stream;
 pub enum Command {
     #[cfg(feature = "test-fixtures")]
     TestPanic {},
+    #[cfg(feature = "test-fixtures")]
+    TestMetrics {},
     Preview {
         session: Uuid,
         document: Uuid,
@@ -91,6 +93,20 @@ pub enum Command {
     Cancel {
         session: Uuid,
         document: Uuid,
+    },
+    ResultSchema {
+        session: Uuid,
+        document: Uuid,
+        generation: u64,
+    },
+    ReadViewport {
+        session: Uuid,
+        document: Uuid,
+        generation: u64,
+        start: usize,
+        count: usize,
+        column_start: usize,
+        column_count: usize,
     },
     ReadPage {
         session: Uuid,
@@ -162,6 +178,7 @@ struct State {
     history_directory: Mutex<Option<HistoryDirectory>>,
     selection: Mutex<NativeSelection>,
     interaction: Mutex<AppState>,
+    readers: tokio::sync::Semaphore,
 }
 
 struct Observer {
@@ -210,6 +227,7 @@ impl App {
                 history_directory: Mutex::new(None),
                 selection: Mutex::new(NativeSelection::default()),
                 interaction: Mutex::new(AppState::default()),
+                readers: tokio::sync::Semaphore::new(16),
             }),
         })
     }
@@ -397,6 +415,7 @@ impl State {
             .connection
             .finish_close(SessionId(session), &cleanup);
         outcome.map_err(|error| application_error("close", error))?;
+        let _readers = self.readers.acquire_many(16).await.unwrap();
         let mut workspaces = self.workspaces.lock().unwrap();
         if let Some(workspace) = workspaces.get_mut(&SessionId(session)) {
             workspace
@@ -502,9 +521,32 @@ impl State {
         if *self.context.subscribe_phase().borrow() == ApplicationPhase::Closed {
             return Err(failure("closed", "Application is closed"));
         }
+        let _reader = if matches!(
+            command,
+            Command::ResultSchema { .. }
+                | Command::ReadViewport { .. }
+                | Command::ReadPage { .. }
+                | Command::ReadCell { .. }
+        ) {
+            let permit = self.readers.acquire().await.unwrap();
+            if *self.context.subscribe_phase().borrow() != ApplicationPhase::Running {
+                return Err(failure("closed", "Application is closing"));
+            }
+            Some(permit)
+        } else {
+            None
+        };
         match command {
             #[cfg(feature = "test-fixtures")]
             Command::TestPanic {} => panic!("Fixture bridge worker panic"),
+            #[cfg(feature = "test-fixtures")]
+            Command::TestMetrics {} => {
+                let (record_bytes, peak_record_bytes) = crate::transport::byte_metrics();
+                let (buffer_bytes, peak_buffer_bytes) = crate::handles::byte_metrics();
+                Ok(
+                    json!({"record_bytes":record_bytes,"peak_record_bytes":peak_record_bytes,"buffer_bytes":buffer_bytes,"peak_buffer_bytes":peak_buffer_bytes}),
+                )
+            }
             Command::Controls {} => Ok(self.controls()),
             Command::EditorAction {
                 session,
@@ -572,6 +614,7 @@ impl State {
             }
             Command::CloseDocument { session, document } => {
                 let outcome = {
+                    let _readers = self.readers.acquire_many(16).await.unwrap();
                     let mut workspaces = self.workspaces.lock().unwrap();
                     let workspace = workspaces
                         .get_mut(&SessionId(session))
@@ -711,6 +754,76 @@ impl State {
                     .await
                     .map_err(execution_error)?;
                 Ok(json!({"cancellation_requested": true}))
+            }
+            Command::ResultSchema {
+                session,
+                document,
+                generation,
+            } => {
+                let (_, document) = self.document(session, document)?;
+                let snapshot = document.snapshot();
+                if snapshot.output_generation != generation {
+                    return Err(failure("stale_output", "Output generation has changed"));
+                }
+                let result = snapshot
+                    .operation
+                    .and_then(|operation| operation.capture)
+                    .and_then(|capture| capture.result)
+                    .ok_or_else(|| failure("result_unavailable", "Result is not available"))?;
+                let page = result.read_page(0, 0).await.map_err(execution_error)?;
+                if !document.accepts_output(generation) {
+                    return Err(failure("stale_output", "Output generation has changed"));
+                }
+                Ok(
+                    json!({"document":document.id().0,"generation":generation,"columns":page.columns}),
+                )
+            }
+            Command::ReadViewport {
+                session,
+                document,
+                generation,
+                start,
+                count,
+                column_start,
+                column_count,
+            } => {
+                if count > MAX_PAGE_ROWS
+                    || column_count == 0
+                    || column_count > crate::viewport::MAX_VIEW_COLUMNS
+                {
+                    return Err(failure(
+                        "invalid_page",
+                        "Viewport exceeds the row or column limit",
+                    ));
+                }
+                let (_, document) = self.document(session, document)?;
+                let snapshot = document.snapshot();
+                if snapshot.output_generation != generation {
+                    return Err(failure("stale_output", "Output generation has changed"));
+                }
+                let result = snapshot
+                    .operation
+                    .and_then(|operation| operation.capture)
+                    .and_then(|capture| capture.result)
+                    .ok_or_else(|| failure("result_unavailable", "Result is not available"))?;
+                let page = result
+                    .read_page(start, count)
+                    .await
+                    .map_err(execution_error)?;
+                if column_start >= page.columns.len()
+                    || column_count > page.columns.len() - column_start
+                {
+                    return Err(failure(
+                        "invalid_page",
+                        "Viewport columns are outside the schema",
+                    ));
+                }
+                if !document.accepts_output(generation) {
+                    return Err(failure("stale_output", "Output generation has changed"));
+                }
+                Ok(
+                    json!({"document":document.id().0,"generation":generation,"start":start,"column_start":column_start,"rows":crate::viewport::cells(page,column_start,column_count)}),
+                )
             }
             Command::ReadPage {
                 session,
@@ -873,6 +986,7 @@ impl State {
                     .wait()
                     .await
                     .map_err(|error| application_error("shutdown", error))?;
+                let _readers = self.readers.acquire_many(16).await.unwrap();
                 {
                     let mut workspaces = self.workspaces.lock().unwrap();
                     for workspace in workspaces.values_mut() {
@@ -925,6 +1039,24 @@ fn document_snapshot(document: &QueryDocument) -> Value {
             Err(error) => Some(error.clone()),
             Ok(completion) => completion.result.as_ref().err().cloned(),
         });
+    let termination = capture.and_then(|capture| match &capture.phase {
+        ResultPhase::Finished(ResultTermination::Complete) => Some("complete"),
+        ResultPhase::Finished(ResultTermination::Limited(_)) => Some("limited"),
+        ResultPhase::Finished(ResultTermination::Canceled) => Some("canceled"),
+        ResultPhase::Finished(ResultTermination::Failed(_)) => Some("failed"),
+        _ => None,
+    });
+    let capture_error = capture.and_then(|capture| match &capture.phase {
+        ResultPhase::FailedAwaitingCleanup(error)
+        | ResultPhase::Finished(ResultTermination::Failed(error)) => Some(error),
+        _ => None,
+    });
+    let command = snapshot
+        .completion
+        .as_ref()
+        .and_then(|completion| completion.as_ref().ok())
+        .and_then(|completion| completion.result.as_ref().ok())
+        .and_then(|result| result.command.as_ref());
     json!({
         "document": snapshot.id.0,
         "session": snapshot.session.map(|session| session.0),
@@ -935,7 +1067,13 @@ fn document_snapshot(document: &QueryDocument) -> Value {
         "draft": snapshot.draft,
         "execution": execution,
         "result_phase": result_phase,
+        "result_available": capture.is_some_and(|capture| capture.result.is_some()),
         "rows": capture.map_or(0, |capture| capture.rows),
+        "received_rows": capture.map_or(0, |capture| capture.received_rows),
+        "capture_bytes": capture.map_or(0, |capture| capture.bytes),
+        "termination": termination,
+        "capture_error": capture_error,
+        "command_result": command,
         "cutoff": capture.and_then(|capture| capture.cutoff),
         "error": error,
     })

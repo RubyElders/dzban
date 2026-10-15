@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use async_trait::async_trait;
 use dzban_core::adapter::{AdapterFactory, AdapterRegistry, DatabaseSession};
 use dzban_core::error::ExecutionError;
-use dzban_core::result_stream::ResultSink;
+use dzban_core::result_stream::{Delivery, ResultSink};
 use dzban_core::{
     Config, DatabaseBackend, DatabaseConfig, QueryPlan, ResultCell, ResultColumn, ResultSet,
 };
@@ -69,30 +69,69 @@ impl DatabaseSession for Fixture {
         if sql == "reject_close" {
             self.reject_close.store(true, Ordering::SeqCst);
         }
-        sink.schema(vec![
-            ResultColumn {
-                name: "id".into(),
-                type_name: "integer".into(),
-            },
-            ResultColumn {
-                name: "value".into(),
-                type_name: "text".into(),
-            },
-        ])
+        if sql == "command" {
+            return Ok(Some(dzban_core::CommandAcknowledgment {
+                affected_rows: Some(7),
+            }));
+        }
+        if sql == "waiting" {
+            self.canceled.notified().await;
+            return Err(ExecutionError::Canceled);
+        }
+        let width = if sql == "wide" { 128 } else { 2 };
+        sink.schema(
+            (0..width)
+                .map(|column| ResultColumn {
+                    name: if column == 0 {
+                        "id".into()
+                    } else if column == 1 {
+                        "value".into()
+                    } else {
+                        format!("column_{column}")
+                    },
+                    type_name: if column == 0 {
+                        "integer".into()
+                    } else {
+                        "text".into()
+                    },
+                })
+                .collect(),
+        )
         .await?;
-        for row in 0..500 {
-            sink.row(vec![
-                ResultCell::Text(row.to_string()),
-                if row == 1 {
-                    ResultCell::Null
-                } else {
-                    ResultCell::Text("žluť\nNULL😀".into())
-                },
-            ])
-            .await?;
+        let rows = match sql {
+            "empty" => 0,
+            "huge" => 3,
+            "limit" => 10_020,
+            _ => 500,
+        };
+        for row in 0..rows {
+            let values = (0..width)
+                .map(|column| {
+                    if column == 0 {
+                        ResultCell::Text(row.to_string())
+                    } else if row == 1 && column == 1 {
+                        ResultCell::Null
+                    } else if sql == "huge" && row == 0 && column == 1 {
+                        ResultCell::Text("😀".repeat(2_500_000))
+                    } else if sql == "wide" {
+                        ResultCell::Text(format!("r{row}c{column}"))
+                    } else {
+                        ResultCell::Text("žluť\nNULL😀".into())
+                    }
+                })
+                .collect();
+            if matches!(sink.row(values).await?, Delivery::Stop(_)) {
+                self.canceled.notified().await;
+                return Ok(None);
+            }
             if row == 4 && sql == "wait" {
                 self.canceled.notified().await;
                 return Err(ExecutionError::Canceled);
+            }
+            if row == 4 && sql == "cleanup_failure" {
+                let error = sink.row(vec![]).await.unwrap_err();
+                self.canceled.notified().await;
+                return Err(error);
             }
         }
         Ok(None)

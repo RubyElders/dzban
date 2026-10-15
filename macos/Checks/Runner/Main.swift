@@ -17,6 +17,7 @@ enum BridgeCheck {
             try await LifecycleScenarios.nativeStoreNavigatesClosesAndRejectsStaleConnections()
             try await LifecycleScenarios.nativeStoreKeepsBusyAndFailedCleanupAvailableForRetry()
             try await LifecycleScenarios.nativeEditorSelectsSQLPreservesDraftsAndScopesCancellation()
+            try await LifecycleScenarios.nativeResultsStreamPageInspectAndRetireAcrossOutputs()
             print("Swift bridge lifecycle scenarios passed")
             #else
             throw NSError(domain: "DzbanBridgeCheck", code: 1, userInfo: [NSLocalizedDescriptionKey: "Build the check runner with test fixtures enabled"])

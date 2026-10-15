@@ -56,3 +56,17 @@ async fn factory_sessions_do_not_connect_implicitly() {
         "Not connected"
     );
 }
+
+#[tokio::test]
+async fn clickhouse_connection_errors_do_not_expose_url_parameters() {
+    let mut config = profile(DatabaseBackend::Clickhouse);
+    config.url = Some("http://127.0.0.1:0/?token=private-fixture-token".into());
+    let session = ClickhouseAdapter.create(config).unwrap();
+    let error = session.connect_detailed().await.unwrap_err();
+    let dzban_core::error::ExecutionError::Database(error) = error else {
+        panic!("expected a structured transport error");
+    };
+    assert_eq!(error.kind, dzban_core::error::ErrorKind::Transport);
+    assert!(!error.message.contains("private-fixture-token"));
+    assert!(!error.message.contains("query_id="));
+}

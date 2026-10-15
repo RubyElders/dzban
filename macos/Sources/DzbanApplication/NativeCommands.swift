@@ -23,6 +23,14 @@ public struct NativeCommands: Commands {
             Button("Cancel Query") { store.sendEditorIntent(.cancel) }
                 .disabled(!store.navigationAvailable || store.controls?.primaryAction != "stop")
         }
+        #if DZBAN_TEST_FIXTURES
+        if ProcessInfo.processInfo.arguments.contains("--metrics-output") {
+            CommandMenu("Testing") {
+                Button("Reset Viewport Metrics") { store.resetResultMetrics() }
+                Button("Record Viewport Metrics") { Task { await store.recordResultMetrics() } }
+            }
+        }
+        #endif
         CommandMenu("Connection") {
             Button("Show Connections") { Task { await store.chooseConnections() } }
                 .keyboardShortcut("k", modifiers: .command)

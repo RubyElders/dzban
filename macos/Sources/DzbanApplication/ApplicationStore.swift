@@ -22,6 +22,10 @@ public final class ApplicationStore: ObservableObject {
     @Published public var failure: String?
 
     public let bridge: Bridge
+    public let results: ResultViewport
+    #if DZBAN_TEST_FIXTURES
+    let responsiveness = MainThreadProbe()
+    #endif
     private var connectionIntent: UUID?
     private var controlRevision: UInt64 = 0
     private var navigationRevision: UInt64 = 0
@@ -31,7 +35,10 @@ public final class ApplicationStore: ObservableObject {
     private var editors: [UUID: EditorBuffer] = [:]
     private var draftWorkers: [UUID: Task<Void, Never>] = [:]
 
-    public init(bridge: Bridge) { self.bridge = bridge }
+    public init(bridge: Bridge, resultSource: (any ResultSource)? = nil) {
+        self.bridge = bridge
+        results = ResultViewport(source: resultSource ?? BridgeResultSource(bridge: bridge))
+    }
 
     public var workspace: Workspace? { workspaces.first { $0.id == selectedSession } }
     public var document: DocumentSnapshot? {
@@ -191,6 +198,7 @@ public final class ApplicationStore: ObservableObject {
             else if let index = workspaces.firstIndex(where: { $0.id == session }) {
                 observations.removeValue(forKey: document)?.cancel()
                 editors.removeValue(forKey: document)?.retire()
+                if results.scope?.document == document { results.retire() }
                 workspaces[index].documents.removeAll { $0.document == document }
                 workspaces[index].selectedDocument = result.selected?.document
                 if let selected = result.selected { apply(selected, session: session) }
@@ -239,6 +247,10 @@ public final class ApplicationStore: ObservableObject {
         defer { shutdownTask = nil; isShuttingDown = false }
         do {
             try await task.value
+            results.retire()
+            #if DZBAN_TEST_FIXTURES
+            responsiveness.stop()
+            #endif
             isClosed = true
             for task in observations.values { task.cancel() }
             observations.removeAll()
@@ -274,6 +286,7 @@ public final class ApplicationStore: ObservableObject {
     }
 
     private func removeWorkspace(_ session: UUID) {
+        if results.scope?.session == session { results.retire() }
         if let workspace = workspaces.first(where: { $0.id == session }) {
             for document in workspace.documents {
                 observations.removeValue(forKey: document.document)?.cancel()
