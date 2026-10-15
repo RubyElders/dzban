@@ -195,6 +195,50 @@ final class ShellTests: XCTestCase {
         XCTAssertTrue(app.wait(for: .notRunning, timeout: 10))
     }
 
+    func testSidebarDoesNotMoveToolbarOrRevealWindowTitle() throws {
+        app.launchArguments = ["--fixture-query", "SELECT 42"]
+        launchApp()
+        waitForValue("Complete - 500 rows", in: app.staticTexts["results.status"])
+        let window = app.windows.firstMatch
+        for width in [1150.0, 960.0] {
+            let corner = window.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 1)).withOffset(CGVector(dx: -2, dy: -2))
+            corner.press(forDuration: 0.1, thenDragTo: corner.withOffset(CGVector(dx: width - window.frame.width, dy: 0)))
+            let toggle = app.toolbars.buttons["history.open"]
+            let origin = toggle.frame
+            for visible in [true, false, true, false, true] {
+                if app.buttons["history.close"].exists != visible { toggle.click() }
+                let state = expectation(for: NSPredicate(format: "exists == %@", NSNumber(value: visible)), evaluatedWith: app.buttons["history.close"])
+                wait(for: [state], timeout: 5)
+                print("History \(visible), window \(window.frame), toggle \(toggle.frame)")
+                XCTAssertEqual(toggle.frame.minX, origin.minX, accuracy: 1)
+                XCTAssertEqual(toggle.frame.minY, origin.minY, accuracy: 1)
+                XCTAssertEqual(toggle.frame.width, origin.width, accuracy: 1)
+                XCTAssertEqual(app.toolbars.searchFields["actions.search"].frame.midX, window.frame.midX, accuracy: 3)
+                XCTAssertFalse(window.staticTexts["Dzban"].exists)
+                let attachment = XCTAttachment(screenshot: window.screenshot())
+                attachment.name = "Titlebar \(Int(width)) history \(visible)"
+                attachment.lifetime = .keepAlways
+                add(attachment)
+            }
+        }
+        let toggle = app.toolbars.buttons["history.open"]
+        let origin = toggle.frame
+        app.buttons["connections.show"].click()
+        XCTAssertTrue(app.buttons["connection.fixture"].waitForExistence(timeout: 5))
+        XCTAssertEqual(toggle.frame.minX, origin.minX, accuracy: 1)
+        XCTAssertFalse(window.staticTexts["Dzban"].exists)
+        let chooser = XCTAttachment(screenshot: window.screenshot())
+        chooser.name = "Titlebar connections"
+        chooser.lifetime = .keepAlways
+        add(chooser)
+        app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH 'workspace.'")).firstMatch.click()
+        XCTAssertTrue(app.buttons["history.close"].waitForExistence(timeout: 5))
+        XCTAssertEqual(toggle.frame.minX, origin.minX, accuracy: 1)
+        XCTAssertFalse(window.staticTexts["Dzban"].exists)
+        app.typeKey("q", modifierFlags: .command)
+        XCTAssertTrue(app.wait(for: .notRunning, timeout: 10))
+    }
+
     func testConnectionQueryMenuAndQuit() throws {
         launchApp()
         let connect = app.buttons["connection.fixture"]
