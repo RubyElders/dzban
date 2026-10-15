@@ -38,6 +38,10 @@ Run `shutdown`, inspect its outcome, and then release the application. Releasing
 | `actions` | `session` | Backend-capability-filtered action IDs, names, descriptions, effects, and argument contracts |
 | `catalog` | `session`, typed `request` | Typed identities and ordered catalog entries, retaining SQL null attributes |
 | `context_changed` | `session`, `document` | Advance cursor/selection context revision and invalidate stale estimates |
+| `input` | `session`, `document`, draft `revision`, typed `input` event | Shared input reducer commands, action hint, and pinned state; rejects stale selection |
+| `await_idle` | `session` | Wait for preview/ping/version cleanup; report an active query without waiting; reject a closed session |
+| `probe_session` | `session`, `include_version` | Measured latency and optional server version; busy is distinct from failure |
+| `probe_profile` | `profile` | Probe a temporary connection and close it before returning; does not select a workspace |
 | `peek` | `session`, `surface`, `event`, optional `elapsed_ms` | Shared plan/row tap, hold, pin, close, and focus-reset visibility |
 | `observe_controls` | `session` | Coalesced shared control projection on session, operation, or query changes |
 | `observe_document` | `session`, `document` | Initial snapshot and subsequent coalesced snapshots |
@@ -50,7 +54,7 @@ Run `shutdown`, inspect its outcome, and then release the application. Releasing
 | `close_session` | `session` | Closed session UUID after cleanup succeeds |
 | `shutdown` | None | Successful shared cleanup acknowledgment, or a retryable failure |
 
-Document snapshots carry session/document/query UUIDs, output generation, draft revision, title/draft, execution state, result phase and availability, captured/received row counts, capture bytes, cutoff, termination, capture diagnostics, command acknowledgments, and retained error. Result pages and cell chunks carry their source document and generation. Reject stale generations before and after asynchronous storage reads. SQL null is encoded as JSON null; the text `NULL` remains text.
+Document snapshots carry session/document/query UUIDs, output generation, draft revision, title/draft, execution state, result phase and availability, captured/received row counts, capture bytes, cutoff, termination, capture diagnostics, command acknowledgments, retained error, and optional `execution_seconds` from the result duration (including restored history). Result pages and cell chunks carry their source document and generation. Reject stale generations before and after asynchronous storage reads. SQL null is encoded as JSON null; the text `NULL` remains text.
 
 `read_page` reports `page_too_large` if its JSON response exceeds the record budget. Request fewer rows or use `read_cell` for a large individual value. Cell offsets/counts use Unicode scalars rather than UTF-16 or grapheme clusters; concatenate chunks without altering the stored text. Null has no text and length zero.
 

@@ -34,6 +34,10 @@ struct WindowPolicy: NSViewRepresentable {
         private var previewPressed: TimeInterval?
         private var previewTask: Task<Void, Never>?
         private var previewEpoch: UInt64 = 0
+        private var primaryHeld = false
+        private var previewHeld = false
+        private var inspectHeld = false
+        private var submitHeld = false
 
         func attach(_ window: NSWindow?) {
             if let monitor { NSEvent.removeMonitor(monitor) }
@@ -42,7 +46,7 @@ struct WindowPolicy: NSViewRepresentable {
             NotificationCenter.default.removeObserver(self)
             guard window != nil else { return }
             NotificationCenter.default.addObserver(self, selector: #selector(applicationResigned), name: NSApplication.didResignActiveNotification, object: nil)
-            monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp]) { [weak self] event in
+            monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged]) { [weak self] event in
                 MainActor.assumeIsolated {
                     guard let self else { return EventResult(event: event) }
                     return EventResult(event: self.handle(event))
@@ -51,6 +55,45 @@ struct WindowPolicy: NSViewRepresentable {
         }
         private func handle(_ event: NSEvent) -> NSEvent? {
             guard let store else { return event }
+            let at = UInt64(max(0, event.timestamp * 1000))
+            if event.type == .keyUp && event.keyCode == 49 && inspectHeld {
+                inspectHeld = false
+                store.sendSharedKey(.inspect, pressed: false, at: at)
+                return nil
+            }
+            if event.type == .keyUp && [36, 76].contains(event.keyCode) && submitHeld {
+                submitHeld = false
+                store.sendSharedKey(.submit, pressed: false, at: at)
+                return nil
+            }
+            let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
+            let editor = window?.firstResponder as? NSTextView
+            let allowed = store.document != nil && window?.attachedSheet == nil && editor?.isFieldEditor != true && editor?.hasMarkedText() != true && !modifiers.contains(.option)
+            if event.window == window || (event.type == .flagsChanged && NSApp.keyWindow == window) {
+                syncModifiers(modifiers, allowed: allowed, at: at)
+            }
+            if event.type == .flagsChanged { return event }
+            if event.type == .keyDown && event.window == window && allowed {
+                if [36, 76].contains(event.keyCode) && primaryHeld {
+                    if !event.isARepeat { submitHeld = true; store.sendSharedKey(.submit, pressed: true, at: at) }
+                    return nil
+                }
+                if event.keyCode == 49 && primaryHeld && previewHeld {
+                    if !event.isARepeat { inspectHeld = true; store.sendSharedKey(.inspect, pressed: true, at: at) }
+                    return nil
+                }
+                if event.keyCode == 53 && modifiers.isEmpty {
+                    if store.controls?.primaryAction == "stop" {
+                        store.sendSharedKey(.cancel, pressed: true, at: at)
+                        store.sendSharedKey(.cancel, pressed: false, at: at)
+                        return nil
+                    }
+                    if store.plan.loading || store.plan.visible || store.sharedInput?.hint.kind == "estimating" {
+                        store.plan.close()
+                        return nil
+                    }
+                }
+            }
             if event.type == .keyDown, event.window == window, window?.attachedSheet == nil,
                event.keyCode == 13, event.modifierFlags.intersection([.command, .control, .option, .shift]) == .command,
                let document = store.document {
@@ -77,11 +120,21 @@ struct WindowPolicy: NSViewRepresentable {
             if !event.isARepeat {
                 previewPressed = event.timestamp
                 previewEpoch &+= 1
-                previewTask = Task { await store.previewCurrent() }
+                previewTask = Task { await store.prepareLegacyPreview(); await store.previewCurrent() }
             }
             return nil
         }
-        @objc private func applicationResigned() { previewEpoch &+= 1; previewTask?.cancel(); previewPressed = nil; store?.plan.reset() }
+        private func syncModifiers(_ modifiers: NSEvent.ModifierFlags, allowed: Bool, at: UInt64) {
+            let primary = allowed && (!modifiers.intersection([.command, .control]).isEmpty)
+            let preview = allowed && modifiers.contains(.shift)
+            if primary != primaryHeld { primaryHeld = primary; store?.sendSharedKey(.primary, pressed: primary, at: at) }
+            if preview != previewHeld { previewHeld = preview; store?.sendSharedKey(.preview, pressed: preview, at: at) }
+        }
+        @objc private func applicationResigned() {
+            previewEpoch &+= 1; previewTask?.cancel(); previewPressed = nil
+            primaryHeld = false; previewHeld = false; inspectHeld = false; submitHeld = false
+            store?.resetSharedKeyboard()
+        }
         func detach() {
             toolbar.detach()
             if let monitor { NSEvent.removeMonitor(monitor) }

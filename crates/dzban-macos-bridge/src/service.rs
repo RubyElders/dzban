@@ -22,6 +22,8 @@ use serde_json::{Value, json};
 use tokio::runtime::Runtime;
 use uuid::Uuid;
 
+mod native_controls;
+
 use crate::editor::{EditorIntent, selected_sql};
 use crate::transport::Stream;
 
@@ -67,6 +69,22 @@ pub enum Command {
         session: Uuid,
         document: Uuid,
         generation: u64,
+    },
+    Input {
+        session: Uuid,
+        document: Uuid,
+        revision: u64,
+        input: native_controls::Input,
+    },
+    AwaitIdle {
+        session: Uuid,
+    },
+    ProbeSession {
+        session: Uuid,
+        include_version: bool,
+    },
+    ProbeProfile {
+        profile: String,
     },
     Profiles {},
     Connections {},
@@ -181,6 +199,8 @@ struct Workspace {
     selection_revision: u64,
     peeks: [dzban_core::preview::PeekState; 2],
     preview_revision: u64,
+    input_document: Option<(DocumentId, u64)>,
+    input_state: AppState,
 }
 
 #[derive(Default)]
@@ -768,6 +788,10 @@ impl State {
                 } else {
                     selection.connection.clear();
                 }
+                for workspace in self.workspaces.lock().unwrap().values_mut() {
+                    workspace.input_document = None;
+                    workspace.input_state = AppState::default();
+                }
                 drop(selection);
                 Ok(self.controls())
             }
@@ -827,6 +851,18 @@ impl State {
                     }
                 }
             }
+            Command::Input {
+                session,
+                document,
+                revision,
+                input,
+            } => self.input(session, document, revision, input),
+            Command::AwaitIdle { session } => self.await_idle(session).await,
+            Command::ProbeSession {
+                session,
+                include_version,
+            } => self.probe_session(session, include_version).await,
+            Command::ProbeProfile { profile } => self.probe_profile(profile).await,
             Command::Profiles {} => {
                 let current = if self.injected_config {
                     self.config.lock().unwrap().clone()
@@ -893,6 +929,8 @@ impl State {
                         preview: PlanPreviewService::default(),
                         peeks: Default::default(),
                         preview_revision: 0,
+                        input_document: None,
+                        input_state: AppState::default(),
                         profile: profile_name,
                         selection_revision: 0,
                     },
@@ -1358,6 +1396,7 @@ fn document_snapshot(document: &QueryDocument) -> Value {
         "termination": termination,
         "capture_error": capture_error,
         "command_result": command,
+        "execution_seconds": snapshot.completion.as_ref().and_then(|completion|completion.as_ref().ok()).and_then(|completion|completion.result.as_ref().ok()).map(|result|result.duration.as_secs_f64()),
         "cutoff": capture.and_then(|capture| capture.cutoff),
         "error": error,
     })
@@ -1367,6 +1406,21 @@ fn document_snapshot(document: &QueryDocument) -> Value {
 mod tests {
     use super::*;
     use dzban_core::history::QueryHistoryEntry;
+
+    #[test]
+    fn profile_probe_closes_its_temporary_session() {
+        let app = crate::fixture::app().unwrap();
+        let runtime = app.runtime.as_ref().unwrap();
+        let result = runtime
+            .block_on(app.state.probe_profile("fixture".into()))
+            .unwrap();
+        assert_eq!(result["state"], "reachable");
+        assert!(runtime.block_on(app.state.context.session_ids()).is_empty());
+        assert!(app.state.workspaces.lock().unwrap().is_empty());
+        runtime
+            .block_on(async { app.state.context.start_shutdown().unwrap().wait().await })
+            .unwrap();
+    }
 
     #[test]
     fn native_history_refresh_observes_external_publication_without_retargeting_saved_entries() {

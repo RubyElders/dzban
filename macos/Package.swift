@@ -12,7 +12,7 @@ let package = Package(
     targets: [
         .systemLibrary(name: "CDzban"),
         .target(name: "DzbanBridge", dependencies: ["CDzban"]),
-        .target(name: "DzbanApplication", dependencies: ["DzbanBridge"]),
+        .target(name: "DzbanApplication", dependencies: ["DzbanBridge"], resources: [.process("Resources")]),
         .target(name: "DzbanBridgeScenarios", dependencies: ["DzbanBridge", "DzbanApplication"], path: "Checks/Scenarios"),
         .executableTarget(name: "DzbanBridgeCheck", dependencies: ["DzbanBridgeScenarios"], path: "Checks/Runner"),
         .testTarget(name: "DzbanBridgeTests", dependencies: ["DzbanBridgeScenarios", "DzbanApplication"]),

@@ -87,8 +87,10 @@ impl SavedOutput {
                 rows,
                 cutoff,
                 command,
+                duration_ms,
                 ..
             } => {
+                snapshot["execution_seconds"] = json!(*duration_ms as f64 / 1000.0);
                 snapshot["history_total_rows"] = json!(rows);
                 snapshot["cutoff"] = json!(cutoff);
                 snapshot["command_result"] = json!(command);
@@ -98,6 +100,7 @@ impl SavedOutput {
             QueryHistoryOutcome::Failure {
                 error, diagnostic, ..
             } => {
+                snapshot["execution_seconds"] = Value::Null;
                 snapshot["history_total_rows"] = json!(0);
                 snapshot["cutoff"] = Value::Null;
                 snapshot["command_result"] = Value::Null;

@@ -477,3 +477,87 @@ fn saved_history_replacement_keeps_background_execution_and_rejects_stale_pages(
     request(app, json!({"command":"shutdown"}));
     assert!(dzban_release(app));
 }
+
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn probes_and_shared_input_preserve_query_and_selection_boundaries() {
+    let app = dzban_macos_bridge::dzban_create_fixture();
+    request(app, json!({"command":"profiles"}));
+    let probe = request(app, json!({"command":"probe_profile","profile":"fixture"}));
+    assert_eq!(probe["state"], "reachable");
+    assert_eq!(probe["latency_micros"], 1);
+    assert_eq!(probe["version"], "fixture");
+    assert_eq!(
+        request(app, json!({"command":"connections"}))["connections"],
+        json!([])
+    );
+    let session = request(app, json!({"command":"connect","profile":"fixture"}))["session"].clone();
+    let document = request(app, json!({"command":"open_document","session":session}));
+    let input = |event: Value| {
+        request(
+            app,
+            json!({"command":"input","session":session,"document":document["document"],"revision":document["draft_revision"],"input":event}),
+        )
+    };
+    assert_eq!(
+        input(json!({"kind":"press","key":"primary","at_ms":1}))["hint"]["kind"],
+        "primary_guide"
+    );
+    assert_eq!(
+        input(json!({"kind":"press","key":"preview","at_ms":2}))["commands"],
+        json!(["begin_preview"])
+    );
+    assert_eq!(
+        input(json!({"kind":"press","key":"submit","at_ms":3}))["commands"],
+        json!(["run_query"])
+    );
+    assert_eq!(
+        input(json!({"kind":"press","key":"submit","at_ms":4}))["commands"],
+        json!([])
+    );
+    request(
+        app,
+        json!({"command":"submit","session":session,"document":document["document"],"sql":"wait"}),
+    );
+    let busy = request(
+        app,
+        json!({"command":"probe_session","session":session,"include_version":true}),
+    );
+    assert_eq!(busy["state"], "busy");
+    assert_eq!(
+        input(json!({"kind":"press","key":"cancel","at_ms":5}))["commands"],
+        json!(["cancel_query"])
+    );
+    request(
+        app,
+        json!({"command":"cancel","session":session,"document":document["document"]}),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let probe = request(
+            app,
+            json!({"command":"probe_session","session":session,"include_version":true}),
+        );
+        if probe["state"] == "connected" {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(input(json!({"kind":"pin"}))["pinned"], true);
+    assert_eq!(input(json!({"kind":"reset"}))["pinned"], true);
+    assert_eq!(input(json!({"kind":"context_changed"}))["pinned"], false);
+    request(
+        app,
+        json!({"command":"set_draft","session":session,"document":document["document"],"draft":"SELECT 2"}),
+    );
+    assert_eq!(
+        input(json!({"kind":"reset"}))["failure"]["kind"],
+        "selection_superseded"
+    );
+    assert_eq!(
+        request(app, json!({"command":"shutdown"}))["shutdown"],
+        true
+    );
+    assert!(dzban_release(app));
+}

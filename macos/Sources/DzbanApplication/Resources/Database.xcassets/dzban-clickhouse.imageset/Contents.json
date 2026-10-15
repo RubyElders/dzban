@@ -1,0 +1,14 @@
+{
+  "images": [
+    {
+      "filename": "dzban-clickhouse.svg",
+      "idiom": "universal"
+    }
+  ],
+  "info": {
+    "version": 1
+  },
+  "properties": {
+    "preserves-vector-representation": true
+  }
+}

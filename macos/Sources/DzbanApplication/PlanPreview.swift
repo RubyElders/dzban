@@ -9,6 +9,8 @@ public final class PlanPreviewModel: ObservableObject {
     @Published public private(set) var loading = false
     @Published public private(set) var plan: JSONValue?
     @Published public private(set) var failure: String?
+    var userPin: (() -> Bool)?
+    var userClose: (() -> Void)?
     private let bridge: Bridge
     private var epoch: UInt64 = 0
     private var session: UUID?
@@ -17,20 +19,22 @@ public final class PlanPreviewModel: ObservableObject {
     private var visibilityWork: Task<Void, Never>?
 
     public init(bridge: Bridge) { self.bridge = bridge }
-    public func show(session: UUID, document: DocumentSnapshot, text: String, selection: Range<Int>, pinned: Bool = false) async {
+    public func show(session: UUID, document: DocumentSnapshot, text: String, selection: Range<Int>, pinned: Bool = false, display: Bool = true) async {
         dismiss()
         self.session = session
         let epoch = epoch
         await cleanup?.value
         guard self.epoch == epoch else { return }
         loading = true
-        visible = true
+        visible = display
         task = Task { [weak self, bridge] in
             guard let self else { return }
             do {
-                self.visibility(pinned ? .open : .show)
-                await self.visibilityWork?.value
-                guard !Task.isCancelled, self.epoch == epoch, self.visible else { return }
+                if display {
+                    self.visibility(pinned ? .open : .show)
+                    await self.visibilityWork?.value
+                }
+                guard !Task.isCancelled, self.epoch == epoch else { return }
                 let response = try await bridge.request(.preview(session: session, document: document.document, sql: text, revision: document.draftRevision, start: selection.lowerBound, end: selection.upperBound, requestRevision: epoch), as: Preview.self)
                 guard !Task.isCancelled, self.epoch == epoch, response.session == session,
                       response.document == document.document, response.draftRevision == document.draftRevision else { return }
@@ -44,8 +48,11 @@ public final class PlanPreviewModel: ObservableObject {
         }
         await task?.value
     }
+    public func present(visible: Bool, pinned: Bool = false) { self.visible = visible; self.pinned = pinned }
+    public func waitForCleanup() async { await cleanup?.value }
+    public func close() { dismiss(); userClose?() }
     public func release(milliseconds: UInt64) { visibility(.release, milliseconds: milliseconds) }
-    public func pin() { visibility(.pin) }
+    public func pin() { if userPin?() != true { visibility(.pin) } }
     public func reset() { visibility(.reset) }
     private func visibility(_ event: PeekEvent, milliseconds: UInt64? = nil) {
         guard let session else { return }
@@ -98,7 +105,7 @@ struct PlanPreviewPanel: View {
                 Text("Query Plan").font(.headline)
                 Spacer()
                 Button(model.pinned ? "Pinned" : "Pin") { model.pin() }.disabled(model.pinned).accessibilityIdentifier("plan.pin")
-                Button("Close") { model.dismiss() }.keyboardShortcut(.cancelAction).accessibilityIdentifier("plan.close")
+                Button("Close") { model.close() }.keyboardShortcut(.cancelAction).accessibilityIdentifier("plan.close")
             }
             if model.loading { ProgressView("Loading plan").accessibilityIdentifier("plan.loading") }
             if let error = model.failure {
@@ -124,7 +131,7 @@ struct PlanPreviewButton: View {
             .help("Command-Shift-P: tap to pin the plan, hold to peek")
             .disabled(!store.canPreview)
             .accessibilityIdentifier("plan.open")
-            .popover(isPresented: Binding(get: { model.visible }, set: { if !$0 { model.dismiss() } }), arrowEdge: .bottom) {
+            .popover(isPresented: Binding(get: { model.visible }, set: { if !$0 && model.visible { model.close() } }), arrowEdge: .bottom) {
                 PlanPreviewPanel(model: model)
             }
     }

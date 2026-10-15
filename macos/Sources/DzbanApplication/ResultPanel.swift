@@ -62,6 +62,8 @@ struct ResultPanel: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Text(ResultStatus.describe(document)).accessibilityIdentifier("results.status")
+                Text(document.execution.capitalized).foregroundStyle(.secondary).accessibilityIdentifier("query.execution")
+                if document.generation > 0 { Text("Run \(document.generation)").foregroundStyle(.secondary).accessibilityIdentifier("query.generation") }
                 if model.isLoading || cell.copying { ProgressView().controlSize(.small).accessibilityLabel(cell.copying ? "Copying cell" : "Loading result pages") }
                 Spacer()
                 if document.historyPlanAvailable == true {
