@@ -4,6 +4,7 @@ mod fixture;
 mod handles;
 mod service;
 mod transport;
+mod viewport;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Duration;

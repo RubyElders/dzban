@@ -201,3 +201,63 @@ fn editor_actions_select_unicode_sql_and_reject_invalid_or_stale_targets() {
     );
     assert!(dzban_release(app));
 }
+
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn viewport_previews_bound_huge_cells_and_close_drains_admitted_reads() {
+    let app = dzban_macos_bridge::dzban_create_fixture();
+    let connection = request(app, json!({"command":"connect", "profile":"fixture"}));
+    let session = &connection["session"];
+    let document =
+        request(app, json!({"command":"open_document", "session":session}))["document"].clone();
+    request(
+        app,
+        json!({"command":"submit", "session":session, "document":document, "sql":"huge"}),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        assert!(std::time::Instant::now() < deadline);
+        let snapshot = request(
+            app,
+            json!({"command":"observe_document", "session":session, "document":document}),
+        );
+        if snapshot["execution"] == "finished" {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let viewport = json!({"command":"read_viewport", "session":session, "document":document, "generation":1, "start":0, "count":3, "column_start":1, "column_count":1});
+    let page = request(app, viewport.clone());
+    assert!(serde_json::to_vec(&page).unwrap().len() < 4096);
+    assert_eq!(page["rows"][0][0]["length"], 2_500_000);
+    assert_eq!(
+        page["rows"][0][0]["text"].as_str().unwrap().chars().count(),
+        256
+    );
+    assert_eq!(page["rows"][0][0]["truncated"], true);
+    let tail = request(
+        app,
+        json!({"command":"read_cell", "session":session,"document":document,"generation":1,"row":0,"column":1,"offset":2_499_998,"count":8}),
+    );
+    assert_eq!(tail["text"], "😀😀");
+    let bytes = serde_json::to_vec(&viewport).unwrap();
+    let operations: Vec<_> = (0..8)
+        .map(|_| unsafe { dzban_send(app, bytes.as_ptr(), bytes.len()) })
+        .collect();
+    let closed = request(
+        app,
+        json!({"command":"close_document", "session":session, "document":document}),
+    );
+    assert_eq!(closed["workspace_closed"], true);
+    for operation in operations {
+        let buffer = dzban_wait(operation, 0, 10_000);
+        assert_eq!(buffer.status, 0);
+        assert!(dzban_buffer_release(buffer.token));
+        assert!(dzban_release(operation));
+    }
+    assert_eq!(
+        request(app, json!({"command":"shutdown"}))["shutdown"],
+        true
+    );
+    assert!(dzban_release(app));
+}

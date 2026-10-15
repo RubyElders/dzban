@@ -13,6 +13,8 @@ struct Registry {
     next: u64,
     handles: HashMap<u64, Handle>,
     buffers: HashMap<u64, Box<[u8]>>,
+    buffer_bytes: usize,
+    peak_buffer_bytes: usize,
 }
 
 fn registry() -> &'static Mutex<Registry> {
@@ -80,10 +82,24 @@ pub fn buffer(bytes: Vec<u8>) -> Option<(u64, *const u8, usize)> {
     let bytes = bytes.into_boxed_slice();
     let pointer = bytes.as_ptr();
     let length = bytes.len();
+    registry.buffer_bytes += length;
+    registry.peak_buffer_bytes = registry.peak_buffer_bytes.max(registry.buffer_bytes);
     registry.buffers.insert(id, bytes);
     Some((id, pointer, length))
 }
 
 pub fn release_buffer(id: u64) -> bool {
-    registry().lock().unwrap().buffers.remove(&id).is_some()
+    let mut registry = registry().lock().unwrap();
+    if let Some(buffer) = registry.buffers.remove(&id) {
+        registry.buffer_bytes -= buffer.len();
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(feature = "test-fixtures")]
+pub fn byte_metrics() -> (usize, usize) {
+    let registry = registry().lock().unwrap();
+    (registry.buffer_bytes, registry.peak_buffer_bytes)
 }

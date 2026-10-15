@@ -120,15 +120,24 @@ public struct RootView: View {
             if let document = store.document {
                 VStack(alignment: .leading, spacing: 14) {
                     Text(document.title).font(.title2)
-                    SQLEditor(buffer: store.editor(for: document), editable: store.navigationAvailable, changed: { [weak store] in
-                        store?.editorChanged(session: workspace.id, document: document.document)
-                    }, action: { [weak store] intent in
-                        guard let store else { return false }
-                        if intent == .cancel && store.controls?.primaryAction != "stop" { return false }
-                        store.sendEditorIntent(intent, session: workspace.id, document: document.document)
-                        return true
-                    })
-                    .id(document.document)
+                    VSplitView {
+                        SQLEditor(buffer: store.editor(for: document), editable: store.navigationAvailable, changed: { [weak store] in
+                            store?.editorChanged(session: workspace.id, document: document.document)
+                        }, action: { [weak store] intent in
+                            guard let store else { return false }
+                            if intent == .cancel && store.controls?.primaryAction != "stop" { return false }
+                            store.sendEditorIntent(intent, session: workspace.id, document: document.document)
+                            return true
+                        })
+                        .id(document.document)
+                        .frame(minHeight: 120, idealHeight: 220)
+                        ResultPanel(model: store.results, session: workspace.id, document: document, cancel: { [weak store] in
+                            guard let store, store.controls?.primaryAction == "stop" else { return false }
+                            store.sendEditorIntent(.cancel)
+                            return true
+                        })
+                        .frame(minHeight: 160)
+                    }
                     if let error = document.error, error != .null {
                         Text(QueryDiagnostic.describe(error))
                             .foregroundStyle(.red)

@@ -6,6 +6,9 @@ final class LifecycleTests: XCTestCase {
     func testNativeEditorSelectsSQLPreservesDraftsAndScopesCancellation() async throws {
         try await LifecycleScenarios.nativeEditorSelectsSQLPreservesDraftsAndScopesCancellation()
     }
+    func testNativeResultsStreamPageInspectAndRetireAcrossOutputs() async throws {
+        try await LifecycleScenarios.nativeResultsStreamPageInspectAndRetireAcrossOutputs()
+    }
     func testConnectStreamCancelRestartAndShutdownThroughSwift() async throws {
         try await LifecycleScenarios.connectStreamCancelRestartAndShutdownThroughSwift()
     }

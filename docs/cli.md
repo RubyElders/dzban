@@ -163,8 +163,7 @@ does not automatically launch a pager.
 
 History is shared with GTK under the existing user data directory and profile identity.
 The visible list keeps the newest 100 entries. Stored result snapshots retain at most
-200 rows and 1,000,000 bytes of column names and displayed values. Completed live
-results are still held in memory; disk-spooled live results are not implemented.
+200 rows and 1,000,000 bytes of column names and displayed values. Live results use the bounded memory and disk-spooled store described above.
 Immutable records avoid replacing another frontend's writes. Physical record cleanup
 is not implemented, so the visible retention limit is not a disk usage limit.
 Damaged, unreadable, future-version, and foreign-profile records are skipped with a

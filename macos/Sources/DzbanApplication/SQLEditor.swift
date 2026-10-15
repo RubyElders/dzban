@@ -102,7 +102,7 @@ public struct SQLEditor: NSViewRepresentable {
     public func updateNSView(_ scroll: NSScrollView, context: Context) {
         context.coordinator.changed = changed
         buffer.textView.intent = action
-        buffer.textView.isEditable = editable
+        if buffer.textView.isEditable != editable { buffer.textView.isEditable = editable }
     }
 
     @MainActor

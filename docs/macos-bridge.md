@@ -38,14 +38,20 @@ Run `shutdown`, inspect its outcome, and then release the application. Releasing
 | `observe_document` | `session`, `document` | Initial snapshot and subsequent coalesced snapshots |
 | `submit` | `session`, `document`, `sql` | Query UUID and output generation after admission |
 | `cancel` | `session`, `document` | Cancellation acknowledgment; terminal completion arrives on the document stream |
+| `result_schema` | `session`, `document`, `generation` | Ordered column names and types without result rows |
+| `read_viewport` | `session`, `document`, `generation`, `start`, `count`, `column_start`, `column_count` | At most 200 rows and 16 columns of bounded cell previews |
 | `read_page` | `session`, `document`, `generation`, `start`, `count` | Schema and original ordered values; count at most 200 |
 | `read_cell` | `session`, `document`, `generation`, `row`, `column`, `offset`, `count` | Full-value chunk, total scalar length, and null identity; count at most 65536 Unicode scalars |
 | `close_session` | `session` | Closed session UUID after cleanup succeeds |
 | `shutdown` | None | Successful shared cleanup acknowledgment, or a retryable failure |
 
-Document snapshots carry session/document/query UUIDs, output generation, draft revision, title/draft, execution state, result phase, row count, cutoff, and retained error. Result pages and cell chunks carry their source document and generation. Reject stale generations before and after asynchronous storage reads. SQL null is encoded as JSON null; the text `NULL` remains text.
+Document snapshots carry session/document/query UUIDs, output generation, draft revision, title/draft, execution state, result phase and availability, captured/received row counts, capture bytes, cutoff, termination, capture diagnostics, command acknowledgments, and retained error. Result pages and cell chunks carry their source document and generation. Reject stale generations before and after asynchronous storage reads. SQL null is encoded as JSON null; the text `NULL` remains text.
 
 `read_page` reports `page_too_large` if its JSON response exceeds the record budget. Request fewer rows or use `read_cell` for a large individual value. Cell offsets/counts use Unicode scalars rather than UTF-16 or grapheme clusters; concatenate chunks without altering the stored text. Null has no text and length zero.
+
+Viewport cells carry nullable `text`, original scalar `length`, and `truncated`. Each preview contains at most 256 Unicode scalars. Display escaping does not alter original values. The native viewport requests 64-row/eight-column tiles, retains at most eight tiles within an 8 MiB accounted budget including schema, and admits at most two schema/page reads across output changes. Its budget counts UTF-8 payloads and estimated collection overhead; it is not a heap or RSS limit. Explicit full-cell copy has a separate 32 MiB UTF-8 limit. The inspector fetches 2048-scalar chunks and supports native text selection.
+
+Result reads acquire one of 16 bridge read permits. Successful document/session close and shutdown drain admitted reads before retiring their result ownership. A retired native viewport discards late responses by both source identity and a local epoch; canceling its Swift task alone does not cancel Rust storage reads.
 
 Navigation revisions reject stale selection commands; late connection completions report whether selection accepted them so a detached native view can explicitly close the resulting session. Catalog actions and document rename commands remain to be added. Query submission loads a fresh shared history store off the caller thread. Fixtures use a private disposable history directory instead of user configuration/data. The fixture lifecycle exercises preview, submission, early pages, history, cancellation/restart, and cleanup; native widget behavior remains a separate integration layer.
 

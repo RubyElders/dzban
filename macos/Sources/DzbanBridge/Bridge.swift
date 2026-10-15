@@ -37,9 +37,19 @@ public struct DocumentSnapshot: Decodable, Sendable {
     public let draft: String
     public let execution: String
     public let resultPhase: String?
+    public let resultAvailable: Bool
     public let rows: Int
     public let error: JSONValue?
     public let cutoff: JSONValue?
+    public let receivedRows: Int?
+    public let captureBytes: Int?
+    public let termination: String?
+    public let captureError: JSONValue?
+    public let commandResult: CommandResult?
+}
+
+public struct CommandResult: Decodable, Sendable {
+    public let affectedRows: UInt64?
 }
 
 public struct Connection: Decodable, Sendable {
@@ -94,9 +104,44 @@ public struct Submission: Decodable, Sendable {
     public let generation: UInt64
 }
 
-public struct Column: Decodable, Sendable {
+public struct Column: Decodable, Sendable, Equatable {
     public let name: String
     public let typeName: String
+}
+
+#if DZBAN_TEST_FIXTURES
+public struct BridgeByteMetrics: Decodable, Sendable {
+    public let recordBytes: Int
+    public let peakRecordBytes: Int
+    public let bufferBytes: Int
+    public let peakBufferBytes: Int
+}
+#endif
+
+public struct ResultSchema: Decodable, Sendable {
+    public let document: UUID
+    public let generation: UInt64
+    public let columns: [Column]
+}
+
+public struct ViewportCell: Decodable, Sendable, Equatable {
+    public let text: String?
+    public let length: Int
+    public let truncated: Bool
+
+    public init(text: String?, length: Int, truncated: Bool) {
+        self.text = text
+        self.length = length
+        self.truncated = truncated
+    }
+}
+
+public struct ViewportPage: Decodable, Sendable {
+    public let document: UUID
+    public let generation: UInt64
+    public let start: Int
+    public let columnStart: Int
+    public let rows: [[ViewportCell]]
 }
 
 public struct ResultPage: Decodable, Sendable {
@@ -149,6 +194,8 @@ public struct BridgeCommand: Encodable, Sendable {
     var revision: UInt64?
     var end: Int?
     var intent: EditorIntent?
+    var columnStart: Int?
+    var columnCount: Int?
 
     public static func connect(profile: String, revision: UInt64? = nil) -> Self { Self(command: "connect", profile: profile, revision: revision) }
     public static func selectSession(_ session: UUID?, revision: UInt64? = nil) -> Self { Self(command: "select_session", session: session, revision: revision) }
@@ -167,6 +214,12 @@ public struct BridgeCommand: Encodable, Sendable {
     public static func cancel(session: UUID, document: UUID) -> Self {
         Self(command: "cancel", session: session, document: document)
     }
+    public static func resultSchema(session: UUID, document: UUID, generation: UInt64) -> Self {
+        Self(command: "result_schema", session: session, document: document, generation: generation)
+    }
+    public static func readViewport(session: UUID, document: UUID, generation: UInt64, start: Int, count: Int, columnStart: Int, columnCount: Int) -> Self {
+        Self(command: "read_viewport", session: session, document: document, generation: generation, start: start, count: count, columnStart: columnStart, columnCount: columnCount)
+    }
     public static func readPage(session: UUID, document: UUID, generation: UInt64, start: Int, count: Int) -> Self {
         Self(command: "read_page", session: session, document: document, generation: generation, start: start, count: count)
     }
@@ -182,6 +235,9 @@ public struct BridgeCommand: Encodable, Sendable {
     public static func editorAction(session: UUID, document: UUID, draft: String, start: Int, end: Int, intent: EditorIntent) -> Self {
         Self(command: "editor_action", session: session, document: document, draft: draft, start: start, end: end, intent: intent)
     }
+    #if DZBAN_TEST_FIXTURES
+    public static let testMetrics = Self(command: "test_metrics")
+    #endif
     public static let profiles = Self(command: "profiles")
     public static let controls = Self(command: "controls")
     public static let connections = Self(command: "connections")
@@ -257,7 +313,9 @@ public final class Bridge: Sendable {
     }
 
     private func send(_ command: BridgeCommand) throws -> UInt64 {
-        let data = try JSONEncoder().encode(command)
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let data = try encoder.encode(command)
         let operation = data.withUnsafeBytes { bytes in
             dzban_send(handle, bytes.bindMemory(to: UInt8.self).baseAddress, data.count)
         }

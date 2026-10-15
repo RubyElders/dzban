@@ -164,9 +164,9 @@ impl ClickHouseSession {
                     .text()
                     .await
                     .map(|body| (status, exception_code, body))
-                    .map_err(|error| ExecutionError::Database(clickhouse_transport_error(&error)))
+                    .map_err(|error| ExecutionError::Database(clickhouse_transport_error(error)))
             }
-            Err(error) => Err(ExecutionError::Database(clickhouse_transport_error(&error))),
+            Err(error) => Err(ExecutionError::Database(clickhouse_transport_error(error))),
         };
         let (status, exception_code, body) = response_body?;
         if !status.is_success() {
@@ -448,11 +448,12 @@ fn clickhouse_estimate(result: &ResultSet) -> QueryEstimate {
     }
 }
 
-fn clickhouse_transport_error(error: &reqwest::Error) -> dzban_core::error::DatabaseError {
+fn clickhouse_transport_error(error: reqwest::Error) -> dzban_core::error::DatabaseError {
+    let error = error.without_url();
     dzban_core::error::DatabaseError {
         backend: DatabaseBackend::Clickhouse,
         kind: dzban_core::error::ErrorKind::Transport,
-        message: format_error_chain(error),
+        message: format_error_chain(&error),
         code: None,
         detail: None,
         hint: None,

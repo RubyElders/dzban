@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -5,6 +6,25 @@ use serde_json::{Value, json};
 use tokio::sync::watch;
 
 pub const MAX_RECORD_BYTES: usize = 8 * 1024 * 1024;
+
+static RECORD_BYTES: AtomicUsize = AtomicUsize::new(0);
+static PEAK_RECORD_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+fn replace_record(state: &mut State, record: Option<Vec<u8>>) {
+    RECORD_BYTES.fetch_sub(state.record.as_ref().map_or(0, Vec::len), Ordering::Relaxed);
+    let bytes = record.as_ref().map_or(0, Vec::len);
+    let total = RECORD_BYTES.fetch_add(bytes, Ordering::Relaxed) + bytes;
+    PEAK_RECORD_BYTES.fetch_max(total, Ordering::Relaxed);
+    state.record = record;
+}
+
+#[cfg(feature = "test-fixtures")]
+pub fn byte_metrics() -> (usize, usize) {
+    (
+        RECORD_BYTES.load(Ordering::Relaxed),
+        PEAK_RECORD_BYTES.load(Ordering::Relaxed),
+    )
+}
 
 #[derive(Default)]
 struct State {
@@ -57,7 +77,7 @@ impl Stream {
             }))
             .expect("JSON values serialize");
         }
-        state.record = Some(record);
+        replace_record(&mut state, Some(record));
         self.ready.notify_all();
     }
 
@@ -91,7 +111,7 @@ impl Stream {
     pub fn close(&self) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         state.closed = true;
-        state.record = None;
+        replace_record(&mut state, None);
         self.closed.send_replace(true);
         self.ready.notify_all();
     }
@@ -99,6 +119,16 @@ impl Stream {
     pub async fn closed(&self) {
         let mut receiver = self.closed.subscribe();
         receiver.wait_for(|closed| *closed).await.ok();
+    }
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        let state = self
+            .state
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner());
+        replace_record(state, None);
     }
 }
 

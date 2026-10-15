@@ -100,7 +100,7 @@ async fn execute_limited(
     let mut response = request
         .send()
         .await
-        .map_err(|error| ExecutionError::Database(clickhouse_transport_error(&error)))?;
+        .map_err(|error| ExecutionError::Database(clickhouse_transport_error(error)))?;
     let status = response.status();
     let exception_code = response
         .headers()
@@ -114,7 +114,7 @@ async fn execute_limited(
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|error| ExecutionError::Database(clickhouse_transport_error(&error)))?
+        .map_err(|error| ExecutionError::Database(clickhouse_transport_error(error)))?
     {
         for part in chunk.split_inclusive(|byte| *byte == b'\n') {
             let newline = part.last() == Some(&b'\n');
