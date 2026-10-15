@@ -1,0 +1,54 @@
+# Native macOS bridge contract
+
+`dzban-macos-bridge` exposes a C ABI over `dzban-core` and `dzban-db`. Swift consumers use `macos/Sources/DzbanBridge`. ABI version 1 and JSON schema version 1 are under development; the native application integration is not complete.
+
+## Ownership and delivery
+
+Create an application with `dzban_create`. A nonzero opaque handle owns its Tokio runtime and shared application context. `dzban_send` copies a UTF-8 JSON command of at most 1 MiB and returns a response-stream handle. A zero handle means the bridge could not admit the request. Command validation errors arrive as response records. Never pass an invalid memory address; the readable input range must remain valid until `dzban_send` returns.
+
+Call `dzban_wait` from a dedicated worker, never from the UI thread or a Swift cooperative executor. Pass the last observed revision, initially zero. Normal commands publish one terminal response. `observe_document` instead publishes the current document snapshot followed by coalesced updates on that same stream. Consumers may miss intermediate states and must render the latest retained snapshot, including terminal completion. Only one thread may wait on a stream at a time.
+
+Each record has `schema`, `revision`, and `payload`. A command failure is `payload.failure` with `kind`, `message`, and optional structured `diagnostic`. A document's `error` field is a retained query outcome and is independent of command failure. A successful submission admits work; its response is not evidence that SQL succeeded.
+
+There is one retained record per stream, capped at 8 MiB. Oversized state returns a `record_too_large` failure. Handles are capped at 4096 per process; outstanding foreign buffers are capped at 64. The consumer must release handles and buffers promptly. These limits bound bridge retention and do not bound total process memory, native view caches, SQL transport, or Rust result storage.
+
+Copy a returned `BridgeBuffer` before releasing its token with `dzban_buffer_release`. Never free its pointer with a Swift or C allocator. Buffers survive stream release and have a separate lifetime. Repeated release returns false. Handles are monotonically allocated and never reused.
+
+Release each operation or observation stream with `dzban_release`. Release wakes a blocked waiter and ends subscription delivery. A waiter racing release may already own a buffer; discard it if the consumer has detached. Releasing observation or canceling a Swift task does not cancel database work. Explicit `cancel` requests core cancellation scoped to the document's query identity.
+
+Run `shutdown`, inspect its outcome, and then release the application. Releasing a live application is rejected. Failed or busy cleanup keeps the runtime available for cancellation and retry. Admitted response tasks retain the runtime through their final publication; observer setup registers for application teardown before releasing its runtime lease. Process-aborting failures are not recoverable through the ABI. Unwinding command-worker panics become `worker_failed`; exported entry points contain unwinding panics and return their documented failure status.
+
+## Command inventory
+
+| Command | Inputs | Response |
+| --- | --- | --- |
+| `profiles` | None | Profile names/backend only; loads shared configuration off the caller thread |
+| `connect` | `profile` | Connection request and session UUIDs; requires profiles to be loaded |
+| `open_document` | `session` | Initial document snapshot |
+| `set_draft` | `session`, `document`, `draft` | Retained document snapshot |
+| `preview` | `session`, `document`, `sql`, `revision` | Accepted plan and target identity; rejects stale draft revisions |
+| `cancel_preview` | `session` | Preview invalidation acknowledgment; transport cleanup may still be active |
+| `history` | `session` | A fresh read of shared history entries for the selected profile name |
+| `observe_document` | `session`, `document` | Initial snapshot and subsequent coalesced snapshots |
+| `submit` | `session`, `document`, `sql` | Query UUID and output generation after admission |
+| `cancel` | `session`, `document` | Cancellation acknowledgment; terminal completion arrives on the document stream |
+| `read_page` | `session`, `document`, `generation`, `start`, `count` | Schema and original ordered values; count at most 200 |
+| `read_cell` | `session`, `document`, `generation`, `row`, `column`, `offset`, `count` | Full-value chunk, total scalar length, and null identity; count at most 65536 Unicode scalars |
+| `close_session` | `session` | Closed session UUID after cleanup succeeds |
+| `shutdown` | None | Successful shared cleanup acknowledgment, or a retryable failure |
+
+Document snapshots carry session/document/query UUIDs, output generation, draft revision, title/draft, execution state, result phase, row count, cutoff, and retained error. Result pages and cell chunks carry their source document and generation. Reject stale generations before and after asynchronous storage reads. SQL null is encoded as JSON null; the text `NULL` remains text.
+
+`read_page` reports `page_too_large` if its JSON response exceeds the record budget. Request fewer rows or use `read_cell` for a large individual value. Cell offsets/counts use Unicode scalars rather than UTF-16 or grapheme clusters; concatenate chunks without altering the stored text. Null has no text and length zero.
+
+Interaction projections, catalog actions, and document close/rename/selection commands remain to be added. Query submission loads a fresh shared history store off the caller thread. Fixtures use a private disposable history directory instead of user configuration/data. The fixture lifecycle exercises preview, submission, early pages, history, cancellation/restart, and cleanup; native widget behavior remains a separate integration layer.
+
+## Local verification
+
+```sh
+bash scripts/test-macos-bridge.sh
+```
+
+The runner isolates configuration/data, builds the fixture-enabled static archive, runs Rust transport/C-ABI tests, and executes shared lifecycle scenarios through a standalone Swift consumer. If XCTest is available it also runs those scenarios through XCTest; otherwise it explicitly reports that coverage as skipped. The standalone consumer is not a substitute for native window or XCUITest validation.
+
+The `test-fixtures` Cargo feature and `DZBAN_TEST_FIXTURES` Swift/C compilation definitions enable the fixture constructor and check scenarios. Production builds must omit them. `bash scripts/build-macos-bridge.sh` builds the default archive without fixtures. The development linker arguments correspond to Rust's `--print native-static-libs` output: CoreFoundation, SystemConfiguration, Security, CoreFoundation, iconv, System, c, and m. Recheck that output when dependencies or build targets change.

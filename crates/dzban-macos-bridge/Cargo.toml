@@ -1,0 +1,20 @@
+[package]
+name = "dzban-macos-bridge"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[features]
+test-fixtures = []
+
+[dependencies]
+dzban-core = { path = "../dzban-core" }
+dzban-db = { path = "../dzban-db" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid = { workspace = true, features = ["serde"] }
+async-trait.workspace = true

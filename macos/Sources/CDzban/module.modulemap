@@ -1,0 +1,4 @@
+module CDzban {
+    header "../../../crates/dzban-macos-bridge/include/dzban_macos.h"
+    export *
+}
