@@ -3,6 +3,7 @@ import SwiftUI
 
 public struct RootView: View {
     @ObservedObject var store: ApplicationStore
+    @ObservedObject private var plan: PlanPreviewModel
     private enum WorkspacePanel: Identifiable {
         case catalog(UUID)
         var id: String { switch self { case .catalog(let id): return "catalog-\(id)" } }
@@ -13,42 +14,18 @@ public struct RootView: View {
     @State private var actionSearch = ""
     @State private var selectedAction = 0
 
-    public init(store: ApplicationStore) { self.store = store }
+    public init(store: ApplicationStore) { self.store = store; plan = store.plan }
 
     public var body: some View {
         VStack(spacing: 0) {
+            connectionTabs
+            Divider()
             NavigationSplitView(columnVisibility: $columns) {
                 VStack(spacing: 0) {
-                    List {
-                        Button { Task { await store.chooseConnections() } } label: {
-                            Label("Connections", systemImage: "externaldrive.connected.to.line.below")
-                        }
-                        .accessibilityIdentifier("connections.show")
-                        Section("Workspaces") {
-                            ForEach(store.workspaces) { workspace in
-                                Button { Task { await store.selectSession(workspace.id) } } label: {
-                                    HStack {
-                                        Label(workspace.profile, systemImage: "externaldrive")
-                                        Spacer()
-                                        if store.selectedSession == workspace.id { Image(systemName: "checkmark") }
-                                    }
-                                }
-                                .accessibilityIdentifier("workspace.\(workspace.id)")
-                                .contextMenu {
-                                    Button("Disconnect") { Task { await store.closeSession(workspace.id) } }
-                                }
-                            }
-                        }
-                    }
-                    .listStyle(.sidebar)
-                    .frame(maxHeight: store.selectedSession == nil ? .infinity : 145)
-                    .disabled(!store.navigationAvailable)
                     if let session = store.selectedSession {
-                        Divider()
-                        HistoryBrowser(store: store, session: session) { columns = .detailOnly }
+                        HistoryBrowser(store: store, session: session) { store.historyVisible = false }
                             .id(session)
                     } else {
-                        Divider()
                         ContentUnavailableView("Query History", systemImage: "clock", description: Text("Connect to a database to browse saved queries."))
                     }
                 }
@@ -61,6 +38,8 @@ public struct RootView: View {
                     chooser
                 }
             }
+            Divider()
+            statusbar
         }
         .frame(minWidth: 900, minHeight: 500)
         .background(WindowPolicy(store: store, toolbar: toolbar).frame(width: 0, height: 0))
@@ -76,6 +55,9 @@ public struct RootView: View {
                 }
             }
         }
+        .sheet(isPresented: $store.shortcutsVisible) { NativeShortcutReference() }
+        .onChange(of: store.historyVisible) { _, visible in columns = visible ? .all : .detailOnly }
+        .onChange(of: columns) { _, value in store.historyVisible = value != .detailOnly }
         .sheet(item: $panel) { panel in
             switch panel {
             case .catalog(let session): CatalogBrowser(bridge: store.bridge, session: session)
@@ -87,20 +69,31 @@ public struct RootView: View {
         .task { await store.loadProfiles() }
     }
 
+    private var actionPlaceholder: String {
+        if plan.loading { return "Estimating query..." }
+        if plan.visible, let value = plan.plan { return PlanFormatting.summary(value) }
+        if store.isShuttingDown { return "Closing connections..." }
+        if store.controls?.primaryAction == "stopping" { return "Canceling query..." }
+        if store.controls?.primaryAction == "stop" { return "Query running..." }
+        return store.selectedSession == nil ? "Search actions..." : "Cmd-Return: run | Cmd-Shift-P: plan"
+    }
+
     private var toolbar: NativeToolbarConfiguration {
         NativeToolbarConfiguration(
-            history: AnyView(Button { columns = columns == .detailOnly ? .all : .detailOnly } label: {
+            history: AnyView(Button { store.historyVisible.toggle() } label: {
                 Label("Query History", systemImage: "sidebar.left")
             }.labelStyle(.iconOnly).help("Toggle query history").accessibilityIdentifier("history.open")),
             plan: AnyView(PlanPreviewButton(store: store)),
             newQuery: AnyView(Button { Task { await store.newDocument() } } label: {
                 Label("New Query", systemImage: "plus")
             }.labelStyle(.iconOnly).disabled(store.selectedSession == nil || !store.navigationAvailable).accessibilityIdentifier("query.new")),
-            primary: AnyView(Button(store.controls?.primaryAction == "stop" ? "Stop" : store.controls?.primaryAction == "stopping" ? "Stopping" : "Run") {
-                store.sendEditorIntent(.primary)
-            }.disabled(!store.navigationAvailable || store.controls?.primaryAction == "unavailable" || store.controls?.primaryAction == "stopping" || store.selectedSession == nil).accessibilityIdentifier("query.primary")),
-            placeholder: store.isShuttingDown ? "Closing connections..." : store.controls?.primaryAction == "stopping" ? "Canceling query..." : store.controls?.primaryAction == "stop" ? "Query running..." : "Search actions...",
-            busy: store.isShuttingDown || store.controls?.primaryAction == "stop" || store.controls?.primaryAction == "stopping",
+            primary: AnyView(Button { store.sendEditorIntent(.primary) } label: {
+                Label(store.controls?.primaryAction == "stop" ? "Stop" : store.controls?.primaryAction == "stopping" ? "Stopping" : "Run", systemImage: store.controls?.primaryAction == "stop" ? "stop.fill" : store.controls?.primaryAction == "stopping" ? "hourglass" : "play.fill")
+            }.labelStyle(.iconOnly).help("Run: Command-Return. Cancel: Command-period or Escape.")
+                .disabled(!store.navigationAvailable || store.controls?.primaryAction == "unavailable" || store.controls?.primaryAction == "stopping" || store.selectedSession == nil).accessibilityIdentifier("query.primary")),
+            placeholder: actionPlaceholder,
+            busy: plan.loading || store.isShuttingDown || store.controls?.primaryAction == "stop" || store.controls?.primaryAction == "stopping",
+            shortcuts: { store.shortcutsVisible = true },
             search: { text in actionSearch = text; selectedAction = 0; actionsVisible = true },
             move: { direction in
                 let enabled = actions.filter(\.enabled)
@@ -129,12 +122,20 @@ public struct RootView: View {
     private var actions: [ActionItem] {
         var items = [
             ActionItem(id: "connections", title: "Show Connections", detail: "Choose a database connection", enabled: store.navigationAvailable) { Task { await store.chooseConnections() } },
-            ActionItem(id: "history", title: "Query History", detail: "Show saved queries on the left", enabled: true) { columns = .all },
+            ActionItem(id: "history", title: "Query History", detail: "Show saved queries on the left", enabled: true) { store.historyVisible = true },
             ActionItem(id: "new", title: "New Query", detail: "Open a query tab", enabled: store.selectedSession != nil && store.navigationAvailable) { Task { await store.newDocument() } },
             ActionItem(id: "run", title: store.controls?.primaryAction == "stop" ? "Stop Query" : "Run Query", detail: "Run or cancel the current query", enabled: store.controls?.primaryAction == "run" || store.controls?.primaryAction == "stop") { store.sendEditorIntent(.primary) },
             ActionItem(id: "plan", title: "Preview Query Plan", detail: "Estimate the current query", enabled: store.canPreview) { Task { await store.previewCurrent(pinned: true) } },
             ActionItem(id: "catalog", title: "Database Catalog", detail: "Browse tables, columns, and database objects", enabled: store.selectedSession != nil && store.navigationAvailable) { if let session = store.selectedSession { panel = .catalog(session) } },
             ActionItem(id: "disconnect", title: "Disconnect", detail: "Close the current workspace", enabled: store.selectedSession != nil && store.navigationAvailable) { if let session = store.selectedSession { Task { await store.closeSession(session) } } }
+        ]
+        items += [
+            ActionItem(id: "shortcuts", title: "Keyboard Shortcuts", detail: "Show native keyboard controls", enabled: true) { store.shortcutsVisible = true },
+            ActionItem(id: "close-query", title: "Close Query Tab", detail: "Close the selected query", enabled: store.document != nil && store.navigationAvailable) { if let document = store.document { Task { await store.closeDocument(document.document) } } },
+            ActionItem(id: "next-query", title: "Next Query Tab", detail: "Select the next query", enabled: store.document != nil && store.navigationAvailable) { Task { await store.cycleDocument(1) } },
+            ActionItem(id: "previous-query", title: "Previous Query Tab", detail: "Select the previous query", enabled: store.document != nil && store.navigationAvailable) { Task { await store.cycleDocument(-1) } },
+            ActionItem(id: "next-connection", title: "Next Connection", detail: "Select the next open database", enabled: !store.workspaces.isEmpty && store.navigationAvailable) { Task { await store.cycleWorkspace(1) } },
+            ActionItem(id: "previous-connection", title: "Previous Connection", detail: "Select the previous open database", enabled: !store.workspaces.isEmpty && store.navigationAvailable) { Task { await store.cycleWorkspace(-1) } }
         ]
         items += store.profiles.map { profile in
             ActionItem(id: "connect.\(profile.name)", title: profile.name, detail: "Open database connection", enabled: store.pendingProfile == nil && store.navigationAvailable) { Task { await store.connect(profile: profile.name) } }
@@ -173,6 +174,67 @@ public struct RootView: View {
         }.padding(12).frame(width: 380, height: 360)
     }
 
+    private func backendSymbol(_ profile: String) -> String {
+        store.profiles.first { $0.name == profile }?.backend == "clickhouse" ? "chart.bar.xaxis" : "cylinder.split.1x2"
+    }
+
+    private var connectionTabs: some View {
+        HStack(spacing: 6) {
+            Button { Task { await store.chooseConnections() } } label: {
+                Label("Connections", systemImage: "externaldrive.connected.to.line.below")
+            }.accessibilityIdentifier("connections.show")
+            ScrollView(.horizontal) {
+                HStack(spacing: 6) {
+                    ForEach(store.workspaces) { workspace in
+                        HStack(spacing: 6) {
+                            Button { Task { await store.selectSession(workspace.id) } } label: {
+                                Label(workspace.profile, systemImage: backendSymbol(workspace.profile))
+                            }.accessibilityIdentifier("workspace.\(workspace.id)")
+                            Button { Task { await store.closeSession(workspace.id) } } label: {
+                                Image(systemName: "xmark").font(.caption)
+                            }.accessibilityLabel("Disconnect \(workspace.profile)").accessibilityIdentifier("connection.close.\(workspace.id)")
+                        }
+                        .padding(5)
+                        .background(store.selectedSession == workspace.id ? Color.accentColor.opacity(0.15) : .clear, in: RoundedRectangle(cornerRadius: 6))
+                    }
+                }
+            }
+            Menu {
+                ForEach(store.profiles) { profile in
+                    Button(profile.name) { Task { await store.connect(profile: profile.name) } }
+                }
+            } label: { Label("New Connection", systemImage: "plus") }
+            .menuStyle(.borderlessButton).fixedSize().accessibilityIdentifier("connection.new")
+            .disabled(store.pendingProfile != nil)
+        }
+        .padding(.horizontal, 10).padding(.vertical, 6)
+        .disabled(!store.navigationAvailable)
+        .accessibilityElement(children: .contain).accessibilityIdentifier("connection.tabs")
+    }
+
+    private var statusbar: some View {
+        HStack(spacing: 12) {
+            Label(store.workspace?.profile ?? "Disconnected", systemImage: store.workspace.map { backendSymbol($0.profile) } ?? "network.slash")
+                .accessibilityIdentifier("connection.status")
+            if let document = store.document {
+                Divider().frame(height: 14)
+                Label(document.execution.capitalized, systemImage: document.execution == "finished" ? (document.error == nil ? "checkmark.circle" : "exclamationmark.circle") : "waveform.path")
+                    .accessibilityIdentifier("query.execution")
+                if document.generation > 0 {
+                    Text("Run \(document.generation)").accessibilityIdentifier("query.generation")
+                    Label("\(document.rows) rows", systemImage: "tablecells").accessibilityIdentifier("status.rows")
+                    if let bytes = document.captureBytes { Label(ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .memory), systemImage: "internaldrive") }
+                }
+            }
+            Spacer()
+            Text("Cmd-Return: Run | Cmd-Shift-P: Plan").foregroundStyle(.secondary)
+            Button { store.shortcutsVisible = true } label: {
+                Image(systemName: "keyboard")
+            }.help("Keyboard Shortcuts (F1)").accessibilityLabel("Keyboard Shortcuts").accessibilityIdentifier("shortcuts.open")
+        }.font(.caption).padding(.horizontal, 12).padding(.vertical, 7)
+        .accessibilityElement(children: .contain).accessibilityIdentifier("workspace.statusbar")
+    }
+
     private var chooser: some View {
         VStack(spacing: 20) {
             Image(systemName: "externaldrive.connected.to.line.below").font(.system(size: 44)).foregroundStyle(.secondary)
@@ -184,6 +246,7 @@ public struct RootView: View {
                 ForEach(store.profiles) { profile in
                     Button { Task { await store.connect(profile: profile.name) } } label: {
                         HStack {
+                            Image(systemName: backendSymbol(profile.name))
                             VStack(alignment: .leading) {
                                 Text(profile.name).font(.headline)
                                 Text(profile.backend == "postgresql" ? "PostgreSQL" : "ClickHouse").font(.caption).foregroundStyle(.secondary)
@@ -265,22 +328,6 @@ public struct RootView: View {
             } else {
                 ContentUnavailableView("No query selected", systemImage: "doc.text")
             }
-            Divider()
-            HStack {
-                Text(workspace.profile)
-                if let document = store.document {
-                    Text(document.execution.capitalized).accessibilityIdentifier("query.execution")
-                    if document.generation > 0 {
-                        Text("Run \(document.generation)").accessibilityIdentifier("query.generation")
-                    }
-                }
-                Spacer()
-                Text(store.controls?.primaryAction == "run" ? "Ready" : "Connection active")
-                    .accessibilityIdentifier("connection.status")
-            }
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            .padding(8)
         }
     }
 }

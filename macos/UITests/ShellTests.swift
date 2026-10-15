@@ -38,6 +38,48 @@ final class ShellTests: XCTestCase {
         }
     }
 
+    func testNativeConnectionsStatusAndShortcuts() throws {
+        app.launchArguments = ["--fixture-query", "SELECT 42"]
+        launchApp()
+        waitForValue("Complete - 500 rows", in: app.staticTexts["results.status"])
+        let tabs = app.descendants(matching: .any)["connection.tabs"]
+        let status = app.descendants(matching: .any)["workspace.statusbar"]
+        XCTAssertTrue(tabs.exists)
+        XCTAssertTrue(status.exists)
+        let editor = app.textViews["query.editor"]
+        XCTAssertLessThan(tabs.frame.maxY, editor.frame.minY)
+        XCTAssertGreaterThan(status.frame.minY, editor.frame.maxY)
+        app.buttons["shortcuts.open"].click()
+        XCTAssertTrue(app.sheets.buttons["shortcuts.close"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.sheets.staticTexts["Command-Shift-P"].exists)
+        app.sheets.buttons["shortcuts.close"].click()
+        app.typeKey("t", modifierFlags: .command)
+        XCTAssertTrue(app.buttons["Query 2"].waitForExistence(timeout: 5))
+        app.typeKey("[", modifierFlags: [.command, .shift])
+        waitForValue("Complete - 500 rows", in: app.staticTexts["results.status"])
+        app.typeKey("]", modifierFlags: [.command, .shift])
+        waitForValue("Run a query to see results", in: app.staticTexts["results.status"])
+        app.typeKey("w", modifierFlags: .command)
+        let closed = expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: app.buttons["Query 2"])
+        wait(for: [closed], timeout: 10)
+        XCTAssertTrue(app.buttons["Query 1"].exists)
+        app.typeKey("b", modifierFlags: .command)
+        XCTAssertFalse(app.buttons["history.close"].exists)
+        app.typeKey("b", modifierFlags: .command)
+        XCTAssertTrue(app.buttons["history.close"].waitForExistence(timeout: 5))
+        app.typeKey("k", modifierFlags: .command)
+        app.buttons["connection.fixture-slow"].click()
+        XCTAssertTrue(app.buttons["Query 1"].waitForExistence(timeout: 5))
+        app.typeKey(.leftArrow, modifierFlags: [.command, .option])
+        waitForValue("Complete - 500 rows", in: app.staticTexts["results.status"])
+        let attachment = XCTAttachment(screenshot: app.windows.firstMatch.screenshot())
+        attachment.name = "Native connections and status bar"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        app.typeKey("q", modifierFlags: .command)
+        XCTAssertTrue(app.wait(for: .notRunning, timeout: 10))
+    }
+
     func testCenteredActionsAndLeftHistory() throws {
         app.launchArguments = ["--fixture-query", "SELECT 42"]
         launchApp()
@@ -186,7 +228,7 @@ final class ShellTests: XCTestCase {
         app.typeKey(.return, modifierFlags: [.command, .shift])
         waitForValue("Run 2", in: app.staticTexts["query.generation"])
         waitForLabel("Stop", in: primary)
-        primary.click()
+        app.typeKey(".", modifierFlags: .command)
         waitForLabel("Run", in: primary)
         editor.click()
         app.typeKey("a", modifierFlags: .command)

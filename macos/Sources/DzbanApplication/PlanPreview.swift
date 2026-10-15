@@ -117,7 +117,11 @@ struct PlanPreviewButton: View {
     @ObservedObject private var model: PlanPreviewModel
     init(store: ApplicationStore) { self.store = store; model = store.plan }
     var body: some View {
-        Button("Preview Plan") { Task { await store.previewCurrent(pinned: true) } }
+        Button { Task { await store.previewCurrent(pinned: true) } } label: {
+            Label("Preview Plan", systemImage: "waveform.path.ecg")
+        }
+            .labelStyle(.iconOnly)
+            .help("Command-Shift-P: tap to pin the plan, hold to peek")
             .disabled(!store.canPreview)
             .accessibilityIdentifier("plan.open")
             .popover(isPresented: Binding(get: { model.visible }, set: { if !$0 { model.dismiss() } }), arrowEdge: .bottom) {

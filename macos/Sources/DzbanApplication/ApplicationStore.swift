@@ -21,6 +21,8 @@ public final class ApplicationStore: ObservableObject {
     @Published public private(set) var isShuttingDown = false
     @Published public private(set) var isClosed = false
     @Published public var failure: String?
+    @Published public var historyVisible = true
+    @Published public var shortcutsVisible = false
 
     public let bridge: Bridge
     public let results: ResultViewport
@@ -243,6 +245,18 @@ public final class ApplicationStore: ObservableObject {
             apply(snapshot, session: session)
             await refreshControls()
         } catch { show(error) }
+    }
+
+    public func cycleDocument(_ direction: Int) async {
+        guard let workspace, !workspace.documents.isEmpty else { return }
+        let index = workspace.documents.firstIndex { $0.document == workspace.selectedDocument } ?? 0
+        await selectDocument(workspace.documents[(index + direction + workspace.documents.count) % workspace.documents.count].document)
+    }
+
+    public func cycleWorkspace(_ direction: Int) async {
+        guard !workspaces.isEmpty else { return }
+        let index = workspaces.firstIndex { $0.id == selectedSession } ?? 0
+        await selectSession(workspaces[(index + direction + workspaces.count) % workspaces.count].id)
     }
 
     public func newDocument() async {

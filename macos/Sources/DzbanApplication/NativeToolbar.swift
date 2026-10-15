@@ -8,6 +8,7 @@ struct NativeToolbarConfiguration {
     let primary: AnyView
     let placeholder: String
     let busy: Bool
+    let shortcuts: () -> Void
     let search: (String) -> Void
     let move: (Int) -> Void
     let submit: () -> Void
@@ -58,7 +59,9 @@ final class NativeToolbarController: NSObject, NSToolbarDelegate, NSSearchFieldD
         window.titleVisibility = .hidden
         monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             MainActor.assumeIsolated {
-                guard let self, event.window == self.window, event.charactersIgnoringModifiers?.lowercased() == "k",
+                guard let self, event.window == self.window else { return EventResult(event: event) }
+                if event.keyCode == 122 { self.configuration.shortcuts(); return EventResult(event: nil) }
+                guard event.charactersIgnoringModifiers?.lowercased() == "k",
                       event.modifierFlags.intersection([.command, .shift, .control, .option]) == [.command, .shift] else { return EventResult(event: event) }
                 self.window?.makeFirstResponder(self.field)
                 self.configuration.search(self.field.stringValue)
@@ -75,6 +78,7 @@ final class NativeToolbarController: NSObject, NSToolbarDelegate, NSSearchFieldD
         }
         window?.titleVisibility = .hidden
         field.placeholderString = configuration.placeholder
+        field.toolTip = configuration.placeholder + "\nCommand-Shift-K: search actions, connections, and query tabs"
         progress.isHidden = !configuration.busy
         if configuration.busy { progress.startAnimation(nil) } else { progress.stopAnimation(nil) }
     }
