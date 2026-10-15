@@ -76,7 +76,7 @@ final class NativeToolbarController: NSObject, NSToolbarDelegate, NSSearchFieldD
     func update(_ configuration: NativeToolbarConfiguration) {
         self.configuration = configuration
         for (identifier, view) in [(Self.history, configuration.history), (Self.plan, configuration.plan), (Self.newQuery, configuration.newQuery), (Self.primary, configuration.primary)] {
-            hosts[identifier]?.rootView = view
+            hosts[identifier]?.rootView = AnyView(view.frame(width: 28, height: 28))
         }
         window?.titleVisibility = .hidden
         resize()
@@ -138,7 +138,7 @@ final class NativeToolbarController: NSObject, NSToolbarDelegate, NSSearchFieldD
             case Self.primary: content = configuration.primary; item.label = "Run or Stop"
             default: return nil
             }
-            let host = NSHostingView(rootView: content)
+            let host = NSHostingView(rootView: AnyView(content.frame(width: 28, height: 28)))
             hosts[identifier] = host
             item.view = host
         }

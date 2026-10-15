@@ -81,6 +81,7 @@ struct DzbanApp: App {
                     .frame(width: 600, height: 400)
             }
         }
+        .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1150, height: 760)
         .commands {
             if let store = delegate.store { NativeCommands(store: store) }
