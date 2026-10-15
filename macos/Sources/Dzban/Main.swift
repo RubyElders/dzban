@@ -26,6 +26,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         super.init()
     }
 
+    #if DZBAN_TEST_FIXTURES
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let arguments = ProcessInfo.processInfo.arguments
+        if let index = arguments.firstIndex(of: "--test-appearance"), arguments.indices.contains(index + 1) {
+            NSApplication.shared.appearance = NSAppearance(named: arguments[index + 1] == "dark" ? .darkAqua : .aqua)
+        }
+    }
+    #endif
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let store, !store.isClosed else { return .terminateNow }
         if !terminationPending {

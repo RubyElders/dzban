@@ -464,6 +464,142 @@ final class ShellTests: XCTestCase {
         XCTAssertTrue(app.wait(for: .notRunning, timeout: 10))
     }
 
+    func testLivePostgreSQLWorkflow() throws { try liveWorkflow(postgres: true) }
+    func testLiveClickHouseWorkflow() throws { try liveWorkflow(postgres: false) }
+
+    private func liveWorkflow(postgres: Bool) throws {
+        guard ProcessInfo.processInfo.environment["DZBAN_TEST_DATABASES"] == "1" else {
+            throw XCTSkip("Requires disposable services from scripts/test-macos-live.sh")
+        }
+        let configuration = fixtureDirectory.appendingPathComponent("live.toml")
+        let profile = postgres ? "native-pg" : "native-ch"
+        let contents = postgres ? """
+        [[databases]]
+        name = "native-pg"
+        host = "localhost"
+        port = 5415
+        user = "testuser"
+        password = "testpass"
+        database = "testdb"
+        """ : """
+        [[databases]]
+        name = "native-ch"
+        backend = "clickhouse"
+        url = "http://127.0.0.1:58123"
+        user = "dzban"
+        password = "dzban-test"
+        database = "dzban_test"
+        """
+        try contents.write(to: configuration, atomically: true, encoding: .utf8)
+        app.launchEnvironment["DZBAN_CONFIG"] = configuration.path
+        app.launchArguments = ["--empty-config", "YES"]
+        launchApp()
+        let connect = app.buttons["connection.\(profile)"]
+        XCTAssertTrue(connect.waitForExistence(timeout: 10))
+        connect.click()
+        XCTAssertTrue(app.textViews["query.editor"].waitForExistence(timeout: 10))
+        let sql = postgres
+            ? "SELECT 42 AS id, NULL::text AS missing, chr(382)||chr(10)||'value' AS value"
+            : "SELECT 42 AS id, CAST(NULL, 'Nullable(String)') AS missing, concat(char(197,190),char(10),'value') AS value"
+        submitResultQuery(sql)
+        waitForValue("Complete - 1 rows", in: app.staticTexts["results.status"])
+        waitForValue("42", in: app.descendants(matching: .any)["result.cell.0.0"])
+        let null = app.descendants(matching: .any)["result.cell.0.1"]
+        waitForValue("NULL", in: null)
+        null.click()
+        app.buttons["results.inspect"].click()
+        waitForValue("SQL NULL", in: app.sheets.staticTexts["cell.null"])
+        app.sheets.buttons["cell.close"].click()
+        app.descendants(matching: .any)["result.cell.0.2"].click()
+        app.buttons["results.inspect"].click()
+        waitForValue("ž\nvalue", in: app.sheets.textViews["cell.value"])
+        app.sheets.buttons["cell.close"].click()
+        if postgres {
+            submitResultQuery("BEGIN")
+            waitForValue("0 rows affected", in: app.staticTexts["results.status"])
+            submitResultQuery("SELECT 43")
+            waitForValue("Complete - 1 rows", in: app.staticTexts["results.status"])
+            waitForValue("43", in: app.descendants(matching: .any)["result.cell.0.0"])
+            submitResultQuery("ROLLBACK")
+            waitForValue("0 rows affected", in: app.staticTexts["results.status"])
+        } else {
+            submitResultQuery("CREATE TEMPORARY TABLE dzban_native_command (id UInt64)")
+            waitForValue("Command completed", in: app.staticTexts["results.status"])
+        }
+        submitResultQuery("SELECT * FROM dzban_native_missing_table")
+        waitForValue("Failed - 0 rows", in: app.staticTexts["results.status"])
+        let diagnostic = app.staticTexts["query.error"]
+        XCTAssertTrue(diagnostic.waitForExistence(timeout: 5))
+        XCTAssertTrue((diagnostic.value as? String)?.contains(postgres ? "42P01" : "60") == true)
+        submitResultQuery(postgres ? "SELECT pg_sleep(30)" : "SELECT number, sleepEachRow(0.1) FROM numbers(300) SETTINGS max_block_size=1, max_threads=1")
+        waitForValue("Running", in: app.staticTexts["query.execution"])
+        app.typeKey("q", modifierFlags: .command)
+        let acknowledgment = app.windows.buttons["OK"]
+        XCTAssertTrue(acknowledgment.waitForExistence(timeout: 5))
+        acknowledgment.click()
+        XCTAssertTrue(app.windows.firstMatch.exists)
+        app.buttons["query.primary"].click()
+        let canceled = expectation(for: NSPredicate(format: "value BEGINSWITH %@", "Canceled -"), evaluatedWith: app.staticTexts["results.status"])
+        wait(for: [canceled], timeout: 10)
+        submitResultQuery(postgres ? "SELECT i FROM generate_series(1,10005) i" : "SELECT number FROM numbers(10005)")
+        waitForValue("Truncated - 10000 rows (row limit)", in: app.staticTexts["results.status"])
+        waitForValue("Finished", in: app.staticTexts["query.execution"])
+        submitResultQuery("SELECT 44")
+        waitForValue("Complete - 1 rows", in: app.staticTexts["results.status"])
+        waitForValue("44", in: app.descendants(matching: .any)["result.cell.0.0"])
+        app.buttons["history.open"].click()
+        let restore = app.buttons["history.restore.0"]
+        XCTAssertTrue(restore.waitForExistence(timeout: 5))
+        restore.click()
+        waitForValue("Saved - 1 of 1 rows", in: app.staticTexts["results.status"])
+        waitForValue("SELECT 44", in: app.textViews["query.editor"])
+        let attachment = XCTAttachment(screenshot: app.windows.firstMatch.screenshot())
+        attachment.name = "Live \(profile) restored result"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        app.typeKey("q", modifierFlags: .command)
+        XCTAssertTrue(app.wait(for: .notRunning, timeout: 10))
+    }
+
+    func testNativeAppearanceResizeAndAccessibleInspection() throws {
+        for appearance in ["Light", "Dark"] {
+            app.launchArguments = ["--fixture-query", "wide", "--test-appearance", appearance.lowercased()]
+            launchApp()
+            waitForValue("Complete - 500 rows", in: app.staticTexts["results.status"])
+            let window = app.windows.firstMatch
+            if window.frame.width < 1000 {
+                let corner = window.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 1)).withOffset(CGVector(dx: -2, dy: -2))
+                corner.press(forDuration: 0.1, thenDragTo: corner.withOffset(CGVector(dx: 240, dy: 0)))
+            }
+            let before = window.frame
+            let corner = window.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 1)).withOffset(CGVector(dx: -2, dy: -2))
+            corner.press(forDuration: 0.1, thenDragTo: corner.withOffset(CGVector(dx: -120, dy: -60)))
+            XCTAssertLessThan(window.frame.width, before.width)
+            print("Native \(appearance) window points: \(window.frame.size); main display backing scale: \(NSScreen.main?.backingScaleFactor ?? 0)")
+            XCTAssertTrue(app.textViews["query.editor"].isHittable)
+            let first = app.descendants(matching: .any)["result.cell.0.0"]
+            XCTAssertTrue(first.waitForExistence(timeout: 5))
+            first.click()
+            app.buttons["results.inspect-row"].click()
+            XCTAssertTrue(app.buttons["row.close"].waitForExistence(timeout: 5))
+            XCTAssertTrue(app.buttons["row.close"].isHittable)
+            let row = XCTAttachment(screenshot: app.screenshot())
+            row.name = "Native \(appearance) resized row inspector"
+            row.lifetime = .keepAlways
+            add(row)
+            app.buttons["row.close"].click()
+            app.buttons["history.open"].click()
+            XCTAssertTrue(app.buttons["history.restore.0"].waitForExistence(timeout: 5))
+            let history = XCTAttachment(screenshot: window.screenshot())
+            history.name = "Native \(appearance) resized history"
+            history.lifetime = .keepAlways
+            add(history)
+            app.buttons["history.close"].click()
+            app.typeKey("q", modifierFlags: .command)
+            XCTAssertTrue(app.wait(for: .notRunning, timeout: 10))
+        }
+    }
+
     private func submitResultQuery(_ sql: String) {
         let editor = app.textViews["query.editor"]
         editor.click()
