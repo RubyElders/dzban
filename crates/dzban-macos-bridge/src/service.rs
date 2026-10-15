@@ -1414,7 +1414,7 @@ mod tests {
         let result = runtime
             .block_on(app.state.probe_profile("fixture".into()))
             .unwrap();
-        assert_eq!(result["state"], "reachable");
+        assert_eq!(result["state"], "connected");
         assert!(runtime.block_on(app.state.context.session_ids()).is_empty());
         assert!(app.state.workspaces.lock().unwrap().is_empty());
         runtime

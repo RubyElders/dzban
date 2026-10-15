@@ -48,11 +48,11 @@ struct HistoryBrowser: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("Query History").font(.headline)
+                Text("Query History").font(.headline).lineLimit(1).layoutPriority(1)
                 Spacer()
-                Button("Refresh") { model.refresh(session: session) }.disabled(model.loading || restoring).accessibilityIdentifier("history.refresh")
-                Button("Close", action: close).accessibilityIdentifier("history.close")
-            }
+                Button { model.refresh(session: session) } label: { Image(systemName: "arrow.clockwise").frame(width: 24, height: 24) }.help("Refresh history").accessibilityLabel("Refresh").disabled(model.loading || restoring).accessibilityIdentifier("history.refresh")
+                Button(action: close) { Image(systemName: "xmark").frame(width: 24, height: 24) }.help("Hide history").accessibilityLabel("Close").accessibilityIdentifier("history.close")
+            }.buttonStyle(.borderless)
             if model.loading || restoring { ProgressView(model.loading ? "Loading history" : "Restoring query") }
             if let failure = model.failure { Text(failure).foregroundStyle(.red).textSelection(.enabled).accessibilityIdentifier("history.error") }
             List(model.list?.entries ?? []) { entry in
@@ -66,14 +66,16 @@ struct HistoryBrowser: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
                     Spacer()
-                    Button("Restore") {
+                    Button {
                         guard let revision = model.list?.revision else { return }
                         restoring = true
                         Task {
                             _ = await store.restoreHistory(session: session, revision: revision, index: entry.index)
                             restoring = false
                         }
-                    }.disabled(restoring || model.loading).accessibilityIdentifier("history.restore.\(entry.index)")
+                    } label: { Image(systemName: "arrow.uturn.backward").frame(width: 24, height: 24) }
+                    .buttonStyle(.borderless).help("Restore query and saved results").accessibilityLabel("Restore")
+                    .disabled(restoring || model.loading).accessibilityIdentifier("history.restore.\(entry.index)")
                 }.padding(.vertical, 4)
             }.accessibilityIdentifier("history.entries")
             if model.list?.entries.isEmpty == true { Text("No saved queries").foregroundStyle(.secondary) }

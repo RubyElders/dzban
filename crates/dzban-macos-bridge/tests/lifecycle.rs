@@ -484,7 +484,7 @@ fn probes_and_shared_input_preserve_query_and_selection_boundaries() {
     let app = dzban_macos_bridge::dzban_create_fixture();
     request(app, json!({"command":"profiles"}));
     let probe = request(app, json!({"command":"probe_profile","profile":"fixture"}));
-    assert_eq!(probe["state"], "reachable");
+    assert_eq!(probe["state"], "connected");
     assert_eq!(probe["latency_micros"], 1);
     assert_eq!(probe["version"], "fixture");
     assert_eq!(

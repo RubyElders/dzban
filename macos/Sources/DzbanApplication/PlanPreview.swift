@@ -138,6 +138,18 @@ struct PlanPreviewButton: View {
 }
 
 public enum PlanFormatting {
+    public static func compact(_ plan: JSONValue) -> String {
+        guard case .object(let root) = plan, case .object(let estimate) = root["estimate"], case .number(let rows) = estimate["rows"] else { return "Estimate ready" }
+        let count = String(format: "%.0f", rows)
+        if case .number(let startup) = estimate["startup_cost"], case .number(let total) = estimate["total_cost"] {
+            return "~\(count) rows - cost " + String(format: "%.2f..%.2f", startup, total)
+        }
+        if case .number(let parts) = estimate["parts"], case .number(let marks) = estimate["marks"] {
+            return "~\(count) rows - " + String(format: "%.0f parts - %.0f marks", parts, marks)
+        }
+        return "~\(count) rows"
+    }
+
     public static func summary(_ plan: JSONValue) -> String {
         guard case .object(let root) = plan, case .object(let estimate) = root["estimate"] else { return "Estimated query plan" }
         var parts: [String] = []

@@ -1,7 +1,12 @@
 import Foundation
 
+public enum ConnectionState: String, Codable, Sendable {
+    case unknown, disconnected, connecting, connected, busy, error
+    public var label: String { rawValue.capitalized }
+}
+
 public struct ConnectionProbe: Decodable, Sendable {
-    public let state: String
+    public let state: ConnectionState
     public let latencyMicros: UInt64?
     public let version: String?
     public let error: String?
