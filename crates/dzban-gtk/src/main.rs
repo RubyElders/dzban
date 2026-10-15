@@ -5,7 +5,7 @@ use gtk4::prelude::*;
 use libadwaita as adw;
 use tracing_subscriber::{EnvFilter, fmt};
 
-const APP_ID: &str = "com.fuga.dzban";
+const APP_ID: &str = "com.rubyelders.dzban";
 pub(crate) const APP_NAME: &str = "Dzban";
 
 fn main() {

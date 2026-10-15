@@ -6,7 +6,7 @@ use gtk4::prelude::*;
 use libadwaita as adw;
 use adw::Application;
 
-const APP_ID: &str = "com.fuga.dzban";
+const APP_ID: &str = "com.rubyelders.dzban";
 
 fn main() {
     // Initialize Adwaita
