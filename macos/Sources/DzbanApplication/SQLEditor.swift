@@ -67,6 +67,14 @@ public final class EditorBuffer: ObservableObject {
         self.selection = selection
     }
 
+    public func restore(text: String) {
+        let range = NSRange(location: 0, length: textView.string.utf16.count)
+        textView.breakUndoCoalescing()
+        textView.insertText(text, replacementRange: range)
+        edit(text: textView.string, selection: textView.selectedRange())
+        acknowledge(version)
+    }
+
     func retire() {
         textView.intent = nil
         textView.delegate = nil

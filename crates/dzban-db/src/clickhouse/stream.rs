@@ -111,11 +111,25 @@ async fn execute_limited(
     let mut frame = Vec::new();
     let mut failure = None;
     let mut delivery = Delivery::Continue;
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| ExecutionError::Database(clickhouse_transport_error(error)))?
-    {
+    loop {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(error) => {
+                if frame.starts_with(b"Code: ") {
+                    decoder.line(&frame, results, delivery).await?;
+                }
+                if let Some(ExecutionError::Database(native)) = &failure
+                    && matches!(
+                        native.code,
+                        Some(dzban_core::error::NativeErrorCode::ClickHouse(_))
+                    )
+                {
+                    return Err(failure.unwrap());
+                }
+                return Err(ExecutionError::Database(clickhouse_transport_error(error)));
+            }
+        };
         for part in chunk.split_inclusive(|byte| *byte == b'\n') {
             let newline = part.last() == Some(&b'\n');
             let part = if newline {
@@ -268,6 +282,25 @@ mod tests {
             snapshot.phase,
             ResultPhase::Finished(ResultTermination::Failed(error))
         );
+    }
+
+    #[tokio::test]
+    async fn native_cancel_error_survives_an_incomplete_http_trailer() {
+        for newline in ["", "\n"] {
+            let body = format!(
+                "[\"id\"]\n[\"UInt64\"]\n[\"1\"]\nCode: 394. DB::Exception: Query was cancelled{newline}"
+            );
+            let (mut sink, _) = start_results(ResultLimits::default());
+            let error = execute(
+                response(body.as_bytes(), "200 OK", body.len() + 1).await,
+                &mut sink,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(error, ExecutionError::Database(ref native) if native.code == Some(NativeErrorCode::ClickHouse(394)))
+            );
+        }
     }
 
     #[tokio::test]

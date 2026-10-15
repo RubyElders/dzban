@@ -273,8 +273,10 @@ impl DatabaseSession for ClickHouseSession {
         let query_id = uuid::Uuid::new_v4().to_string();
         let active = self.track(&query_id);
         let outcome = stream::execute(
-            self.request_mode(client, query, &query_id, "0")
-                .query(&[("buffer_size", "0")]),
+            self.request_mode(client, query, &query_id, "0").query(&[
+                ("buffer_size", "0"),
+                ("http_write_exception_in_output_format", "0"),
+            ]),
             results,
         )
         .await;

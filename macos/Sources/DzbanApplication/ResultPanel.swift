@@ -4,6 +4,11 @@ import SwiftUI
 
 public enum ResultStatus {
     public static func describe(_ document: DocumentSnapshot) -> String {
+        if document.history == true {
+            if document.termination == "failed" { return "Saved query failed" }
+            if let command = document.commandResult { return command.affectedRows.map { "Saved command - \($0) rows affected" } ?? "Saved command" }
+            return "Saved - \(document.rows) of \(document.historyTotalRows ?? document.rows) rows"
+        }
         if document.generation == 0 { return "Run a query to see results" }
         if document.execution == "canceling" { return "Canceling - \(document.rows) rows captured" }
         switch document.resultPhase {
@@ -25,6 +30,7 @@ public enum ResultStatus {
 
 struct ResultPanel: View {
     @ObservedObject var model: ResultViewport
+    let bridge: Bridge
     let session: UUID
     let document: DocumentSnapshot
     let cancel: () -> Bool
@@ -34,6 +40,7 @@ struct ResultPanel: View {
 
     init(model: ResultViewport, bridge: Bridge, session: UUID, document: DocumentSnapshot, cancel: @escaping () -> Bool) {
         self.model = model
+        self.bridge = bridge
         self.session = session
         self.document = document
         self.cancel = cancel
@@ -57,6 +64,9 @@ struct ResultPanel: View {
                 Text(ResultStatus.describe(document)).accessibilityIdentifier("results.status")
                 if model.isLoading || cell.copying { ProgressView().controlSize(.small).accessibilityLabel(cell.copying ? "Copying cell" : "Loading result pages") }
                 Spacer()
+                if document.historyPlanAvailable == true {
+                    SavedPlanButton(bridge: bridge, scope: ResultScope(session: session, document: document.document, generation: document.generation))
+                }
                 Button("Inspect Row") { if let selected = model.selected { row.show(selected, pinned: true, columns: model.columns.count) } }
                     .disabled(model.selected == nil).accessibilityIdentifier("results.inspect-row")
                     .overlay(alignment: .bottom) {
@@ -71,6 +81,9 @@ struct ResultPanel: View {
                 if cell.copying { Button("Cancel Copy") { cell.cancelCopy() } }
             }
             .font(.caption)
+            if document.history == true {
+                Text("Saved samples contain legacy text values; SQL null identity and original column types are unavailable.").font(.caption).foregroundStyle(.secondary).accessibilityIdentifier("history.sample-note")
+            }
             if let failure = model.loadError {
                 HStack {
                     Text(failure).foregroundStyle(.red).textSelection(.enabled).accessibilityIdentifier("results.read-error")

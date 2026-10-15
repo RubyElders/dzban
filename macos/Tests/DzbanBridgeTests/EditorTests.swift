@@ -60,6 +60,26 @@ final class EditorTests: XCTestCase {
         XCTAssertEqual(buffer.text, "日本語")
     }
 
+    func testHistoryReplacementPreservesNativeUndoAndUnicode() throws {
+        let buffer = EditorBuffer(text: "SELECT 'draft 😀'")
+        let coordinator = SQLEditor.Coordinator(buffer: buffer, changed: {})
+        buffer.textView.delegate = coordinator
+        let undo = try XCTUnwrap(buffer.textView.undoManager)
+        undo.groupsByEvent = false
+        undo.beginUndoGrouping()
+        buffer.restore(text: "SELECT 'saved 日本語'")
+        undo.endUndoGrouping()
+        XCTAssertEqual(buffer.textView.string, "SELECT 'saved 日本語'")
+        XCTAssertEqual(buffer.text, buffer.textView.string)
+        XCTAssertEqual(buffer.savedVersion, buffer.version)
+        undo.undo()
+        XCTAssertEqual(buffer.textView.string, "SELECT 'draft 😀'")
+        XCTAssertEqual(buffer.text, buffer.textView.string)
+        XCTAssertGreaterThan(buffer.version, buffer.savedVersion)
+        undo.redo()
+        XCTAssertEqual(buffer.text, "SELECT 'saved 日本語'")
+    }
+
     func testNativeEditorConsumesHeldSubmitWithoutRepeatingAndResetsFocus() throws {
         let buffer = EditorBuffer(text: "SELECT 1")
         var intents: [EditorIntent] = []
