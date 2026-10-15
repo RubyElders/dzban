@@ -2,13 +2,13 @@
 set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_root"
-arguments=()
+arguments=(DZBAN_MACOS_FIXTURES=NO)
 variant=macos-xcode
 case ${1:-} in
     '') ;;
     --fixtures)
         variant=macos-xcode-fixtures
-        arguments+=(DZBAN_MACOS_FIXTURES=YES
+        arguments=(DZBAN_MACOS_FIXTURES=YES
             'SWIFT_ACTIVE_COMPILATION_CONDITIONS=$(inherited) DEBUG DZBAN_TEST_FIXTURES'
             'OTHER_SWIFT_FLAGS=$(inherited) -Xcc -DDZBAN_TEST_FIXTURES'
             DZBAN_BUNDLE_IDENTIFIER=com.rubyelders.dzban.macos.dev.fixtures)
