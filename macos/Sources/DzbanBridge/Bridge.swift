@@ -196,6 +196,11 @@ public struct BridgeCommand: Encodable, Sendable {
     var intent: EditorIntent?
     var columnStart: Int?
     var columnCount: Int?
+    var request: CatalogQuery?
+    var surface: PeekSurface?
+    var event: PeekEvent?
+    var elapsedMs: UInt64?
+    var requestRevision: UInt64?
 
     public static func connect(profile: String, revision: UInt64? = nil) -> Self { Self(command: "connect", profile: profile, revision: revision) }
     public static func selectSession(_ session: UUID?, revision: UInt64? = nil) -> Self { Self(command: "select_session", session: session, revision: revision) }
@@ -224,10 +229,10 @@ public struct BridgeCommand: Encodable, Sendable {
         Self(command: "read_page", session: session, document: document, generation: generation, start: start, count: count)
     }
     public static func closeSession(session: UUID) -> Self { Self(command: "close_session", session: session) }
-    public static func preview(session: UUID, document: UUID, sql: String, revision: UInt64) -> Self {
-        Self(command: "preview", session: session, document: document, sql: sql, revision: revision)
+    public static func preview(session: UUID, document: UUID, sql: String, revision: UInt64, start: Int? = nil, end: Int? = nil, requestRevision: UInt64? = nil) -> Self {
+        Self(command: "preview", session: session, document: document, sql: sql, start: start, revision: revision, end: end, requestRevision: requestRevision)
     }
-    public static func cancelPreview(session: UUID) -> Self { Self(command: "cancel_preview", session: session) }
+    public static func cancelPreview(session: UUID, requestRevision: UInt64? = nil) -> Self { Self(command: "cancel_preview", session: session, requestRevision: requestRevision) }
     public static func history(session: UUID) -> Self { Self(command: "history", session: session) }
     public static func readCell(session: UUID, document: UUID, generation: UInt64, row: Int, column: Int, offset: Int, count: Int) -> Self {
         Self(command: "read_cell", session: session, document: document, generation: generation, count: count, row: row, column: column, offset: offset)
@@ -346,7 +351,13 @@ public final class Bridge: Sendable {
     }
 
     public func observeDocument(session: UUID, document: UUID) async throws -> AsyncThrowingStream<DocumentSnapshot, Error> {
-        let stream = try send(.observeDocument(session: session, document: document))
+        try observe(.observeDocument(session: session, document: document), as: DocumentSnapshot.self)
+    }
+    public func observeControls(session: UUID) async throws -> AsyncThrowingStream<Controls, Error> {
+        try observe(.observeControls(session: session), as: Controls.self)
+    }
+    private func observe<T: Decodable & Sendable>(_ command: BridgeCommand, as type: T.Type) throws -> AsyncThrowingStream<T, Error> {
+        let stream = try send(command)
         let observation = Observation(stream)
         return AsyncThrowingStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
             continuation.onTermination = { _ in observation.release() }
@@ -357,7 +368,7 @@ public final class Bridge: Sendable {
                     while !observation.isReleased {
                         if let data = try wait(stream, after: revision) {
                             guard !observation.isReleased else { break }
-                            let envelope = try decode(data, as: DocumentSnapshot.self)
+                            let envelope = try decode(data, as: type)
                             revision = envelope.revision
                             continuation.yield(envelope.payload)
                         }

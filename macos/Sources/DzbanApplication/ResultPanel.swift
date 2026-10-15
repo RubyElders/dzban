@@ -28,14 +28,16 @@ struct ResultPanel: View {
     let session: UUID
     let document: DocumentSnapshot
     let cancel: () -> Bool
+    @StateObject private var row: RowInspectorModel
     @StateObject private var cell: CellInspectorModel
     @State private var inspecting: ResultAddress?
 
-    init(model: ResultViewport, session: UUID, document: DocumentSnapshot, cancel: @escaping () -> Bool) {
+    init(model: ResultViewport, bridge: Bridge, session: UUID, document: DocumentSnapshot, cancel: @escaping () -> Bool) {
         self.model = model
         self.session = session
         self.document = document
         self.cancel = cancel
+        _row = StateObject(wrappedValue: RowInspectorModel(bridge: bridge, source: model.source))
         _cell = StateObject(wrappedValue: CellInspectorModel(source: model.source))
     }
 
@@ -55,6 +57,11 @@ struct ResultPanel: View {
                 Text(ResultStatus.describe(document)).accessibilityIdentifier("results.status")
                 if model.isLoading || cell.copying { ProgressView().controlSize(.small).accessibilityLabel(cell.copying ? "Copying cell" : "Loading result pages") }
                 Spacer()
+                Button("Inspect Row") { if let selected = model.selected { row.show(selected, pinned: true, columns: model.columns.count) } }
+                    .disabled(model.selected == nil).accessibilityIdentifier("results.inspect-row")
+                    .overlay(alignment: .bottom) {
+                        RowPopover(model: row, columns: model.columns, inspect: { address in row.close(); inspecting = address }).frame(width: 1, height: 1)
+                    }
                 Button("Inspect Cell") { inspecting = model.selected }
                     .disabled(model.selected == nil)
                     .accessibilityIdentifier("results.inspect")
@@ -76,7 +83,9 @@ struct ResultPanel: View {
             }
             ResultTable(model: model, inspect: { inspecting = model.selected }, copy: {
                 if let selected = model.selected { cell.copy(selected) }
-            }, cancel: cancel)
+            }, cancel: cancel, peek: {
+                if let selected = model.selected { row.show(selected, pinned: false, columns: model.columns.count) }
+            }, releasePeek: { row.release(milliseconds: $0) })
             .id(model.scope)
             .overlay {
                 if model.availableRows == 0 && !model.isLoading {
@@ -87,10 +96,11 @@ struct ResultPanel: View {
         .padding(.top, 8)
         .onChange(of: revision, initial: true) { _, _ in
             let scope = ResultScope(session: session, document: document.document, generation: document.generation)
-            if model.scope != scope { cell.cancel(); inspecting = nil }
+            if model.scope != scope { cell.cancel(); row.close(); inspecting = nil }
             model.update(session: session, document: document)
         }
-        .onDisappear { model.retire(); cell.cancel() }
+        .onDisappear { model.retire(); cell.cancel(); row.close() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in row.reset() }
         .sheet(item: $inspecting) { address in CellInspectorView(model: cell, address: address) }
     }
 }
@@ -119,7 +129,7 @@ private struct CellInspectorView: View {
             }
             if model.loaded {
                 if let text = model.text {
-                    InspectorText(text: text)
+                    ReadOnlyText(text: text)
                     Text(verbatim: rangeDescription)
                         .font(.caption).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -151,8 +161,9 @@ private struct CellInspectorView: View {
     }
 }
 
-private struct InspectorText: NSViewRepresentable {
+struct ReadOnlyText: NSViewRepresentable {
     let text: String
+    var identifier = "cell.value"
 
     func makeNSView(context: Context) -> NSScrollView {
         let scroll = NSScrollView()
@@ -165,7 +176,7 @@ private struct InspectorText: NSViewRepresentable {
         view.isVerticallyResizable = true
         view.autoresizingMask = [.width]
         view.textContainer?.widthTracksTextView = true
-        view.setAccessibilityIdentifier("cell.value")
+        view.setAccessibilityIdentifier(identifier)
         scroll.documentView = view
         return scroll
     }

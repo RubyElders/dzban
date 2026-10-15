@@ -7,6 +7,8 @@ struct ResultTable: NSViewRepresentable {
     let inspect: () -> Void
     let copy: () -> Void
     let cancel: () -> Bool
+    let peek: () -> Void
+    let releasePeek: (UInt64) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(model: model) }
     func sizeThatFits(_ proposal: ProposedViewSize, nsView: NSScrollView, context: Context) -> CGSize? {
@@ -48,6 +50,8 @@ struct ResultTable: NSViewRepresentable {
         table.inspectCell = inspect
         table.copyCell = copy
         table.cancelQuery = cancel
+        table.peekRow = peek
+        table.releaseRow = releasePeek
         table.selectCell = { [weak coordinator] row, column in coordinator?.model.select(row: row, column: column) }
         table.canCopy = model.selected != nil
         coordinator.applying = true
@@ -77,6 +81,7 @@ struct ResultTable: NSViewRepresentable {
 
     static func dismantleNSView(_ scroll: NSScrollView, coordinator: Coordinator) {
         NotificationCenter.default.removeObserver(coordinator)
+        coordinator.table?.resetPeek()
         coordinator.table?.delegate = nil
         coordinator.table?.dataSource = nil
     }
@@ -230,6 +235,36 @@ final class NativeResultTable: NSTableView {
     override func accessibilityRowCount() -> Int { numberOfRows }
     override func accessibilityColumnCount() -> Int { numberOfColumns }
 
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        NotificationCenter.default.removeObserver(self, name: NSApplication.didResignActiveNotification, object: nil)
+        if window != nil { NotificationCenter.default.addObserver(self, selector: #selector(resetPhysicalPeek), name: NSApplication.didResignActiveNotification, object: nil) }
+    }
+    @objc private func resetPhysicalPeek() { resetPeek() }
+    private var peekMonitor: Any?
+    private var peekStarted: TimeInterval?
+    var peekRow: (() -> Void)?
+    var releaseRow: ((UInt64) -> Void)?
+    func resetPeek() {
+        if let peekMonitor { NSEvent.removeMonitor(peekMonitor) }
+        peekMonitor = nil
+        peekStarted = nil
+    }
+    private struct PeekEventResult: @unchecked Sendable { let event: NSEvent? }
+    private func beginPeek(_ event: NSEvent) {
+        guard peekStarted == nil else { return }
+        peekStarted = event.timestamp
+        peekRow?()
+        peekMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp]) { [weak self] event in
+            MainActor.assumeIsolated {
+                guard let self, event.keyCode == 49, let start = self.peekStarted else { return PeekEventResult(event: event) }
+                if event.type == .keyDown { return PeekEventResult(event: nil) }
+                self.releaseRow?(UInt64(max(0, event.timestamp - start) * 1000))
+                self.resetPeek()
+                return PeekEventResult(event: nil)
+            }.event
+        }
+    }
     var focusedColumn = 0
     var canCopy = false
     var selectCell: ((Int, Int) -> Void)?
@@ -246,6 +281,7 @@ final class NativeResultTable: NSTableView {
     }
     override func keyDown(with event: NSEvent) {
         let plain = event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty
+        if plain && event.keyCode == 49, canCopy { if !event.isARepeat { beginPeek(event) }; return }
         if plain && event.keyCode == 53, cancelQuery?() == true { return }
         if plain && (event.keyCode == 36 || event.keyCode == 76), canCopy { inspectCell?(); return }
         if plain && (event.keyCode == 123 || event.keyCode == 124), selectedRow >= 0, numberOfColumns > 0 {

@@ -261,3 +261,118 @@ fn viewport_previews_bound_huge_cells_and_close_drains_admitted_reads() {
     );
     assert!(dzban_release(app));
 }
+
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn catalog_bridge_preserves_typed_identity_nulls_and_capability_filtering() {
+    let app = dzban_macos_bridge::dzban_create_fixture();
+    let session = request(app, json!({"command":"connect","profile":"fixture"}))["session"].clone();
+    let actions = request(app, json!({"command":"actions","session":session}));
+    let ids: Vec<_> = actions["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|action| action["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&"catalog.list.table"));
+    assert!(ids.contains(&"catalog.describe.table"));
+    assert!(!ids.contains(&"catalog.list.schema"));
+    let entries = request(
+        app,
+        json!({"command":"catalog","session":session,"request":{"operation":"list","kind":"table"}}),
+    );
+    let entry = &entries["entries"][0];
+    assert_eq!(entry["identity"]["name"], "žluť table");
+    assert_eq!(entry["attributes"]["comment"], Value::Null);
+    let described = request(
+        app,
+        json!({"command":"catalog","session":session,"request":{"operation":"describe","object":entry["identity"],"full":true}}),
+    );
+    assert_eq!(described["entries"][0]["identity"], entry["identity"]);
+    assert_eq!(described["entries"][0]["attributes"]["column_name"], "id");
+    let unsupported = request(
+        app,
+        json!({"command":"catalog","session":session,"request":{"operation":"list","kind":"schema"}}),
+    );
+    assert_eq!(unsupported["failure"]["kind"], "catalog_unsupported");
+    assert!(
+        unsupported["failure"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Unsupported")
+    );
+    request(app, json!({"command":"shutdown"}));
+    assert!(dzban_release(app));
+}
+
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn native_peek_surfaces_share_tap_hold_pin_and_focus_reset_policy() {
+    let app = dzban_macos_bridge::dzban_create_fixture();
+    let session = request(app, json!({"command":"connect","profile":"fixture"}))["session"].clone();
+    for surface in ["plan", "row"] {
+        let event = |event: &str, elapsed: u64| {
+            request(
+                app,
+                json!({"command":"peek","session":session,"surface":surface,"event":event,"elapsed_ms":elapsed}),
+            )
+        };
+        assert_eq!(event("show", 0)["visible"], true);
+        assert_eq!(event("release", 10)["pinned"], true);
+        assert_eq!(event("reset", 0)["visible"], true);
+        assert_eq!(event("close", 0)["visible"], false);
+        event("show", 0);
+        assert_eq!(event("release", 250)["visible"], false);
+        event("show", 0);
+        assert_eq!(event("reset", 0)["visible"], false);
+        assert_eq!(event("open", 0)["pinned"], true);
+        event("close", 0);
+    }
+    request(app, json!({"command":"shutdown"}));
+    assert!(dzban_release(app));
+}
+
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn preview_intent_tombstones_reject_late_admission_and_old_cancellation() {
+    let app = dzban_macos_bridge::dzban_create_fixture();
+    let session = request(app, json!({"command":"connect","profile":"fixture"}))["session"].clone();
+    let document =
+        request(app, json!({"command":"open_document","session":session}))["document"].clone();
+    let snapshot = request(
+        app,
+        json!({"command":"set_draft","session":session,"document":document,"draft":"SELECT 1; SELECT 2"}),
+    );
+    let revision = &snapshot["draft_revision"];
+    request(
+        app,
+        json!({"command":"cancel_preview","session":session,"request_revision":10}),
+    );
+    let preview = |intent| json!({"command":"preview","session":session,"document":document,"sql":"SELECT 1; SELECT 2","revision":revision,"start":1,"end":1,"request_revision":intent});
+    assert_eq!(
+        request(app, preview(9))["failure"]["kind"],
+        "preview_invalidated"
+    );
+    assert_eq!(
+        request(app, preview(11))["plan"]["document"]["sql"],
+        "SELECT 1"
+    );
+    assert_eq!(
+        request(
+            app,
+            json!({"command":"cancel_preview","session":session,"request_revision":10})
+        )["failure"]["kind"],
+        "preview_invalidated"
+    );
+    let context = request(
+        app,
+        json!({"command":"context_changed","session":session,"document":document}),
+    );
+    assert!(context["draft_revision"].as_u64().unwrap() > revision.as_u64().unwrap());
+    assert_eq!(
+        request(app, preview(12))["failure"]["kind"],
+        "preview_invalidated"
+    );
+    request(app, json!({"command":"shutdown"}));
+    assert!(dzban_release(app));
+}

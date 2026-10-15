@@ -3,6 +3,7 @@ import SwiftUI
 
 public struct RootView: View {
     @ObservedObject var store: ApplicationStore
+    @State private var catalogSession: UUID?
 
     public init(store: ApplicationStore) { self.store = store }
 
@@ -50,11 +51,18 @@ public struct RootView: View {
             }
             .disabled(!store.navigationAvailable || store.controls?.primaryAction == "unavailable" || store.controls?.primaryAction == "stopping" || store.selectedSession == nil)
             .accessibilityIdentifier("query.primary")
+            PlanPreviewButton(store: store)
+            Button("Catalog") { catalogSession = store.selectedSession }
+                .disabled(store.selectedSession == nil || !store.navigationAvailable)
+                .accessibilityIdentifier("catalog.open")
             Button { Task { await store.newDocument() } } label: {
                 Label("New Query", systemImage: "plus")
             }
             .disabled(store.selectedSession == nil || !store.navigationAvailable)
             .accessibilityIdentifier("query.new")
+        }
+        .sheet(isPresented: Binding(get: { catalogSession != nil }, set: { if !$0 { catalogSession = nil } })) {
+            if let session = catalogSession { CatalogBrowser(bridge: store.bridge, session: session) }
         }
         .alert("Dzban", isPresented: Binding(get: { store.failure != nil }, set: { if !$0 { store.failure = nil } })) {
             Button("OK") { store.failure = nil }
@@ -123,6 +131,8 @@ public struct RootView: View {
                     VSplitView {
                         SQLEditor(buffer: store.editor(for: document), editable: store.navigationAvailable, changed: { [weak store] in
                             store?.editorChanged(session: workspace.id, document: document.document)
+                        }, contextChanged: { [weak store] in
+                            store?.editorContextChanged(session: workspace.id, document: document.document)
                         }, action: { [weak store] intent in
                             guard let store else { return false }
                             if intent == .cancel && store.controls?.primaryAction != "stop" { return false }
@@ -131,7 +141,7 @@ public struct RootView: View {
                         })
                         .id(document.document)
                         .frame(minHeight: 120, idealHeight: 220)
-                        ResultPanel(model: store.results, session: workspace.id, document: document, cancel: { [weak store] in
+                        ResultPanel(model: store.results, bridge: store.bridge, session: workspace.id, document: document, cancel: { [weak store] in
                             guard let store, store.controls?.primaryAction == "stop" else { return false }
                             store.sendEditorIntent(.cancel)
                             return true

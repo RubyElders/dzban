@@ -1,3 +1,4 @@
+mod catalog;
 mod editor;
 #[cfg(feature = "test-fixtures")]
 mod fixture;

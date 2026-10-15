@@ -11,6 +11,7 @@ public struct Workspace: Identifiable {
 
 @MainActor
 public final class ApplicationStore: ObservableObject {
+    @Published public private(set) var backendActions: [BackendActions.Action] = []
     @Published public private(set) var profiles: [Profiles.Profile] = []
     @Published public private(set) var workspaces: [Workspace] = []
     @Published public private(set) var selectedSession: UUID?
@@ -23,6 +24,7 @@ public final class ApplicationStore: ObservableObject {
 
     public let bridge: Bridge
     public let results: ResultViewport
+    public let plan: PlanPreviewModel
     #if DZBAN_TEST_FIXTURES
     let responsiveness = MainThreadProbe()
     #endif
@@ -31,12 +33,16 @@ public final class ApplicationStore: ObservableObject {
     private var navigationRevision: UInt64 = 0
     private var documentRevisions: [UUID: UInt64] = [:]
     private var observations: [UUID: Task<Void, Never>] = [:]
+    private var controlObservation: Task<Void, Never>?
     private var shutdownTask: Task<Void, Error>?
     private var editors: [UUID: EditorBuffer] = [:]
+    private var contextWorkers: [UUID: Task<Void, Never>] = [:]
+    private var contextVersions: [UUID: UInt64] = [:]
     private var draftWorkers: [UUID: Task<Void, Never>] = [:]
 
     public init(bridge: Bridge, resultSource: (any ResultSource)? = nil) {
         self.bridge = bridge
+        plan = PlanPreviewModel(bridge: bridge)
         results = ResultViewport(source: resultSource ?? BridgeResultSource(bridge: bridge))
     }
 
@@ -45,6 +51,7 @@ public final class ApplicationStore: ObservableObject {
         guard let workspace else { return nil }
         return workspace.documents.first { $0.document == workspace.selectedDocument }
     }
+    public var canPreview: Bool { navigationAvailable && controls?.primaryAction == "run" && backendActions.contains { $0.id == "query.plan" } }
     public var navigationAvailable: Bool { closingSession == nil && !isShuttingDown && !isClosed }
 
     public func editor(for document: DocumentSnapshot) -> EditorBuffer {
@@ -54,7 +61,26 @@ public final class ApplicationStore: ObservableObject {
         return editor
     }
 
+    public func editorContextChanged(session: UUID, document: UUID) {
+        guard navigationAvailable, editors[document] != nil else { return }
+        plan.dismiss()
+        contextVersions[document, default: 0] &+= 1
+        guard contextWorkers[document] == nil else { return }
+        contextWorkers[document] = Task { [weak self, bridge] in
+            defer { self?.contextWorkers[document] = nil }
+            while let self, self.editors[document] != nil {
+                let version = self.contextVersions[document]
+                do {
+                    let snapshot = try await bridge.request(.contextChanged(session: session, document: document), as: DocumentSnapshot.self)
+                    self.apply(snapshot, session: session)
+                } catch { self.show(error); return }
+                if self.contextVersions[document] == version { return }
+            }
+        }
+    }
+
     public func editorChanged(session: UUID, document: UUID) {
+        plan.dismiss()
         guard let editor = editors[document], draftWorkers[document] == nil else { return }
         draftWorkers[document] = Task { [weak self, editor, bridge] in
             defer { self?.draftWorkers[document] = nil }
@@ -72,11 +98,13 @@ public final class ApplicationStore: ObservableObject {
 
     public func sendEditorIntent(_ intent: EditorIntent, session: UUID? = nil, document: UUID? = nil) {
         guard let command = editorCommand(intent, session: session, document: document) else { return }
+        if intent != .reset { plan.dismiss() }
         Task { await performEditorCommand(command) }
     }
 
     public func performEditorIntent(_ intent: EditorIntent, session: UUID? = nil, document: UUID? = nil) async {
         guard let command = editorCommand(intent, session: session, document: document) else { return }
+        if intent != .reset { plan.dismiss() }
         await performEditorCommand(command)
     }
 
@@ -97,6 +125,19 @@ public final class ApplicationStore: ObservableObject {
         } catch { show(error) }
     }
 
+    public func previewCurrent(pinned: Bool = false) async {
+        guard canPreview, let session = selectedSession, let document else { return }
+        let editor = editor(for: document)
+        guard !editor.textView.hasMarkedText() else { return }
+        let text = editor.text
+        let selection = editor.scalarSelection
+        await draftWorkers[document.document]?.value
+        await contextWorkers[document.document]?.value
+        guard !Task.isCancelled, selectedSession == session, self.document?.document == document.document, editor.text == text,
+              let current = self.document else { return }
+        await plan.show(session: session, document: current, text: text, selection: selection, pinned: pinned)
+    }
+
     public func loadProfiles() async {
         do { profiles = try await bridge.request(.profiles, as: Profiles.self).profiles }
         catch { show(error) }
@@ -110,7 +151,9 @@ public final class ApplicationStore: ObservableObject {
         let revision = navigationRevision
         connectionIntent = intent
         pendingProfile = profile
+        controlObservation?.cancel()
         selectedSession = nil
+        backendActions = []
         controls = nil
         defer { pendingProfile = nil }
         do {
@@ -128,6 +171,8 @@ public final class ApplicationStore: ObservableObject {
             workspaces.append(Workspace(id: connection.session, profile: profile, documents: [], selectedDocument: nil))
             selectedSession = connection.session
             await newDocument()
+            observeControls(session: connection.session)
+            await refreshActions(session: connection.session)
             await refreshControls()
             return true
         } catch {
@@ -137,11 +182,14 @@ public final class ApplicationStore: ObservableObject {
     }
 
     public func chooseConnections() async {
+        plan.dismiss()
         guard navigationAvailable else { return }
         connectionIntent = nil
         navigationRevision += 1
         let revision = navigationRevision
+        controlObservation?.cancel()
         selectedSession = nil
+        backendActions = []
         controls = nil
         controlRevision &+= 1
         do { let _: Controls = try await bridge.request(.selectSession(nil, revision: revision), as: Controls.self) }
@@ -149,19 +197,22 @@ public final class ApplicationStore: ObservableObject {
     }
 
     public func selectSession(_ session: UUID) async {
+        plan.dismiss()
         guard navigationAvailable, workspaces.contains(where: { $0.id == session }) else { return }
         connectionIntent = nil
         navigationRevision += 1
         let revision = navigationRevision
         selectedSession = session
+        backendActions = []
         controls = nil
         do {
             let projection = try await bridge.request(.selectSession(session, revision: revision), as: Controls.self)
-            if navigationRevision == revision, selectedSession == session { controls = projection }
+            if navigationRevision == revision, selectedSession == session { controls = projection; observeControls(session: session); await refreshActions(session: session) }
         } catch { show(error) }
     }
 
     public func selectDocument(_ document: UUID) async {
+        plan.dismiss()
         guard navigationAvailable, let session = selectedSession else { return }
         documentRevisions[session, default: 0] += 1
         let revision = documentRevisions[session]!
@@ -175,6 +226,7 @@ public final class ApplicationStore: ObservableObject {
     }
 
     public func newDocument() async {
+        plan.dismiss()
         guard navigationAvailable, let session = selectedSession else { return }
         documentRevisions[session, default: 0] += 1
         let revision = documentRevisions[session]!
@@ -188,16 +240,19 @@ public final class ApplicationStore: ObservableObject {
     }
 
     public func closeDocument(_ document: UUID) async {
+        plan.dismiss()
         guard navigationAvailable, let session = selectedSession else { return }
         closingSession = session
         defer { closingSession = nil }
         do {
             await draftWorkers[document]?.value
+            await contextWorkers[document]?.value
             let result = try await bridge.request(.closeDocument(session: session, document: document), as: DocumentClose.self)
             if result.workspaceClosed { removeWorkspace(session) }
             else if let index = workspaces.firstIndex(where: { $0.id == session }) {
                 observations.removeValue(forKey: document)?.cancel()
                 editors.removeValue(forKey: document)?.retire()
+                contextVersions.removeValue(forKey: document)
                 if results.scope?.document == document { results.retire() }
                 workspaces[index].documents.removeAll { $0.document == document }
                 workspaces[index].selectedDocument = result.selected?.document
@@ -215,10 +270,31 @@ public final class ApplicationStore: ObservableObject {
             struct Closed: Decodable, Sendable { let closed: UUID }
             for document in workspaces.first(where: { $0.id == session })?.documents ?? [] {
                 await draftWorkers[document.document]?.value
+                await contextWorkers[document.document]?.value
             }
             let _: Closed = try await bridge.request(.closeSession(session: session), as: Closed.self)
             removeWorkspace(session)
             await refreshControls()
+        } catch { show(error) }
+    }
+
+    private func observeControls(session: UUID) {
+        controlObservation?.cancel()
+        controlObservation = Task { [weak self, bridge] in
+            do {
+                let stream = try await bridge.observeControls(session: session)
+                for try await projection in stream {
+                    guard !Task.isCancelled, let self else { return }
+                    if self.selectedSession == session, projection.session == session { self.controlRevision &+= 1; self.controls = projection }
+                }
+            } catch { if let self, !self.isClosed, !(error is CancellationError) { self.show(error) } }
+        }
+    }
+
+    private func refreshActions(session: UUID) async {
+        do {
+            let response = try await bridge.request(.actions(session: session), as: BackendActions.self)
+            if selectedSession == session, response.session == session { backendActions = response.actions }
         } catch { show(error) }
     }
 
@@ -238,7 +314,7 @@ public final class ApplicationStore: ObservableObject {
         if isClosed { return }
         if let shutdownTask { try await shutdownTask.value; return }
         isShuttingDown = true
-        let pendingDrafts = Array(draftWorkers.values)
+        let pendingDrafts = Array(draftWorkers.values) + Array(contextWorkers.values)
         let task = Task { [bridge] in
             for worker in pendingDrafts { await worker.value }
             try await bridge.shutdown()
@@ -247,10 +323,13 @@ public final class ApplicationStore: ObservableObject {
         defer { shutdownTask = nil; isShuttingDown = false }
         do {
             try await task.value
+            plan.dismiss()
             results.retire()
             #if DZBAN_TEST_FIXTURES
             responsiveness.stop()
             #endif
+            controlObservation?.cancel()
+            controlObservation = nil
             isClosed = true
             for task in observations.values { task.cancel() }
             observations.removeAll()
@@ -286,11 +365,13 @@ public final class ApplicationStore: ObservableObject {
     }
 
     private func removeWorkspace(_ session: UUID) {
+        if selectedSession == session { plan.dismiss(); controlObservation?.cancel(); controlObservation = nil; backendActions = [] }
         if results.scope?.session == session { results.retire() }
         if let workspace = workspaces.first(where: { $0.id == session }) {
             for document in workspace.documents {
                 observations.removeValue(forKey: document.document)?.cancel()
                 editors.removeValue(forKey: document.document)?.retire()
+                contextVersions.removeValue(forKey: document.document)
             }
         }
         workspaces.removeAll { $0.id == session }

@@ -37,9 +37,19 @@ pub enum Command {
         document: Uuid,
         sql: String,
         revision: u64,
+        start: Option<usize>,
+        end: Option<usize>,
+        request_revision: Option<u64>,
+    },
+    Peek {
+        session: Uuid,
+        surface: crate::catalog::Surface,
+        event: crate::catalog::PeekEvent,
+        elapsed_ms: Option<u64>,
     },
     CancelPreview {
         session: Uuid,
+        request_revision: Option<u64>,
     },
     History {
         session: Uuid,
@@ -51,6 +61,16 @@ pub enum Command {
         revision: Option<u64>,
     },
     Controls {},
+    ObserveControls {
+        session: Uuid,
+    },
+    Actions {
+        session: Uuid,
+    },
+    Catalog {
+        session: Uuid,
+        request: crate::catalog::Request,
+    },
     EditorAction {
         session: Uuid,
         document: Uuid,
@@ -75,6 +95,10 @@ pub enum Command {
     OpenDocument {
         session: Uuid,
         revision: Option<u64>,
+    },
+    ContextChanged {
+        session: Uuid,
+        document: Uuid,
     },
     SetDraft {
         session: Uuid,
@@ -141,6 +165,8 @@ struct Workspace {
     preview: PlanPreviewService,
     profile: String,
     selection_revision: u64,
+    peeks: [dzban_core::preview::PeekState; 2],
+    preview_revision: u64,
 }
 
 #[derive(Default)]
@@ -244,6 +270,18 @@ impl App {
         let runtime = self.runtime.as_ref().expect("live app has a runtime");
         let state = self.state.clone();
         let lifetime = self.clone();
+        if let Command::ObserveControls { session } = command {
+            let mut observers = self.state.observers.lock().unwrap();
+            if *self.state.context.subscribe_phase().borrow() != ApplicationPhase::Running {
+                output.publish(failure("closed", "Application is closing"));
+                return;
+            }
+            observers.retain(|observer| !observer.task.is_finished());
+            let stream = Arc::downgrade(&output);
+            let task = runtime.spawn(async move { state.observe_controls(session, output).await });
+            observers.push(Observer { stream, task });
+            return;
+        }
         if let Command::ObserveDocument { session, document } = command {
             let mut observers = self.state.observers.lock().unwrap();
             if *self.state.context.subscribe_phase().borrow() != ApplicationPhase::Running {
@@ -471,6 +509,30 @@ impl State {
         .map_err(|_| failure("worker_failed", "History worker failed"))?
         .map_err(|error| failure("history", error))
     }
+    async fn observe_controls(&self, session: Uuid, stream: Arc<Stream>) {
+        let engine = self
+            .workspaces
+            .lock()
+            .unwrap()
+            .get(&SessionId(session))
+            .map(|workspace| workspace.engine.clone());
+        let Some(engine) = engine else {
+            stream.publish(failure("unknown_session", "Session is not open"));
+            return;
+        };
+        let mut operation = engine.subscribe_operation();
+        let mut query = engine.subscribe();
+        let mut lifecycle = engine.subscribe_session();
+        loop {
+            stream.publish(self.controls());
+            tokio::select! {
+                _ = stream.closed() => break,
+                changed = operation.changed() => if changed.is_err() { break; },
+                changed = query.changed() => if changed.is_err() { break; },
+                changed = lifecycle.changed() => if changed.is_err() { break; },
+            }
+        }
+    }
     async fn observe_document(&self, session: Uuid, document: Uuid, stream: Arc<Stream>) {
         let document = match self.document(session, document) {
             Ok((_, document)) => document,
@@ -548,6 +610,39 @@ impl State {
                 )
             }
             Command::Controls {} => Ok(self.controls()),
+            Command::Actions { session } => {
+                let engine = self
+                    .workspaces
+                    .lock()
+                    .unwrap()
+                    .get(&SessionId(session))
+                    .map(|workspace| workspace.engine.clone())
+                    .ok_or_else(|| failure("unknown_session", "Session is not open"))?;
+                let registry = engine
+                    .action_registry()
+                    .map_err(|error| failure("actions", error.to_string()))?;
+                let capabilities = engine.capabilities();
+                let actions: Vec<_> = registry
+                    .available(&capabilities)
+                    .map(crate::catalog::action)
+                    .collect();
+                Ok(json!({"session":session,"actions":actions}))
+            }
+            Command::Catalog { session, request } => {
+                let engine = self
+                    .workspaces
+                    .lock()
+                    .unwrap()
+                    .get(&SessionId(session))
+                    .map(|workspace| workspace.engine.clone())
+                    .ok_or_else(|| failure("unknown_session", "Session is not open"))?;
+                let entries = engine
+                    .catalog(request.core())
+                    .await
+                    .map_err(crate::catalog::error)?;
+                let entries: Vec<_> = entries.iter().map(crate::catalog::entry).collect();
+                Ok(json!({"session":session,"entries":entries}))
+            }
             Command::EditorAction {
                 session,
                 document,
@@ -705,6 +800,8 @@ impl State {
                         engine,
                         documents: QueryDocuments::default(),
                         preview: PlanPreviewService::default(),
+                        peeks: Default::default(),
+                        preview_revision: 0,
                         profile: profile_name,
                         selection_revision: 0,
                     },
@@ -727,6 +824,11 @@ impl State {
                 }
                 Ok(document_snapshot(&document))
             }
+            Command::ContextChanged { session, document } => {
+                let (_, document) = self.document(session, document)?;
+                document.query_context_changed();
+                Ok(document_snapshot(&document))
+            }
             Command::SetDraft {
                 session,
                 document,
@@ -736,7 +838,7 @@ impl State {
                 document.set_draft(draft);
                 Ok(document_snapshot(&document))
             }
-            Command::ObserveDocument { .. } => Err(failure(
+            Command::ObserveDocument { .. } | Command::ObserveControls { .. } => Err(failure(
                 "invalid_command",
                 "Observation must use a streaming response",
             )),
@@ -871,11 +973,62 @@ impl State {
                 let history = self.history(session).await?;
                 Ok(json!({"entries": history.entries()}))
             }
-            Command::CancelPreview { session } => {
-                let workspaces = self.workspaces.lock().unwrap();
+            Command::Peek {
+                session,
+                surface,
+                event,
+                elapsed_ms,
+            } => {
+                let mut workspaces = self.workspaces.lock().unwrap();
                 let workspace = workspaces
-                    .get(&SessionId(session))
+                    .get_mut(&SessionId(session))
                     .ok_or_else(|| failure("unknown_session", "Session is not open"))?;
+                let state = &mut workspace.peeks[match surface {
+                    crate::catalog::Surface::Plan => 0,
+                    crate::catalog::Surface::Row => 1,
+                }];
+                use crate::catalog::PeekEvent;
+                match event {
+                    PeekEvent::Show => state.show_transient(),
+                    PeekEvent::Open => {
+                        state.show_transient();
+                        state.pin();
+                    }
+                    PeekEvent::Pin => {
+                        state.pin();
+                    }
+                    PeekEvent::Close => {
+                        state.close();
+                    }
+                    PeekEvent::Release => match dzban_core::preview::preview_release(
+                        std::time::Duration::from_millis(elapsed_ms.unwrap_or(0)),
+                    ) {
+                        dzban_core::preview::PreviewRelease::Pin => {
+                            state.pin();
+                        }
+                        dzban_core::preview::PreviewRelease::Hide => state.hide_transient(),
+                    },
+                    PeekEvent::Reset => state.hide_transient(),
+                }
+                Ok(json!({"visible":state.is_visible(), "pinned":state.is_pinned()}))
+            }
+            Command::CancelPreview {
+                session,
+                request_revision,
+            } => {
+                let mut workspaces = self.workspaces.lock().unwrap();
+                let workspace = workspaces
+                    .get_mut(&SessionId(session))
+                    .ok_or_else(|| failure("unknown_session", "Session is not open"))?;
+                if let Some(revision) = request_revision {
+                    if revision < workspace.preview_revision {
+                        return Err(failure(
+                            "preview_invalidated",
+                            "A newer preview intent is active",
+                        ));
+                    }
+                    workspace.preview_revision = revision;
+                }
                 workspace.preview.cancel();
                 Ok(json!({"preview_canceled":true}))
             }
@@ -884,22 +1037,53 @@ impl State {
                 document,
                 sql,
                 revision,
+                start,
+                end,
+                request_revision,
             } => {
+                let sql = match (start, end) {
+                    (Some(start), Some(end)) => selected_sql(&sql, start, end)
+                        .map_err(|message| failure("selection", message))?,
+                    (None, None) => sql,
+                    _ => return Err(failure("selection", "Both selection bounds are required")),
+                };
                 let (engine, document) = self.document(session, document)?;
                 if document.snapshot().draft_revision != revision {
                     return Err(failure("preview_invalidated", "Draft revision has changed"));
                 }
-                let service = self
-                    .workspaces
-                    .lock()
-                    .unwrap()
-                    .get(&SessionId(session))
-                    .map(|workspace| workspace.preview.clone())
-                    .ok_or_else(|| failure("unknown_session", "Session is not open"))?;
-                let mut updates = service.subscribe();
-                let target = service
-                    .schedule(engine, document.clone(), sql, PREVIEW_DELAY)
-                    .map_err(execution_error)?;
+                let (service, target, mut updates) = {
+                    let selection = self.selection.lock().unwrap();
+                    if request_revision.is_some()
+                        && selection.connection != ConnectionSelection::Ready(SessionId(session))
+                    {
+                        return Err(failure(
+                            "preview_invalidated",
+                            "Workspace is no longer selected",
+                        ));
+                    }
+                    let mut workspaces = self.workspaces.lock().unwrap();
+                    let workspace = workspaces
+                        .get_mut(&SessionId(session))
+                        .ok_or_else(|| failure("unknown_session", "Session is not open"))?;
+                    if let Some(revision) = request_revision {
+                        if revision < workspace.preview_revision
+                            || workspace.documents.selected().map(|document| document.id())
+                                != Some(document.id())
+                        {
+                            return Err(failure(
+                                "preview_invalidated",
+                                "A newer preview context is active",
+                            ));
+                        }
+                        workspace.preview_revision = revision;
+                    }
+                    let service = workspace.preview.clone();
+                    let updates = service.subscribe();
+                    let target = service
+                        .schedule(engine, document.clone(), sql, PREVIEW_DELAY)
+                        .map_err(execution_error)?;
+                    (service, target, updates)
+                };
                 loop {
                     let snapshot = updates.borrow_and_update().clone();
                     if snapshot.target != Some(target)

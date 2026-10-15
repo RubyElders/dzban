@@ -20,6 +20,9 @@ public struct NativeCommands: Commands {
             }
             .keyboardShortcut(.return, modifiers: .command)
             .disabled(!store.navigationAvailable || store.controls?.primaryAction != "run")
+            Button("Preview Query Plan") { Task { await store.previewCurrent(pinned: true) } }
+                .keyboardShortcut("p", modifiers: [.command, .shift])
+                .disabled(!store.canPreview)
             Button("Cancel Query") { store.sendEditorIntent(.cancel) }
                 .disabled(!store.navigationAvailable || store.controls?.primaryAction != "stop")
         }
