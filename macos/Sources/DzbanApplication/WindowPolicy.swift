@@ -50,7 +50,14 @@ struct WindowPolicy: NSViewRepresentable {
             }
         }
         private func handle(_ event: NSEvent) -> NSEvent? {
-            guard let store, event.keyCode == 35 else { return event }
+            guard let store else { return event }
+            if event.type == .keyDown, event.window == window, window?.attachedSheet == nil,
+               event.keyCode == 13, event.modifierFlags.intersection([.command, .control, .option, .shift]) == .command,
+               let document = store.document {
+                if !event.isARepeat { Task { await store.closeDocument(document.document) } }
+                return nil
+            }
+            guard event.keyCode == 35 else { return event }
             if event.type == .keyUp, let pressed = previewPressed {
                 previewPressed = nil
                 let elapsed = UInt64(max(0, event.timestamp - pressed) * 1000)
