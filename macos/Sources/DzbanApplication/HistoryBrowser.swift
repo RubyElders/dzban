@@ -37,11 +37,12 @@ struct HistoryBrowser: View {
     @ObservedObject var store: ApplicationStore
     @StateObject private var model: HistoryBrowserModel
     let session: UUID
+    let close: () -> Void
     @State private var restoring = false
-    @Environment(\.dismiss) private var dismiss
-    init(store: ApplicationStore, session: UUID) {
+    init(store: ApplicationStore, session: UUID, close: @escaping () -> Void) {
         self.store = store
         self.session = session
+        self.close = close
         _model = StateObject(wrappedValue: HistoryBrowserModel(bridge: store.bridge))
     }
     var body: some View {
@@ -50,7 +51,7 @@ struct HistoryBrowser: View {
                 Text("Query History").font(.headline)
                 Spacer()
                 Button("Refresh") { model.refresh(session: session) }.disabled(model.loading || restoring).accessibilityIdentifier("history.refresh")
-                Button("Close") { dismiss() }.keyboardShortcut(.cancelAction).accessibilityIdentifier("history.close")
+                Button("Close", action: close).accessibilityIdentifier("history.close")
             }
             if model.loading || restoring { ProgressView(model.loading ? "Loading history" : "Restoring query") }
             if let failure = model.failure { Text(failure).foregroundStyle(.red).textSelection(.enabled).accessibilityIdentifier("history.error") }
@@ -58,28 +59,26 @@ struct HistoryBrowser: View {
                 HStack(alignment: .top) {
                     VStack(alignment: .leading, spacing: 4) {
                         Text(entry.sqlPreview).font(.system(.body, design: .monospaced)).lineLimit(3)
-                        HStack {
-                            Text(Date(timeIntervalSince1970: Double(entry.executedAt)), style: .date)
-                            Text(entry.status == "success" ? "Succeeded" : "Failed")
-                            if let rows = entry.rows { Text("\(rows) rows") }
-                            if let duration = entry.durationMs { Text("\(duration) ms") }
-                        }.font(.caption).foregroundStyle(.secondary)
+                        Text(Date(timeIntervalSince1970: Double(entry.executedAt)), style: .date)
+                            .font(.caption).foregroundStyle(.secondary)
+                        Text(([entry.status == "success" ? "Succeeded" : "Failed"] + [entry.rows.map { "\($0) rows" }, entry.durationMs.map { "\($0) ms" }].compactMap { $0 }).joined(separator: " - "))
+                            .font(.caption).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                     Spacer()
                     Button("Restore") {
                         guard let revision = model.list?.revision else { return }
                         restoring = true
                         Task {
-                            let restored = await store.restoreHistory(session: session, revision: revision, index: entry.index)
+                            _ = await store.restoreHistory(session: session, revision: revision, index: entry.index)
                             restoring = false
-                            if restored { dismiss() }
                         }
                     }.disabled(restoring || model.loading).accessibilityIdentifier("history.restore.\(entry.index)")
                 }.padding(.vertical, 4)
             }.accessibilityIdentifier("history.entries")
             if model.list?.entries.isEmpty == true { Text("No saved queries").foregroundStyle(.secondary) }
             Text("Restore loads SQL and the saved result sample without running the query.").font(.caption).foregroundStyle(.secondary)
-        }.padding(20).frame(minWidth: 720, minHeight: 480)
+        }.padding(12).frame(minWidth: 240, minHeight: 180)
         .task(id: session) { model.refresh(session: session) }
         .onChange(of: store.document?.execution) { _, execution in if execution == "finished" { model.refresh(session: session) } }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in model.refresh(session: session) }
