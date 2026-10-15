@@ -29,7 +29,7 @@ remaining = list(Path(os.environ['TMPDIR']).glob('dzban-*'))
 assert not remaining, f'Bridge scenarios retained temporary artifacts: {remaining}'
 print('Bridge scenarios released temporary result and history artifacts')
 PY
-if swift -e 'import XCTest' >/dev/null 2>&1; then
+if xcrun --find xctest >/dev/null 2>&1; then
     swift test "${swift_arguments[@]}"
 else
     echo 'Skipped XCTest: full Xcode is required. Standalone Swift lifecycle scenarios ran.'

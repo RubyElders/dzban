@@ -4,7 +4,7 @@ The native frontend targets macOS 14 and later on Apple Silicon. It uses SwiftUI
 
 ## Toolchains
 
-Use Rust 1.98.1 for native development and Rust 1.88.0 for shared-code compatibility checks. The native Swift toolchain baseline is Swift 6.4. Native application development requires full Xcode with a compatible macOS SDK and Swift toolchain; record the exact Xcode version when native application validation becomes available. Command Line Tools alone can run shared Rust checks and Swift bridge tests but cannot run Xcode application schemes or XCUITest. Record `xcodebuild -version`, `swift --version`, and `rustc --version` with native validation results; an installed newer SDK does not change the deployment target.
+Use Rust 1.98.1 for native development and Rust 1.88.0 for shared-code compatibility checks. The native Swift toolchain baseline is Swift 6.4. Native application development uses Xcode 27.0 (build 27A266a) with Swift 6.4; full Xcode is required. Command Line Tools alone can run shared Rust checks and Swift bridge tests but cannot run Xcode application schemes or XCUITest. Record `xcodebuild -version`, `swift --version`, and `rustc --version` with native validation results; an installed newer SDK does not change the deployment target.
 
 Install the Rust toolchains with `rustup toolchain install 1.98.1 1.88.0 --profile minimal`. Select the installed Xcode using `xcode-select` before building the application. Build artifacts must remain in the repository's ignored `target/` directory.
 
@@ -24,6 +24,10 @@ The initial inspection passed shared core/adapter tests on Apple Silicon with Ru
 ## Application and distribution scope
 
 Run `bash scripts/test-macos-bridge.sh` to compile the Rust archive and verify its Swift consumer. The [bridge contract](macos-bridge.md) describes handle ownership, snapshot delivery, and the fixture lifecycle checks. Full Xcode enables the XCTest run; Command Line Tools can run the standalone Swift scenarios.
+
+Build the development application with `bash scripts/build-macos.sh`. The bundle is `target/macos-xcode/Build/Products/Debug/Dzban.app`; open it from Finder or with `open` after setting disposable configuration for testing. Its development identifier is `com.rubyelders.dzban.macos.dev`. The `--fixtures` build uses a separate `.fixtures` identifier and injected in-memory adapters. Both are locally signed development artifacts.
+
+Run `bash scripts/test-macos.sh` for the Rust bridge tests, standalone Swift scenarios, XCTest store/lifecycle tests, and native XCUITest shell workflows. Fixture connections use disposable history; the empty-configuration workflow explicitly uses `/dev/null`. UI test results are saved under `target/macos-ui-results.*`. XCUITest requires an interactive macOS session with automation available. The current shell provides connections, workspace/query navigation, native commands, and deferred close/quit; editing and results are subsequent batches.
 
 The first milestone covers connect, execute, streaming result pages, cancellation, and safe shutdown in a native window. The application must preserve core configuration/history formats and run without Homebrew or a repository working directory. Initial development retains existing XDG discovery semantics; do not silently migrate credentials or create a separate native history format.
 
