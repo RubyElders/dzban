@@ -10,7 +10,9 @@ use dzban_core::documents::{
 use dzban_core::error::ExecutionError;
 use dzban_core::execution::{QueryEngine, SessionId};
 use dzban_core::history::QueryHistoryStore;
-use dzban_core::interaction::{AppEvent, AppState, PrimaryAction, SessionInteraction};
+use dzban_core::interaction::{
+    AppCommand, AppEvent, AppState, InputRole, PrimaryAction, SessionInteraction,
+};
 use dzban_core::preview::{PREVIEW_DELAY, PlanPreviewService, PreviewPhase};
 use dzban_core::result_store::{MAX_PAGE_ROWS, ResultLimits};
 use dzban_core::result_stream::ResultPhase;
@@ -20,6 +22,7 @@ use serde_json::{Value, json};
 use tokio::runtime::Runtime;
 use uuid::Uuid;
 
+use crate::editor::{EditorIntent, selected_sql};
 use crate::transport::Stream;
 
 #[derive(Deserialize)]
@@ -46,6 +49,14 @@ pub enum Command {
         revision: Option<u64>,
     },
     Controls {},
+    EditorAction {
+        session: Uuid,
+        document: Uuid,
+        draft: String,
+        start: usize,
+        end: usize,
+        intent: EditorIntent,
+    },
     SelectDocument {
         session: Uuid,
         document: Uuid,
@@ -148,7 +159,7 @@ struct State {
     injected_config: bool,
     workspaces: Mutex<HashMap<SessionId, Workspace>>,
     observers: Mutex<Vec<Observer>>,
-    history_directory: Option<HistoryDirectory>,
+    history_directory: Mutex<Option<HistoryDirectory>>,
     selection: Mutex<NativeSelection>,
     interaction: Mutex<AppState>,
 }
@@ -196,7 +207,7 @@ impl App {
                 injected_config,
                 workspaces: Mutex::new(HashMap::new()),
                 observers: Mutex::new(Vec::new()),
-                history_directory: None,
+                history_directory: Mutex::new(None),
                 selection: Mutex::new(NativeSelection::default()),
                 interaction: Mutex::new(AppState::default()),
             }),
@@ -204,12 +215,10 @@ impl App {
     }
 
     #[cfg(feature = "test-fixtures")]
-    pub fn with_fixture_history(mut self) -> Result<Self, String> {
+    pub fn with_fixture_history(self) -> Result<Self, String> {
         let path = std::env::temp_dir().join(format!("dzban-bridge-history-{}", Uuid::new_v4()));
         std::fs::create_dir(&path).map_err(|error| error.to_string())?;
-        Arc::get_mut(&mut self.state)
-            .expect("new app has one state owner")
-            .history_directory = Some(HistoryDirectory(path));
+        *self.state.history_directory.lock().unwrap() = Some(HistoryDirectory(path));
         Ok(self)
     }
 
@@ -261,6 +270,116 @@ impl Drop for App {
 }
 
 impl State {
+    async fn submit(&self, session: Uuid, document: Uuid, sql: String) -> Result<Value, Value> {
+        let (engine, document) = self.document(session, document)?;
+        let history = self.history(session).await?;
+        let query = document
+            .submit(engine, sql, ResultLimits::default(), Some(history))
+            .map_err(execution_error)?;
+        let result = json!({"query": query.query.0, "document": query.document.0, "session": query.session.0, "generation": query.generation});
+        tokio::spawn(async move {
+            let _ = query.wait().await;
+        });
+        Ok(result)
+    }
+
+    async fn editor_action(
+        &self,
+        session: Uuid,
+        document: Uuid,
+        draft: String,
+        start: usize,
+        end: usize,
+        intent: EditorIntent,
+    ) -> Result<Value, Value> {
+        let (commands, active) = {
+            let selection = self.selection.lock().unwrap();
+            if selection.connection != ConnectionSelection::Ready(SessionId(session)) {
+                return Err(failure(
+                    "selection_superseded",
+                    "The workspace is no longer selected",
+                ));
+            }
+            let workspaces = self.workspaces.lock().unwrap();
+            let workspace = workspaces
+                .get(&SessionId(session))
+                .ok_or_else(|| failure("unknown_session", "Session is not open"))?;
+            if workspace.documents.selected().map(|value| value.id()) != Some(DocumentId(document))
+            {
+                return Err(failure(
+                    "selection_superseded",
+                    "The query is no longer selected",
+                ));
+            }
+            let active = workspace
+                .documents
+                .documents()
+                .iter()
+                .find(|document| document.is_active())
+                .cloned();
+            let mut interaction = self.interaction.lock().unwrap();
+            interaction.transition(AppEvent::SessionSelected(Some(
+                SessionInteraction::from_engine(&workspace.engine),
+            )));
+            let commands = match intent {
+                EditorIntent::Submit => {
+                    interaction.transition(AppEvent::KeyPressed {
+                        key: InputRole::PrimaryModifier,
+                        at_ms: 0,
+                    });
+                    let commands = interaction.transition(AppEvent::KeyPressed {
+                        key: InputRole::Submit,
+                        at_ms: 0,
+                    });
+                    interaction.transition(AppEvent::KeyReleased {
+                        key: InputRole::Submit,
+                        at_ms: 0,
+                    });
+                    interaction.transition(AppEvent::KeyReleased {
+                        key: InputRole::PrimaryModifier,
+                        at_ms: 0,
+                    });
+                    commands
+                }
+                EditorIntent::Primary => interaction.transition(AppEvent::PrimaryActionRequested),
+                EditorIntent::Cancel => interaction.transition(AppEvent::CancelRequested),
+                EditorIntent::Reset => interaction.transition(AppEvent::KeyboardReset),
+            };
+            (commands, active)
+        };
+        let mut submission = None;
+        let mut canceled = false;
+        for command in commands {
+            match command {
+                AppCommand::RunQuery => {
+                    let sql = selected_sql(&draft, start, end)
+                        .map_err(|message| failure("selection", message))?;
+                    submission = Some(self.submit(session, document, sql).await?);
+                }
+                AppCommand::CancelQuery => {
+                    if let Some(active) = &active {
+                        let (engine, _) = self.document(session, active.id().0)?;
+                        active
+                            .request_cancel(engine)
+                            .map_err(execution_error)?
+                            .wait()
+                            .await
+                            .map_err(execution_error)?;
+                        canceled = true;
+                    }
+                }
+                AppCommand::CancelPreview => {
+                    if let Some(workspace) =
+                        self.workspaces.lock().unwrap().get(&SessionId(session))
+                    {
+                        workspace.preview.cancel();
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(json!({"submission":submission, "cancellation_requested":canceled}))
+    }
     async fn close_session(&self, session: Uuid) -> Result<(), Value> {
         self.selection
             .lock()
@@ -318,8 +437,13 @@ impl State {
             .ok_or_else(|| failure("unknown_session", "Session is not open"))?;
         let path = self
             .history_directory
+            .lock()
+            .unwrap()
             .as_ref()
             .map(|directory| directory.0.join("history.json"));
+        if self.injected_config && path.is_none() {
+            return Err(failure("closed", "Fixture history is closed"));
+        }
         tokio::task::spawn_blocking(move || match path {
             Some(path) => QueryHistoryStore::load_from_path(path, &profile),
             None => QueryHistoryStore::load(&profile),
@@ -382,6 +506,17 @@ impl State {
             #[cfg(feature = "test-fixtures")]
             Command::TestPanic {} => panic!("Fixture bridge worker panic"),
             Command::Controls {} => Ok(self.controls()),
+            Command::EditorAction {
+                session,
+                document,
+                draft,
+                start,
+                end,
+                intent,
+            } => {
+                self.editor_action(session, document, draft, start, end, intent)
+                    .await
+            }
             Command::Connections {} => Ok(
                 json!({"connections":self.context.subscribe_pending_connections().borrow().iter().map(|snapshot|json!({"request":snapshot.request.0,"profile":snapshot.profile.0,"connecting":matches!(snapshot.phase,dzban_core::application::ConnectionPhase::Connecting)})).collect::<Vec<_>>()}),
             ),
@@ -566,18 +701,7 @@ impl State {
                 session,
                 document,
                 sql,
-            } => {
-                let (engine, document) = self.document(session, document)?;
-                let history = self.history(session).await?;
-                let query = document
-                    .submit(engine, sql, ResultLimits::default(), Some(history))
-                    .map_err(execution_error)?;
-                let result = json!({"query": query.query.0, "document": query.document.0, "session": query.session.0, "generation": query.generation});
-                tokio::spawn(async move {
-                    let _ = query.wait().await;
-                });
-                Ok(result)
-            }
+            } => self.submit(session, document, sql).await,
             Command::Cancel { session, document } => {
                 let (engine, document) = self.document(session, document)?;
                 document
@@ -767,6 +891,7 @@ impl State {
                     observer.task.abort();
                     let _ = observer.task.await;
                 }
+                self.history_directory.lock().unwrap().take();
                 Ok(json!({"shutdown": true}))
             }
         }

@@ -146,3 +146,58 @@ fn a_foreign_consumer_can_stream_detach_cancel_and_shutdown() {
     );
     assert!(dzban_release(app));
 }
+
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn editor_actions_select_unicode_sql_and_reject_invalid_or_stale_targets() {
+    let app = dzban_macos_bridge::dzban_create_fixture();
+    let connection = request(app, json!({"command":"connect", "profile":"fixture"}));
+    let session = &connection["session"];
+    let document =
+        request(app, json!({"command":"open_document", "session":session}))["document"].clone();
+    let draft = "SELECT '😀e\u{301}'; fail";
+    let start = draft[..draft.find("fail").unwrap()].chars().count();
+    let action = |start, end| json!({"command":"editor_action", "session":session, "document":document, "draft":draft, "start":start, "end":end, "intent":"submit"});
+    assert_eq!(
+        request(app, action(start, start + 4))["submission"]["generation"],
+        1
+    );
+    let observe = json!({"command":"observe_document", "session":session, "document":document});
+    let finished = |generation| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            assert!(std::time::Instant::now() < deadline);
+            let snapshot = request(app, observe.clone());
+            if snapshot["generation"] == generation && snapshot["execution"] == "finished" {
+                break snapshot;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    };
+    assert_eq!(finished(1)["error"]["Message"], "Fixture query failed");
+    assert_eq!(request(app, action(0, 0))["submission"]["generation"], 2);
+    assert_eq!(finished(2)["error"], Value::Null);
+    let history = request(app, json!({"command":"history", "session":session}));
+    assert!(
+        history["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["sql"] == "SELECT '😀e\u{301}'")
+    );
+    assert_eq!(
+        request(app, action(1000, 1000))["failure"]["kind"],
+        "selection"
+    );
+    assert_eq!(request(app, observe)["generation"], 2);
+    request(app, json!({"command":"select_session", "session":null}));
+    assert_eq!(
+        request(app, action(0, 0))["failure"]["kind"],
+        "selection_superseded"
+    );
+    assert_eq!(
+        request(app, json!({"command":"shutdown"}))["shutdown"],
+        true
+    );
+    assert!(dzban_release(app));
+}
