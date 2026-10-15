@@ -16,7 +16,7 @@ pub fn register() {
             .expect("Failed to register application resources");
     });
     let display = gtk4::gdk::Display::default().expect("GTK display is initialized");
-    gtk4::IconTheme::for_display(&display).add_resource_path("/com/fuga/dzban/icons");
+    gtk4::IconTheme::for_display(&display).add_resource_path("/com/rubyelders/dzban/icons");
 }
 
 pub fn database_backend(backend: DatabaseBackend) -> &'static str {
