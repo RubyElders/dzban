@@ -45,6 +45,37 @@ public struct DocumentSnapshot: Decodable, Sendable {
 public struct Connection: Decodable, Sendable {
     public let request: UUID
     public let session: UUID
+    public let selected: Bool
+}
+
+public struct Controls: Decodable, Sendable {
+    public let session: UUID?
+    public let query: UUID?
+    public let primaryAction: String
+}
+
+public struct Connections: Decodable, Sendable {
+    public struct Pending: Decodable, Sendable {
+        public let request: UUID
+        public let profile: String
+        public let connecting: Bool
+    }
+    public let connections: [Pending]
+}
+
+public struct Profiles: Decodable, Sendable {
+    public struct Profile: Decodable, Sendable, Identifiable {
+        public let name: String
+        public let backend: String
+        public var id: String { name }
+    }
+    public let profiles: [Profile]
+}
+
+public struct DocumentClose: Decodable, Sendable {
+    public let workspaceClosed: Bool
+    public let document: UUID
+    public let selected: DocumentSnapshot?
 }
 
 public struct Submission: Decodable, Sendable {
@@ -108,8 +139,11 @@ public struct BridgeCommand: Encodable, Sendable {
     var offset: Int?
     var revision: UInt64?
 
-    public static func connect(profile: String) -> Self { Self(command: "connect", profile: profile) }
-    public static func openDocument(session: UUID) -> Self { Self(command: "open_document", session: session) }
+    public static func connect(profile: String, revision: UInt64? = nil) -> Self { Self(command: "connect", profile: profile, revision: revision) }
+    public static func selectSession(_ session: UUID?, revision: UInt64? = nil) -> Self { Self(command: "select_session", session: session, revision: revision) }
+    public static func selectDocument(session: UUID, document: UUID, revision: UInt64? = nil) -> Self { Self(command: "select_document", session: session, document: document, revision: revision) }
+    public static func closeDocument(session: UUID, document: UUID) -> Self { Self(command: "close_document", session: session, document: document) }
+    public static func openDocument(session: UUID, revision: UInt64? = nil) -> Self { Self(command: "open_document", session: session, revision: revision) }
     public static func setDraft(session: UUID, document: UUID, draft: String) -> Self {
         Self(command: "set_draft", session: session, document: document, draft: draft)
     }
@@ -135,6 +169,8 @@ public struct BridgeCommand: Encodable, Sendable {
         Self(command: "read_cell", session: session, document: document, generation: generation, count: count, row: row, column: column, offset: offset)
     }
     public static let profiles = Self(command: "profiles")
+    public static let controls = Self(command: "controls")
+    public static let connections = Self(command: "connections")
     public static let shutdown = Self(command: "shutdown")
 }
 

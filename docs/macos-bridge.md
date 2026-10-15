@@ -23,8 +23,13 @@ Run `shutdown`, inspect its outcome, and then release the application. Releasing
 | Command | Inputs | Response |
 | --- | --- | --- |
 | `profiles` | None | Profile names/backend only; loads shared configuration off the caller thread |
-| `connect` | `profile` | Connection request and session UUIDs; requires profiles to be loaded |
-| `open_document` | `session` | Initial document snapshot |
+| `connect` | `profile`, optional navigation `revision` | Connection request/session UUIDs and whether selection accepted completion; requires profiles to be loaded |
+| `connections` | None | Shared connection-request identities, profiles, and pending state |
+| `select_session` | Optional `session`, navigation `revision` | Shared interaction projection; null session shows the connection chooser |
+| `controls` | None | Selected session/query identities and shared primary action |
+| `open_document` | `session`, optional selection `revision` | Initial document snapshot |
+| `select_document` | `session`, `document`, optional selection `revision` | Selected document snapshot; older selection revisions are rejected |
+| `close_document` | `session`, `document` | Selected replacement snapshot or workspace-closed acknowledgment; busy work and failed cleanup preserve the document |
 | `set_draft` | `session`, `document`, `draft` | Retained document snapshot |
 | `preview` | `session`, `document`, `sql`, `revision` | Accepted plan and target identity; rejects stale draft revisions |
 | `cancel_preview` | `session` | Preview invalidation acknowledgment; transport cleanup may still be active |
@@ -41,7 +46,7 @@ Document snapshots carry session/document/query UUIDs, output generation, draft 
 
 `read_page` reports `page_too_large` if its JSON response exceeds the record budget. Request fewer rows or use `read_cell` for a large individual value. Cell offsets/counts use Unicode scalars rather than UTF-16 or grapheme clusters; concatenate chunks without altering the stored text. Null has no text and length zero.
 
-Interaction projections, catalog actions, and document close/rename/selection commands remain to be added. Query submission loads a fresh shared history store off the caller thread. Fixtures use a private disposable history directory instead of user configuration/data. The fixture lifecycle exercises preview, submission, early pages, history, cancellation/restart, and cleanup; native widget behavior remains a separate integration layer.
+Navigation revisions reject stale selection commands; late connection completions report whether selection accepted them so a detached native view can explicitly close the resulting session. Catalog actions, semantic keyboard events, and document rename commands remain to be added. Query submission loads a fresh shared history store off the caller thread. Fixtures use a private disposable history directory instead of user configuration/data. The fixture lifecycle exercises preview, submission, early pages, history, cancellation/restart, and cleanup; native widget behavior remains a separate integration layer.
 
 ## Local verification
 

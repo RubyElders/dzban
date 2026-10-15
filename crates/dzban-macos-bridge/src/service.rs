@@ -1,11 +1,16 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use dzban_core::application::{ApplicationContext, ApplicationError, ApplicationPhase};
-use dzban_core::documents::{DocumentExecution, DocumentId, QueryDocument, QueryDocuments};
+use dzban_core::application::{
+    ApplicationContext, ApplicationError, ApplicationPhase, ConnectionSelection,
+};
+use dzban_core::documents::{
+    CloseDocument, DocumentExecution, DocumentId, QueryDocument, QueryDocuments,
+};
 use dzban_core::error::ExecutionError;
 use dzban_core::execution::{QueryEngine, SessionId};
 use dzban_core::history::QueryHistoryStore;
+use dzban_core::interaction::{AppEvent, AppState, PrimaryAction, SessionInteraction};
 use dzban_core::preview::{PREVIEW_DELAY, PlanPreviewService, PreviewPhase};
 use dzban_core::result_store::{MAX_PAGE_ROWS, ResultLimits};
 use dzban_core::result_stream::ResultPhase;
@@ -35,11 +40,28 @@ pub enum Command {
         session: Uuid,
     },
     Profiles {},
+    Connections {},
+    SelectSession {
+        session: Option<Uuid>,
+        revision: Option<u64>,
+    },
+    Controls {},
+    SelectDocument {
+        session: Uuid,
+        document: Uuid,
+        revision: Option<u64>,
+    },
+    CloseDocument {
+        session: Uuid,
+        document: Uuid,
+    },
     Connect {
         profile: String,
+        revision: Option<u64>,
     },
     OpenDocument {
         session: Uuid,
+        revision: Option<u64>,
     },
     SetDraft {
         session: Uuid,
@@ -91,6 +113,25 @@ struct Workspace {
     documents: QueryDocuments,
     preview: PlanPreviewService,
     profile: String,
+    selection_revision: u64,
+}
+
+#[derive(Default)]
+struct NativeSelection {
+    connection: ConnectionSelection,
+    revision: u64,
+}
+
+impl NativeSelection {
+    fn accept_revision(&mut self, revision: Option<u64>) -> bool {
+        if let Some(revision) = revision {
+            if revision < self.revision {
+                return false;
+            }
+            self.revision = revision;
+        }
+        true
+    }
 }
 
 struct HistoryDirectory(std::path::PathBuf);
@@ -104,9 +145,12 @@ impl Drop for HistoryDirectory {
 struct State {
     context: Arc<ApplicationContext>,
     config: Mutex<Option<Config>>,
+    injected_config: bool,
     workspaces: Mutex<HashMap<SessionId, Workspace>>,
     observers: Mutex<Vec<Observer>>,
     history_directory: Option<HistoryDirectory>,
+    selection: Mutex<NativeSelection>,
+    interaction: Mutex<AppState>,
 }
 
 struct Observer {
@@ -138,6 +182,7 @@ impl App {
         registry: dzban_core::adapter::AdapterRegistry,
         config: Option<Config>,
     ) -> Result<Self, String> {
+        let injected_config = config.is_some();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -148,9 +193,12 @@ impl App {
             state: Arc::new(State {
                 context: Arc::new(ApplicationContext::new(registry)),
                 config: Mutex::new(config),
+                injected_config,
                 workspaces: Mutex::new(HashMap::new()),
                 observers: Mutex::new(Vec::new()),
                 history_directory: None,
+                selection: Mutex::new(NativeSelection::default()),
+                interaction: Mutex::new(AppState::default()),
             }),
         })
     }
@@ -213,6 +261,53 @@ impl Drop for App {
 }
 
 impl State {
+    async fn close_session(&self, session: Uuid) -> Result<(), Value> {
+        self.selection
+            .lock()
+            .unwrap()
+            .connection
+            .begin_close(SessionId(session));
+        let outcome = self.context.close(SessionId(session)).await;
+        let cleanup = outcome.as_ref().map(|_| ()).map_err(|error| match error {
+            ApplicationError::Operation(error) => error.clone(),
+            _ => ExecutionError::Message(error.to_string()),
+        });
+        self.selection
+            .lock()
+            .unwrap()
+            .connection
+            .finish_close(SessionId(session), &cleanup);
+        outcome.map_err(|error| application_error("close", error))?;
+        let mut workspaces = self.workspaces.lock().unwrap();
+        if let Some(workspace) = workspaces.get_mut(&SessionId(session)) {
+            workspace
+                .documents
+                .retire_closed_session(&workspace.engine)
+                .map_err(execution_error)?;
+        }
+        workspaces.remove(&SessionId(session));
+        Ok(())
+    }
+    fn controls(&self) -> Value {
+        let selected = match self.selection.lock().unwrap().connection {
+            ConnectionSelection::Ready(id) => self
+                .workspaces
+                .lock()
+                .unwrap()
+                .get(&id)
+                .map(|workspace| SessionInteraction::from_engine(&workspace.engine)),
+            _ => None,
+        };
+        let mut interaction = self.interaction.lock().unwrap();
+        interaction.transition(AppEvent::SessionSelected(selected));
+        let primary_action = match interaction.primary_action() {
+            PrimaryAction::Run => "run",
+            PrimaryAction::Stop => "stop",
+            PrimaryAction::Stopping => "stopping",
+            PrimaryAction::Unavailable => "unavailable",
+        };
+        json!({"session":interaction.scope.map(|scope|scope.session.0), "query":interaction.scope.and_then(|scope|scope.query.map(|id|id.0)), "primary_action":primary_action})
+    }
     async fn history(&self, session: Uuid) -> Result<QueryHistoryStore, Value> {
         let profile = self
             .workspaces
@@ -286,8 +381,94 @@ impl State {
         match command {
             #[cfg(feature = "test-fixtures")]
             Command::TestPanic {} => panic!("Fixture bridge worker panic"),
+            Command::Controls {} => Ok(self.controls()),
+            Command::Connections {} => Ok(
+                json!({"connections":self.context.subscribe_pending_connections().borrow().iter().map(|snapshot|json!({"request":snapshot.request.0,"profile":snapshot.profile.0,"connecting":matches!(snapshot.phase,dzban_core::application::ConnectionPhase::Connecting)})).collect::<Vec<_>>()}),
+            ),
+            Command::SelectSession { session, revision } => {
+                let mut selection = self.selection.lock().unwrap();
+                if matches!(selection.connection, ConnectionSelection::Closing(_)) {
+                    return Err(execution_error(ExecutionError::Busy));
+                }
+                if !selection.accept_revision(revision) {
+                    return Err(failure(
+                        "selection_superseded",
+                        "A newer navigation request is active",
+                    ));
+                }
+                if let Some(session) = session {
+                    if !self
+                        .workspaces
+                        .lock()
+                        .unwrap()
+                        .contains_key(&SessionId(session))
+                    {
+                        return Err(failure("unknown_session", "Session is not open"));
+                    }
+                    selection.connection = ConnectionSelection::Ready(SessionId(session));
+                } else {
+                    selection.connection.clear();
+                }
+                drop(selection);
+                Ok(self.controls())
+            }
+            Command::SelectDocument {
+                session,
+                document,
+                revision,
+            } => {
+                let mut workspaces = self.workspaces.lock().unwrap();
+                let workspace = workspaces
+                    .get_mut(&SessionId(session))
+                    .ok_or_else(|| failure("unknown_session", "Session is not open"))?;
+                if revision.is_some_and(|revision| revision < workspace.selection_revision) {
+                    return Err(failure(
+                        "selection_superseded",
+                        "A newer document selection is active",
+                    ));
+                }
+                if !workspace.documents.select(DocumentId(document)) {
+                    return Err(failure("unknown_document", "Document is not open"));
+                }
+                if let Some(revision) = revision {
+                    workspace.selection_revision = revision;
+                }
+                Ok(document_snapshot(&workspace.documents.selected().unwrap()))
+            }
+            Command::CloseDocument { session, document } => {
+                let outcome = {
+                    let mut workspaces = self.workspaces.lock().unwrap();
+                    let workspace = workspaces
+                        .get_mut(&SessionId(session))
+                        .ok_or_else(|| failure("unknown_session", "Session is not open"))?;
+                    workspace.documents.close_in_workspace(DocumentId(document))
+                };
+                match outcome {
+                    CloseDocument::Busy => Err(execution_error(ExecutionError::Busy)),
+                    CloseDocument::Missing => {
+                        Err(failure("unknown_document", "Document is not open"))
+                    }
+                    CloseDocument::CloseWorkspace => {
+                        self.close_session(session).await?;
+                        Ok(json!({"workspace_closed":true, "document":document, "selected":null}))
+                    }
+                    CloseDocument::Closed { .. } => {
+                        let workspaces = self.workspaces.lock().unwrap();
+                        let selected = workspaces
+                            .get(&SessionId(session))
+                            .and_then(|workspace| workspace.documents.selected());
+                        Ok(
+                            json!({"workspace_closed":false, "document":document, "selected":selected.as_ref().map(document_snapshot)}),
+                        )
+                    }
+                }
+            }
             Command::Profiles {} => {
-                let current = self.config.lock().unwrap().clone();
+                let current = if self.injected_config {
+                    self.config.lock().unwrap().clone()
+                } else {
+                    None
+                };
                 let config = if let Some(config) = current {
                     config
                 } else {
@@ -302,7 +483,7 @@ impl State {
                     json!({"profiles": config.databases.iter().map(|profile| json!({"name": profile.name, "backend": profile.backend})).collect::<Vec<_>>()}),
                 )
             }
-            Command::Connect { profile } => {
+            Command::Connect { profile, revision } => {
                 let config =
                     self.config.lock().unwrap().clone().ok_or_else(|| {
                         failure("configuration", "Load profiles before connecting")
@@ -311,12 +492,34 @@ impl State {
                     .resolve_profile(&ConnectionProfileId(profile), None)
                     .map_err(|error| failure("profile", error))?;
                 let profile_name = profile.name.clone();
-                let connection = self.context.start_connect(profile);
+                let (connection, snapshots) = {
+                    let mut selection = self.selection.lock().unwrap();
+                    if !selection.accept_revision(revision) {
+                        return Err(failure(
+                            "selection_superseded",
+                            "A newer navigation request is active",
+                        ));
+                    }
+                    if !selection.connection.accepts_connection_request() {
+                        return Err(execution_error(ExecutionError::Busy));
+                    }
+                    let connection = self.context.start_connect(profile);
+                    selection.connection.begin(connection.id);
+                    let snapshots = connection.subscribe();
+                    (connection, snapshots)
+                };
                 let request = connection.id.0;
-                let engine = connection
-                    .wait()
-                    .await
-                    .map_err(|error| application_error("connection", error))?;
+                let outcome = connection.wait().await;
+                let selected = self
+                    .selection
+                    .lock()
+                    .unwrap()
+                    .connection
+                    .apply(&snapshots.borrow());
+                let engine = outcome.map_err(|error| application_error("connection", error))?;
+                if *self.context.subscribe_phase().borrow() != ApplicationPhase::Running {
+                    return Err(failure("closed", "Application is closing"));
+                }
                 let session = engine.id();
                 self.workspaces.lock().unwrap().insert(
                     session,
@@ -325,16 +528,25 @@ impl State {
                         documents: QueryDocuments::default(),
                         preview: PlanPreviewService::default(),
                         profile: profile_name,
+                        selection_revision: 0,
                     },
                 );
-                Ok(json!({"request": request, "session": session.0}))
+                Ok(json!({"request": request, "session": session.0, "selected":selected}))
             }
-            Command::OpenDocument { session } => {
+            Command::OpenDocument { session, revision } => {
                 let mut workspaces = self.workspaces.lock().unwrap();
                 let workspace = workspaces
                     .get_mut(&SessionId(session))
                     .ok_or_else(|| failure("unknown_session", "Session is not open"))?;
+                let previous = workspace.documents.selected();
                 let document = workspace.documents.open();
+                if revision.is_some_and(|revision| revision < workspace.selection_revision) {
+                    if let Some(previous) = previous {
+                        workspace.documents.select(previous.id());
+                    }
+                } else if let Some(revision) = revision {
+                    workspace.selection_revision = revision;
+                }
                 Ok(document_snapshot(&document))
             }
             Command::SetDraft {
@@ -415,18 +627,7 @@ impl State {
                 Ok(payload)
             }
             Command::CloseSession { session } => {
-                self.context
-                    .close(SessionId(session))
-                    .await
-                    .map_err(|error| application_error("close", error))?;
-                let mut workspaces = self.workspaces.lock().unwrap();
-                if let Some(workspace) = workspaces.get_mut(&SessionId(session)) {
-                    workspace
-                        .documents
-                        .retire_closed_session(&workspace.engine)
-                        .map_err(execution_error)?;
-                }
-                workspaces.remove(&SessionId(session));
+                self.close_session(session).await?;
                 Ok(json!({"closed": session}))
             }
             Command::History { session } => {

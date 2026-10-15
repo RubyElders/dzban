@@ -14,11 +14,19 @@ use tokio::sync::Notify;
 struct Fixture {
     canceled: Notify,
     reject_close: AtomicBool,
+    slow_connect: bool,
+    fail_connect: bool,
 }
 
 #[async_trait]
 impl DatabaseSession for Fixture {
     async fn connect(&self) -> Result<(), String> {
+        if self.slow_connect {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
+        if self.fail_connect {
+            return Err("Fixture connection rejected".into());
+        }
         Ok(())
     }
     async fn disconnect(&self) -> Result<(), ExecutionError> {
@@ -97,8 +105,12 @@ impl AdapterFactory for Factory {
     fn backend(&self) -> DatabaseBackend {
         DatabaseBackend::Postgresql
     }
-    fn create(&self, _: DatabaseConfig) -> Result<Arc<dyn DatabaseSession>, String> {
-        Ok(Arc::new(Fixture::default()))
+    fn create(&self, config: DatabaseConfig) -> Result<Arc<dyn DatabaseSession>, String> {
+        Ok(Arc::new(Fixture {
+            slow_connect: config.name == "fixture-slow",
+            fail_connect: config.name == "fixture-failure",
+            ..Default::default()
+        }))
     }
 }
 
@@ -108,10 +120,14 @@ pub fn app() -> Result<crate::service::App, String> {
     let mut profile =
         DatabaseConfig::from_connection_string("host=localhost user=fixture dbname=fixture");
     profile.name = "fixture".into();
+    let mut slow = profile.clone();
+    slow.name = "fixture-slow".into();
+    let mut failed = profile.clone();
+    failed.name = "fixture-failure".into();
     crate::service::App::new(
         registry,
         Some(Config {
-            databases: vec![profile],
+            databases: vec![profile, slow, failed],
         }),
     )?
     .with_fixture_history()
