@@ -5,6 +5,7 @@ members = [
     "crates/dzban-gtk",
     "crates/dzban-core",
     "crates/dzban-cli",
+    "crates/dzban-macos-bridge",
 ]
 
 [workspace.dependencies]

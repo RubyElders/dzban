@@ -19,3 +19,7 @@ cargo "+$toolchain" build --locked -p dzban-cli --bin dzb
 bash scripts/check-portable.sh
 cargo "+$toolchain" metadata --locked --format-version 1 > /dev/null
 cargo "+$toolchain" test --locked -p dzban-core -p dzban-db -p dzban-cli --all-targets
+cargo "+$toolchain" tree --color never --locked -p dzban-macos-bridge \
+    --all-features --target all --edges normal,build,dev --prefix none --format '{p}' \
+    | bash scripts/check-portable.sh --check-tree
+cargo "+$toolchain" test --locked -p dzban-macos-bridge --all-targets --all-features

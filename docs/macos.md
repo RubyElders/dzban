@@ -17,11 +17,13 @@ DZBAN_TEST_TOOLCHAIN=1.98.1 bash scripts/check-headless.sh
 bash scripts/check-portable.sh
 ```
 
-The headless runner disables native package discovery and isolates configuration and history in a disposable directory. It runs core, database adapter, and CLI tests; ignored service-dependent tests require the disposable Compose fixtures described in [the testing skill](../skills/dzban-testing/SKILL.md). It does not validate native windows, TLS connections, or database runtime behavior by itself.
+The headless runner disables native package discovery and isolates configuration and history in a disposable directory. It runs core, database adapter, CLI, and Rust macOS bridge tests, including a dependency check for the bridge. Ignored service-dependent tests require the disposable Compose fixtures described in [the testing skill](../skills/dzban-testing/SKILL.md). It does not validate native windows, TLS connections, or database runtime behavior by itself.
 
 The initial inspection passed shared core/adapter tests on Apple Silicon with Rust 1.98.1. Four CLI process tests failed because they assumed `/bin/true` and `/bin/false`; these tests use explicit shell exit commands for portable success/failure behavior. The macOS CI matrix checks both Rust versions. Remote CI results are separate from local validation.
 
 ## Application and distribution scope
+
+Run `bash scripts/test-macos-bridge.sh` to compile the Rust archive and verify its Swift consumer. The [bridge contract](macos-bridge.md) describes handle ownership, snapshot delivery, and the fixture lifecycle checks. Full Xcode enables the XCTest run; Command Line Tools can run the standalone Swift scenarios.
 
 The first milestone covers connect, execute, streaming result pages, cancellation, and safe shutdown in a native window. The application must preserve core configuration/history formats and run without Homebrew or a repository working directory. Initial development retains existing XDG discovery semantics; do not silently migrate credentials or create a separate native history format.
 
