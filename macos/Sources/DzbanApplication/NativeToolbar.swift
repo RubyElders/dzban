@@ -58,7 +58,7 @@ final class NativeToolbarController: NSObject, NSToolbarDelegate, NSSearchFieldD
         window.titleVisibility = .hidden
         monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             MainActor.assumeIsolated {
-                guard let self, event.window == self.window, event.charactersIgnoringModifiers == "k",
+                guard let self, event.window == self.window, event.charactersIgnoringModifiers?.lowercased() == "k",
                       event.modifierFlags.intersection([.command, .shift, .control, .option]) == [.command, .shift] else { return EventResult(event: event) }
                 self.window?.makeFirstResponder(self.field)
                 self.configuration.search(self.field.stringValue)
