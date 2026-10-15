@@ -15,6 +15,6 @@ let package = Package(
         .target(name: "DzbanApplication", dependencies: ["DzbanBridge"]),
         .target(name: "DzbanBridgeScenarios", dependencies: ["DzbanBridge", "DzbanApplication"], path: "Checks/Scenarios"),
         .executableTarget(name: "DzbanBridgeCheck", dependencies: ["DzbanBridgeScenarios"], path: "Checks/Runner"),
-        .testTarget(name: "DzbanBridgeTests", dependencies: ["DzbanBridgeScenarios"]),
+        .testTarget(name: "DzbanBridgeTests", dependencies: ["DzbanBridgeScenarios", "DzbanApplication"]),
     ]
 )

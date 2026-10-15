@@ -22,6 +22,12 @@ swift_arguments=(--package-path macos --scratch-path target/macos-swift
     -Xlinker -framework -Xlinker CoreFoundation
     -Xlinker -liconv -Xlinker -lSystem -Xlinker -lc -Xlinker -lm)
 swift run "${swift_arguments[@]}" DzbanBridgeCheck
+if xcrun --find xctest >/dev/null 2>&1; then
+    swift test "${swift_arguments[@]}"
+else
+    echo 'Skipped XCTest: full Xcode is required. Standalone Swift lifecycle scenarios ran.'
+fi
+
 python3 - <<'PY'
 import os
 from pathlib import Path
@@ -29,8 +35,3 @@ remaining = list(Path(os.environ['TMPDIR']).glob('dzban-*'))
 assert not remaining, f'Bridge scenarios retained temporary artifacts: {remaining}'
 print('Bridge scenarios released temporary result and history artifacts')
 PY
-if xcrun --find xctest >/dev/null 2>&1; then
-    swift test "${swift_arguments[@]}"
-else
-    echo 'Skipped XCTest: full Xcode is required. Standalone Swift lifecycle scenarios ran.'
-fi

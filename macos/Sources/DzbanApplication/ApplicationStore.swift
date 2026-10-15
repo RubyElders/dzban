@@ -28,6 +28,8 @@ public final class ApplicationStore: ObservableObject {
     private var documentRevisions: [UUID: UInt64] = [:]
     private var observations: [UUID: Task<Void, Never>] = [:]
     private var shutdownTask: Task<Void, Error>?
+    private var editors: [UUID: EditorBuffer] = [:]
+    private var draftWorkers: [UUID: Task<Void, Never>] = [:]
 
     public init(bridge: Bridge) { self.bridge = bridge }
 
@@ -37,6 +39,56 @@ public final class ApplicationStore: ObservableObject {
         return workspace.documents.first { $0.document == workspace.selectedDocument }
     }
     public var navigationAvailable: Bool { closingSession == nil && !isShuttingDown && !isClosed }
+
+    public func editor(for document: DocumentSnapshot) -> EditorBuffer {
+        if let editor = editors[document.document] { return editor }
+        let editor = EditorBuffer(text: document.draft)
+        editors[document.document] = editor
+        return editor
+    }
+
+    public func editorChanged(session: UUID, document: UUID) {
+        guard let editor = editors[document], draftWorkers[document] == nil else { return }
+        draftWorkers[document] = Task { [weak self, editor, bridge] in
+            defer { self?.draftWorkers[document] = nil }
+            while let self, self.editors[document] === editor, editor.savedVersion < editor.version {
+                let version = editor.version
+                let draft = editor.text
+                do {
+                    let snapshot = try await bridge.request(.setDraft(session: session, document: document, draft: draft), as: DocumentSnapshot.self)
+                    editor.acknowledge(version)
+                    self.apply(snapshot, session: session)
+                } catch { self.show(error); return }
+            }
+        }
+    }
+
+    public func sendEditorIntent(_ intent: EditorIntent, session: UUID? = nil, document: UUID? = nil) {
+        guard let command = editorCommand(intent, session: session, document: document) else { return }
+        Task { await performEditorCommand(command) }
+    }
+
+    public func performEditorIntent(_ intent: EditorIntent, session: UUID? = nil, document: UUID? = nil) async {
+        guard let command = editorCommand(intent, session: session, document: document) else { return }
+        await performEditorCommand(command)
+    }
+
+    private func editorCommand(_ intent: EditorIntent, session: UUID?, document: UUID?) -> BridgeCommand? {
+        guard navigationAvailable, let session = session ?? selectedSession,
+              let workspace = workspaces.first(where: { $0.id == session }),
+              let snapshot = workspace.documents.first(where: { $0.document == (document ?? workspace.selectedDocument) }) else { return nil }
+        let editor = editor(for: snapshot)
+        if editor.textView.hasMarkedText(), intent == .submit || intent == .primary { return nil }
+        let selection = editor.scalarSelection
+        return .editorAction(session: session, document: snapshot.document, draft: editor.text, start: selection.lowerBound, end: selection.upperBound, intent: intent)
+    }
+
+    private func performEditorCommand(_ command: BridgeCommand) async {
+        do {
+            let _: EditorOutcome = try await bridge.request(command, as: EditorOutcome.self)
+            await refreshControls()
+        } catch { show(error) }
+    }
 
     public func loadProfiles() async {
         do { profiles = try await bridge.request(.profiles, as: Profiles.self).profiles }
@@ -133,10 +185,12 @@ public final class ApplicationStore: ObservableObject {
         closingSession = session
         defer { closingSession = nil }
         do {
+            await draftWorkers[document]?.value
             let result = try await bridge.request(.closeDocument(session: session, document: document), as: DocumentClose.self)
             if result.workspaceClosed { removeWorkspace(session) }
             else if let index = workspaces.firstIndex(where: { $0.id == session }) {
                 observations.removeValue(forKey: document)?.cancel()
+                editors.removeValue(forKey: document)?.retire()
                 workspaces[index].documents.removeAll { $0.document == document }
                 workspaces[index].selectedDocument = result.selected?.document
                 if let selected = result.selected { apply(selected, session: session) }
@@ -151,6 +205,9 @@ public final class ApplicationStore: ObservableObject {
         defer { closingSession = nil }
         do {
             struct Closed: Decodable, Sendable { let closed: UUID }
+            for document in workspaces.first(where: { $0.id == session })?.documents ?? [] {
+                await draftWorkers[document.document]?.value
+            }
             let _: Closed = try await bridge.request(.closeSession(session: session), as: Closed.self)
             removeWorkspace(session)
             await refreshControls()
@@ -173,7 +230,11 @@ public final class ApplicationStore: ObservableObject {
         if isClosed { return }
         if let shutdownTask { try await shutdownTask.value; return }
         isShuttingDown = true
-        let task = Task { [bridge] in try await bridge.shutdown() }
+        let pendingDrafts = Array(draftWorkers.values)
+        let task = Task { [bridge] in
+            for worker in pendingDrafts { await worker.value }
+            try await bridge.shutdown()
+        }
         shutdownTask = task
         defer { shutdownTask = nil; isShuttingDown = false }
         do {
@@ -182,6 +243,8 @@ public final class ApplicationStore: ObservableObject {
             for task in observations.values { task.cancel() }
             observations.removeAll()
             workspaces.removeAll()
+            for editor in editors.values { editor.retire() }
+            editors.removeAll()
             selectedSession = nil
             controls = nil
         } catch { show(error); throw error }
@@ -212,7 +275,10 @@ public final class ApplicationStore: ObservableObject {
 
     private func removeWorkspace(_ session: UUID) {
         if let workspace = workspaces.first(where: { $0.id == session }) {
-            for document in workspace.documents { observations.removeValue(forKey: document.document)?.cancel() }
+            for document in workspace.documents {
+                observations.removeValue(forKey: document.document)?.cancel()
+                editors.removeValue(forKey: document.document)?.retire()
+            }
         }
         workspaces.removeAll { $0.id == session }
         documentRevisions.removeValue(forKey: session)

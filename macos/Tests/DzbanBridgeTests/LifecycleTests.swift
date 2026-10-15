@@ -3,6 +3,9 @@ import DzbanBridgeScenarios
 
 @MainActor
 final class LifecycleTests: XCTestCase {
+    func testNativeEditorSelectsSQLPreservesDraftsAndScopesCancellation() async throws {
+        try await LifecycleScenarios.nativeEditorSelectsSQLPreservesDraftsAndScopesCancellation()
+    }
     func testConnectStreamCancelRestartAndShutdownThroughSwift() async throws {
         try await LifecycleScenarios.connectStreamCancelRestartAndShutdownThroughSwift()
     }

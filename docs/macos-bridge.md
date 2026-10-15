@@ -30,6 +30,7 @@ Run `shutdown`, inspect its outcome, and then release the application. Releasing
 | `open_document` | `session`, optional selection `revision` | Initial document snapshot |
 | `select_document` | `session`, `document`, optional selection `revision` | Selected document snapshot; older selection revisions are rejected |
 | `close_document` | `session`, `document` | Selected replacement snapshot or workspace-closed acknowledgment; busy work and failed cleanup preserve the document |
+| `editor_action` | `session`, `document`, `draft`, scalar `start`/`end`, `intent` | Shared submit/primary/cancel/reset semantics; optional submission identity and cancellation acknowledgment |
 | `set_draft` | `session`, `document`, `draft` | Retained document snapshot |
 | `preview` | `session`, `document`, `sql`, `revision` | Accepted plan and target identity; rejects stale draft revisions |
 | `cancel_preview` | `session` | Preview invalidation acknowledgment; transport cleanup may still be active |
@@ -46,7 +47,11 @@ Document snapshots carry session/document/query UUIDs, output generation, draft 
 
 `read_page` reports `page_too_large` if its JSON response exceeds the record budget. Request fewer rows or use `read_cell` for a large individual value. Cell offsets/counts use Unicode scalars rather than UTF-16 or grapheme clusters; concatenate chunks without altering the stored text. Null has no text and length zero.
 
-Navigation revisions reject stale selection commands; late connection completions report whether selection accepted them so a detached native view can explicitly close the resulting session. Catalog actions, semantic keyboard events, and document rename commands remain to be added. Query submission loads a fresh shared history store off the caller thread. Fixtures use a private disposable history directory instead of user configuration/data. The fixture lifecycle exercises preview, submission, early pages, history, cancellation/restart, and cleanup; native widget behavior remains a separate integration layer.
+Navigation revisions reject stale selection commands; late connection completions report whether selection accepted them so a detached native view can explicitly close the resulting session. Catalog actions and document rename commands remain to be added. Query submission loads a fresh shared history store off the caller thread. Fixtures use a private disposable history directory instead of user configuration/data. The fixture lifecycle exercises preview, submission, early pages, history, cancellation/restart, and cleanup; native widget behavior remains a separate integration layer.
+
+The native editor converts AppKit UTF-16 selections to Unicode scalar offsets before `editor_action`. Explicit nonempty selections execute their original text; an empty selection uses the shared current-statement selector. Bounds are validated in Rust. Command-Return and Command-Shift-Return submit the selection/current statement; Escape requests cancellation. The toolbar primary action uses the shared run/stop projection. Busy submission is suppressed by shared interaction policy and core admission remains authoritative. Cancellation targets the active document in the specified session even when another tab is selected.
+
+Each open document owns its native text view, selection, and undo manager. Snapshots do not replace locally edited text. A single worker per document coalesces draft writes; close and shutdown await admitted draft writes. Native composition keeps editing keys operational and prevents menu submission before composition commits. Physical submit repeats are consumed without another submission; focus loss resets shared keyboard/preview state. UTF-16 positions inside a surrogate pair clamp to the beginning of that scalar; combining marks remain separate scalar positions.
 
 ## Local verification
 

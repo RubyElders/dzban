@@ -45,6 +45,11 @@ public struct RootView: View {
             if store.closingSession != nil || store.isShuttingDown {
                 ProgressView().controlSize(.small).accessibilityLabel("Closing connections")
             }
+            Button(store.controls?.primaryAction == "stop" ? "Stop" : store.controls?.primaryAction == "stopping" ? "Stopping" : "Run") {
+                store.sendEditorIntent(.primary)
+            }
+            .disabled(!store.navigationAvailable || store.controls?.primaryAction == "unavailable" || store.controls?.primaryAction == "stopping" || store.selectedSession == nil)
+            .accessibilityIdentifier("query.primary")
             Button { Task { await store.newDocument() } } label: {
                 Label("New Query", systemImage: "plus")
             }
@@ -115,11 +120,21 @@ public struct RootView: View {
             if let document = store.document {
                 VStack(alignment: .leading, spacing: 14) {
                     Text(document.title).font(.title2)
-                    Text(document.draft.isEmpty ? "Write a query to explore your database." : document.draft)
-                        .font(.system(.body, design: .monospaced))
-                        .textSelection(.enabled)
-                        .foregroundStyle(.secondary)
-                    Spacer()
+                    SQLEditor(buffer: store.editor(for: document), editable: store.navigationAvailable, changed: { [weak store] in
+                        store?.editorChanged(session: workspace.id, document: document.document)
+                    }, action: { [weak store] intent in
+                        guard let store else { return false }
+                        if intent == .cancel && store.controls?.primaryAction != "stop" { return false }
+                        store.sendEditorIntent(intent, session: workspace.id, document: document.document)
+                        return true
+                    })
+                    .id(document.document)
+                    if let error = document.error, error != .null {
+                        Text(QueryDiagnostic.describe(error))
+                            .foregroundStyle(.red)
+                            .textSelection(.enabled)
+                            .accessibilityIdentifier("query.error")
+                    }
                 }
                 .padding(24)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -133,6 +148,9 @@ public struct RootView: View {
                 Text(workspace.profile)
                 if let document = store.document {
                     Text(document.execution.capitalized).accessibilityIdentifier("query.execution")
+                    if document.generation > 0 {
+                        Text("Run \(document.generation)").accessibilityIdentifier("query.generation")
+                    }
                 }
                 Spacer()
                 Text(store.controls?.primaryAction == "run" ? "Ready" : "Connection active")

@@ -78,6 +78,15 @@ public struct DocumentClose: Decodable, Sendable {
     public let selected: DocumentSnapshot?
 }
 
+public enum EditorIntent: String, Encodable, Sendable {
+    case submit, primary, cancel, reset
+}
+
+public struct EditorOutcome: Decodable, Sendable {
+    public let submission: Submission?
+    public let cancellationRequested: Bool
+}
+
 public struct Submission: Decodable, Sendable {
     public let query: UUID
     public let document: UUID
@@ -138,6 +147,8 @@ public struct BridgeCommand: Encodable, Sendable {
     var column: Int?
     var offset: Int?
     var revision: UInt64?
+    var end: Int?
+    var intent: EditorIntent?
 
     public static func connect(profile: String, revision: UInt64? = nil) -> Self { Self(command: "connect", profile: profile, revision: revision) }
     public static func selectSession(_ session: UUID?, revision: UInt64? = nil) -> Self { Self(command: "select_session", session: session, revision: revision) }
@@ -167,6 +178,9 @@ public struct BridgeCommand: Encodable, Sendable {
     public static func history(session: UUID) -> Self { Self(command: "history", session: session) }
     public static func readCell(session: UUID, document: UUID, generation: UInt64, row: Int, column: Int, offset: Int, count: Int) -> Self {
         Self(command: "read_cell", session: session, document: document, generation: generation, count: count, row: row, column: column, offset: offset)
+    }
+    public static func editorAction(session: UUID, document: UUID, draft: String, start: Int, end: Int, intent: EditorIntent) -> Self {
+        Self(command: "editor_action", session: session, document: document, draft: draft, start: start, end: end, intent: intent)
     }
     public static let profiles = Self(command: "profiles")
     public static let controls = Self(command: "controls")

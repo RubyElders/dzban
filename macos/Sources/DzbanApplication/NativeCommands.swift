@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 public struct NativeCommands: Commands {
@@ -10,6 +11,17 @@ public struct NativeCommands: Commands {
             Button("New Query") { Task { await store.newDocument() } }
                 .keyboardShortcut("t", modifiers: .command)
                 .disabled(store.selectedSession == nil || !store.navigationAvailable)
+        }
+        CommandMenu("Query") {
+            Button("Run Current Query") {
+                if NSApp.currentEvent?.type != .keyDown || NSApp.currentEvent?.isARepeat != true {
+                    store.sendEditorIntent(.submit)
+                }
+            }
+            .keyboardShortcut(.return, modifiers: .command)
+            .disabled(!store.navigationAvailable || store.controls?.primaryAction != "run")
+            Button("Cancel Query") { store.sendEditorIntent(.cancel) }
+                .disabled(!store.navigationAvailable || store.controls?.primaryAction != "stop")
         }
         CommandMenu("Connection") {
             Button("Show Connections") { Task { await store.chooseConnections() } }
