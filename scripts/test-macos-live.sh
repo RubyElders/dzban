@@ -2,6 +2,9 @@
 set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_root"
+if (( $# > 1 )); then echo 'Usage: bash scripts/test-macos-live.sh [APP_BUNDLE]' >&2; exit 2; fi
+app_bundle=${1:-}
+if [[ -n "$app_bundle" ]]; then app_bundle=$(cd "$app_bundle" && pwd); fi
 mkdir -p target
 fixture_root=$(mktemp -d "$repo_root/target/macos-live.XXXXXX")
 project="dzban-native-$(basename "$fixture_root" | tr '[:upper:].' '[:lower:]-')"
@@ -15,6 +18,7 @@ cleanup() {
     fi
     if ! "${compose[@]}" down --volumes --remove-orphans; then status=1; fi
     if [[ -n ${live_run:-} ]]; then rm -f "$live_run"; fi
+    if [[ -n ${installed_root:-} ]]; then rm -rf "$installed_root"; fi
     exit "$status"
 }
 docker compose -p "$project" -f docker-compose.test.yml config --format json > "$fixture_root/base.json"
@@ -32,6 +36,18 @@ for service in specification["services"].values():
 (root / "compose.json").write_text(json.dumps(specification))
 PY
 trap cleanup EXIT
+expected=3
+workflows=(-only-testing:DzbanUITests/ShellTests/testLivePostgreSQLWorkflow
+    -only-testing:DzbanUITests/ShellTests/testLiveClickHouseWorkflow)
+installed_app=
+if [[ -n "$app_bundle" ]]; then
+    installed_root=$(mktemp -d /tmp/dzban-native-installed.XXXXXX)
+    installed_app="$installed_root/Dzban.app"
+    ditto "$app_bundle" "$installed_app"
+    expected=2
+else
+    workflows+=(-only-testing:DzbanUITests/ShellTests/testNativeAppearanceResizeAndAccessibleInspection)
+fi
 "${compose[@]}" up -d --wait
 xcode_arguments=(-project macos/Dzban.xcodeproj -scheme Dzban -configuration Debug
     -derivedDataPath "$repo_root/target/macos-xcode-fixtures" -destination 'platform=macOS,arch=arm64'
@@ -40,7 +56,7 @@ xcode_arguments=(-project macos/Dzban.xcodeproj -scheme Dzban -configuration Deb
     'OTHER_SWIFT_FLAGS=$(inherited) -Xcc -DDZBAN_TEST_FIXTURES')
 xcodebuild "${xcode_arguments[@]}" build-for-testing
 live_run="$repo_root/target/macos-xcode-fixtures/Build/Products/DzbanLive-$(basename "$fixture_root").xctestrun"
-python3 - "$repo_root/target/macos-xcode-fixtures/Build/Products" "$live_run" <<'PYTEST'
+python3 - "$repo_root/target/macos-xcode-fixtures/Build/Products" "$live_run" "$installed_app" <<'PYTEST'
 from pathlib import Path
 import plistlib
 import sys
@@ -55,18 +71,20 @@ else:
 assert targets, 'No test runner targets in generated xctestrun'
 for target in targets:
     target.setdefault('EnvironmentVariables', {})['DZBAN_TEST_DATABASES'] = '1'
+    if sys.argv[3]:
+        original = target['UITargetAppPath']
+        target['UITargetAppPath'] = sys.argv[3]
+        target['DependentProductPaths'] = [sys.argv[3] if path == original else path for path in target.get('DependentProductPaths', [])]
 Path(sys.argv[2]).write_bytes(plistlib.dumps(specification))
 PYTEST
 xcodebuild -xctestrun "$live_run" -destination 'platform=macOS,arch=arm64' \
     -resultBundlePath "$fixture_root/Native.xcresult" -parallel-testing-enabled NO \
-    -only-testing:DzbanUITests/ShellTests/testLivePostgreSQLWorkflow \
-    -only-testing:DzbanUITests/ShellTests/testLiveClickHouseWorkflow \
-    -only-testing:DzbanUITests/ShellTests/testNativeAppearanceResizeAndAccessibleInspection test-without-building
+    "${workflows[@]}" test-without-building
 xcrun xcresulttool get test-results summary --path "$fixture_root/Native.xcresult" > "$fixture_root/summary.json"
-python3 - "$fixture_root/summary.json" <<'PYRESULT'
+python3 - "$fixture_root/summary.json" "$expected" <<'PYRESULT'
 import json
 import sys
 summary = json.load(open(sys.argv[1]))
 assert summary['skippedTests'] == 0, 'Live gate skipped required tests'
-assert summary['failedTests'] == 0 and summary['passedTests'] == 3, 'Live gate did not pass all three workflows'
+assert summary['failedTests'] == 0 and summary['passedTests'] == int(sys.argv[2]), 'Live gate did not pass every required workflow'
 PYRESULT

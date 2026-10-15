@@ -1,0 +1,24 @@
+name: Native macOS artifact
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    runs-on: [self-hosted, dzban-macos-native]
+    env:
+      DZBAN_TEST_TOOLCHAIN: "1.98.1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust and archive tools
+        run: rustup toolchain install 1.98.1 --profile minimal --component llvm-tools
+      - name: Check the native dependency boundary
+        run: bash scripts/check-portable.sh
+      - name: Check local packaging contracts
+        run: python3 -m unittest discover -s scripts/tests -p 'test_macos_release.py'
+      - name: Build and verify the local unsigned artifact
+        run: python3 scripts/release-macos.py target/macos-native-ci
