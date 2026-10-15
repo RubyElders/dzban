@@ -46,17 +46,21 @@ final class ShellTests: XCTestCase {
         XCTAssertTrue(restore.waitForExistence(timeout: 10))
         let editor = app.textViews["query.editor"]
         XCTAssertLessThan(restore.frame.maxX, editor.frame.minX)
-        let actions = app.buttons["actions.open"]
+        XCTAssertTrue(app.windows.firstMatch.buttons["_XCUI:CloseWindow"].exists)
+        XCTAssertTrue(app.toolbars.buttons["history.open"].exists)
+        XCTAssertTrue(app.toolbars.buttons["query.primary"].exists)
+        let actions = app.toolbars.searchFields["actions.search"]
         let run = app.buttons["query.primary"]
         XCTAssertLessThan(app.buttons["history.open"].frame.maxX, actions.frame.minX)
         XCTAssertLessThan(actions.frame.maxX, run.frame.minX)
         actions.click()
-        let search = app.textFields["actions.search"]
+        let search = app.toolbars.searchFields["actions.search"]
         XCTAssertTrue(search.waitForExistence(timeout: 5))
         search.click()
-        search.typeText("new query")
+        search.typeText("query")
         XCTAssertTrue(app.buttons["action.new"].exists)
         XCTAssertFalse(app.buttons["action.disconnect"].exists)
+        search.typeKey(.downArrow, modifierFlags: [])
         search.typeKey(.return, modifierFlags: [])
         XCTAssertTrue(app.buttons["Query 2"].waitForExistence(timeout: 5))
         restore.click()
@@ -377,8 +381,8 @@ final class ShellTests: XCTestCase {
         launchApp()
         app.buttons["connection.fixture"].click()
         XCTAssertTrue(app.textViews["query.editor"].waitForExistence(timeout: 10))
-        app.buttons["actions.open"].click()
-        let actionSearch = app.textFields["actions.search"]
+        app.toolbars.searchFields["actions.search"].click()
+        let actionSearch = app.toolbars.searchFields["actions.search"]
         actionSearch.click()
         actionSearch.typeText("catalog")
         app.buttons["action.catalog"].click()

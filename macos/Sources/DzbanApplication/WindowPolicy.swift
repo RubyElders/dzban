@@ -3,14 +3,18 @@ import SwiftUI
 
 struct WindowPolicy: NSViewRepresentable {
     let store: ApplicationStore
+    let toolbar: NativeToolbarConfiguration
 
-    func makeCoordinator() -> Coordinator { Coordinator(store: store) }
+    func makeCoordinator() -> Coordinator { Coordinator(store: store, toolbar: toolbar) }
     func makeNSView(context: Context) -> AttachmentView {
         let view = AttachmentView()
         view.coordinator = context.coordinator
         return view
     }
-    func updateNSView(_ view: AttachmentView, context: Context) { view.window?.delegate = context.coordinator }
+    func updateNSView(_ view: AttachmentView, context: Context) {
+        view.window?.delegate = context.coordinator
+        context.coordinator.toolbar.update(toolbar)
+    }
 
     static func dismantleNSView(_ view: AttachmentView, coordinator: Coordinator) { coordinator.detach() }
 
@@ -22,6 +26,7 @@ struct WindowPolicy: NSViewRepresentable {
     @MainActor
     final class Coordinator: NSObject, NSWindowDelegate {
         weak var store: ApplicationStore?
+        let toolbar: NativeToolbarController
         private var closing = false
         private struct EventResult: @unchecked Sendable { let event: NSEvent? }
         private weak var window: NSWindow?
@@ -33,6 +38,7 @@ struct WindowPolicy: NSViewRepresentable {
         func attach(_ window: NSWindow?) {
             if let monitor { NSEvent.removeMonitor(monitor) }
             self.window = window
+            toolbar.attach(window)
             NotificationCenter.default.removeObserver(self)
             guard window != nil else { return }
             NotificationCenter.default.addObserver(self, selector: #selector(applicationResigned), name: NSApplication.didResignActiveNotification, object: nil)
@@ -70,6 +76,7 @@ struct WindowPolicy: NSViewRepresentable {
         }
         @objc private func applicationResigned() { previewEpoch &+= 1; previewTask?.cancel(); previewPressed = nil; store?.plan.reset() }
         func detach() {
+            toolbar.detach()
             if let monitor { NSEvent.removeMonitor(monitor) }
             monitor = nil
             NotificationCenter.default.removeObserver(self)
@@ -77,7 +84,10 @@ struct WindowPolicy: NSViewRepresentable {
             previewPressed = nil
         }
 
-        init(store: ApplicationStore) { self.store = store }
+        init(store: ApplicationStore, toolbar: NativeToolbarConfiguration) {
+            self.store = store
+            self.toolbar = NativeToolbarController(configuration: toolbar)
+        }
         func windowShouldClose(_ window: NSWindow) -> Bool {
             guard let store, !store.isClosed else { return true }
             guard !closing else { return false }
