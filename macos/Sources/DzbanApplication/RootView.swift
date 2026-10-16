@@ -29,17 +29,17 @@ public struct RootView: View {
                             ContentUnavailableView("Query History", systemImage: "clock", description: Text("Connect to a database to browse saved queries."))
                         }
                     }
-                    .frame(minWidth: 240, idealWidth: 280, maxWidth: 320)
+                    .frame(minWidth: 240, idealWidth: 280, maxWidth: 320, maxHeight: .infinity)
                 }
                 Group {
                     if let workspace = store.workspace { workspaceView(workspace) }
                     else { chooser }
                 }.frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
+            }.frame(maxWidth: .infinity, maxHeight: .infinity)
             Divider()
             statusbar
         }
-        .frame(minWidth: 900, minHeight: 500)
+        .frame(minWidth: 900, maxWidth: .infinity, minHeight: 500, maxHeight: .infinity)
         .background(WindowPolicy(store: store, toolbar: toolbar).frame(width: 0, height: 0))
         .overlay {
             if actionsVisible {
@@ -217,6 +217,7 @@ public struct RootView: View {
             .disabled(store.pendingProfile != nil)
         }
         .padding(.horizontal, 10).padding(.vertical, 6)
+        .frame(height: 40)
         .buttonStyle(.borderless)
         .disabled(!store.navigationAvailable)
         .accessibilityElement(children: .contain).accessibilityIdentifier("connection.tabs")

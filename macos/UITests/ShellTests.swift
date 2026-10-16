@@ -223,14 +223,23 @@ final class ShellTests: XCTestCase {
         }
         let toggle = app.toolbars.buttons["history.open"]
         let origin = toggle.frame
+        let splitBefore = app.splitGroups.firstMatch.frame
+        let connectionTop = app.descendants(matching: .any)["connection.tabs"].frame.minY
+        let footerBottom = app.descendants(matching: .any)["workspace.statusbar"].frame.maxY
         app.buttons["connections.show"].click()
         XCTAssertTrue(app.buttons["connection.fixture"].waitForExistence(timeout: 5))
         XCTAssertEqual(toggle.frame.minX, origin.minX, accuracy: 1)
         XCTAssertFalse(window.staticTexts["Dzban"].exists)
+        XCTAssertEqual(app.descendants(matching: .any)["connection.tabs"].frame.minY, connectionTop, accuracy: 1)
+        XCTAssertEqual(app.descendants(matching: .any)["workspace.statusbar"].frame.maxY, footerBottom, accuracy: 1)
         let chooser = XCTAttachment(screenshot: window.screenshot())
         chooser.name = "Titlebar connections"
         chooser.lifetime = .keepAlways
         add(chooser)
+        let split = app.splitGroups.firstMatch.frame
+        print("Workspace split \(splitBefore), chooser split \(split)")
+        XCTAssertEqual(split.minY, splitBefore.minY, accuracy: 1)
+        XCTAssertEqual(split.maxY, splitBefore.maxY, accuracy: 1)
         app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH 'workspace.'")).firstMatch.click()
         XCTAssertTrue(app.buttons["history.close"].waitForExistence(timeout: 5))
         XCTAssertEqual(toggle.frame.minX, origin.minX, accuracy: 1)
