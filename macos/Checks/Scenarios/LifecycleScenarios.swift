@@ -37,13 +37,15 @@ public enum LifecycleScenarios {
         }
         try expect(early?.generation == submission.generation)
         try expect(early?.execution != "finished")
-        let other = try await bridge.request(.openDocument(session: connection.session), as: DocumentSnapshot.self)
+        let otherConnection = try await bridge.request(.selectSession(nil), as: Controls.self)
+        try expect(otherConnection.session == nil)
+        let parallel = try await bridge.request(.connect(profile: "fixture"), as: Connection.self)
+        let other = try await bridge.request(.openDocument(session: parallel.session), as: DocumentSnapshot.self)
         try expect(other.document != document.document)
-        try expect(other.execution == "idle")
-        do {
-            let _: Submission = try await bridge.request(.submit(session: connection.session, document: other.document, sql: "rows"), as: Submission.self)
-            throw CheckFailure(message: "Admitted overlapping work on one session")
-        } catch let error as BridgeFailure { try expect(error.diagnostic == .string("Busy")) }
+        try expect(parallel.session != connection.session)
+        let _: Submission = try await bridge.request(.submit(session: parallel.session, document: other.document, sql: "rows"), as: Submission.self)
+        let parallelStream = try await bridge.observeDocument(session: parallel.session, document: other.document)
+        for try await snapshot in parallelStream { if snapshot.execution == "finished" { try expect(snapshot.rows == 500); break } }
         let detachable = try await bridge.observeDocument(session: connection.session, document: document.document)
         let listener = Task { for try await _ in detachable {} }
         listener.cancel()
@@ -54,10 +56,6 @@ public enum LifecycleScenarios {
         let chunk = try await bridge.request(.readCell(session: connection.session, document: document.document, generation: submission.generation, row: 0, column: 1, offset: 9, count: 1), as: CellChunk.self)
         try expect(chunk.text == "😀")
         try expect(chunk.total == 10)
-        do {
-            try await bridge.shutdown()
-            throw CheckFailure(message: "Busy shutdown succeeded")
-        } catch let error as BridgeFailure { try expect(error.kind == "shutdown") }
         let _: Ack = try await bridge.request(.cancel(session: connection.session, document: document.document), as: Ack.self)
         let finishing = try await bridge.observeDocument(session: connection.session, document: document.document)
         for try await snapshot in finishing { if snapshot.execution == "finished" { break } }

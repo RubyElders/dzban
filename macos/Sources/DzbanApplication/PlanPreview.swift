@@ -112,7 +112,6 @@ struct PlanPreviewPanel: View {
                 Text(error).foregroundStyle(.red).textSelection(.enabled).accessibilityIdentifier("plan.error")
             }
             if let plan = model.plan {
-                Text(PlanFormatting.summary(plan)).font(.caption).accessibilityIdentifier("plan.estimate")
                 ReadOnlyText(text: PlanFormatting.text(plan), identifier: "plan.value")
             }
         }.padding(16).frame(width: 620, height: 400)
@@ -124,11 +123,11 @@ struct PlanPreviewButton: View {
     @ObservedObject private var model: PlanPreviewModel
     init(store: ApplicationStore) { self.store = store; model = store.plan }
     var body: some View {
-        Button { Task { await store.previewCurrent(pinned: true) } } label: {
+        Button { Task { await store.openCurrentPlan() } } label: {
             Label("Preview Plan", systemImage: "waveform.path.ecg")
         }
             .labelStyle(.iconOnly)
-            .help("Command-Shift-P: tap to pin the plan, hold to peek")
+            .help("Preview the current query plan")
             .disabled(!store.canPreview)
             .accessibilityIdentifier("plan.open")
             .popover(isPresented: Binding(get: { model.visible }, set: { if !$0 && model.visible { model.close() } }), arrowEdge: .bottom) {
@@ -138,6 +137,22 @@ struct PlanPreviewButton: View {
 }
 
 public enum PlanFormatting {
+    public static func rowEstimate(_ plan: JSONValue) -> String? {
+        guard case .object(let root) = plan, case .object(let estimate) = root["estimate"],
+              case .number(let rows) = estimate["rows"], rows.isFinite, rows >= 0 else { return nil }
+        let prefix = root["backend"] == .string("clickhouse") ? "Scan est." : "Est."
+        return "\(prefix) ~" + String(format: "%.0f", rows) + " rows"
+    }
+
+    public static func costEstimate(_ plan: JSONValue) -> String? {
+        guard case .object(let root) = plan, case .object(let estimate) = root["estimate"],
+              case .number(let total) = estimate["total_cost"], total.isFinite, total >= 0 else { return nil }
+        if case .number(let startup) = estimate["startup_cost"], startup.isFinite, startup >= 0 {
+            return "Cost " + String(format: "%.2f..%.2f", startup, total)
+        }
+        return "Cost " + String(format: "%.2f", total)
+    }
+
     public static func compact(_ plan: JSONValue) -> String {
         guard case .object(let root) = plan, case .object(let estimate) = root["estimate"], case .number(let rows) = estimate["rows"] else { return "Estimate ready" }
         let count = String(format: "%.0f", rows)
@@ -154,25 +169,25 @@ public enum PlanFormatting {
         guard case .object(let root) = plan, case .object(let estimate) = root["estimate"] else { return "Estimated query plan" }
         var parts: [String] = []
         for (key, label) in [("rows", "Estimated rows"), ("startup_cost", "Startup cost"), ("total_cost", "Total cost"), ("parts", "Parts"), ("marks", "Marks")] {
-            if let value = estimate[key], value != .null { parts.append("\(label): \(CatalogText.describe(value))") }
+            if let value = estimate[key], value != .null { parts.append("\(label): \(describe(value))") }
         }
         if let diagnostic = estimate["diagnostic"], diagnostic != .null { parts.append("Estimate unavailable: \(QueryDiagnostic.describe(diagnostic))") }
         return parts.isEmpty ? "Estimated query plan" : parts.joined(separator: " | ")
     }
     public static func text(_ plan: JSONValue) -> String {
-        func object(_ value: JSONValue) -> Any {
-            switch value {
-            case .null: return NSNull()
-            case .string(let text): return text
-            case .bool(let value): return value
-            case .number(let value): return value
-            case .array(let values): return values.map(object)
-            case .object(let values): return values.mapValues(object)
-            }
-        }
-        let document: JSONValue
-        if case .object(let root) = plan { document = root["document"] ?? plan } else { document = plan }
-        guard let data = try? JSONSerialization.data(withJSONObject: object(document), options: [.prettyPrinted, .sortedKeys, .fragmentsAllowed]) else { return CatalogText.describe(document) }
-        return String(decoding: data, as: UTF8.self)
+        if case .object(let root) = plan, case .string(let text) = root["text"] { return text }
+        return "No text plan available"
     }
+
+    private static func describe(_ value: JSONValue) -> String {
+        switch value {
+        case .null: return "SQL NULL"
+        case .string(let text): return text
+        case .bool(let value): return String(value)
+        case .number(let value): return String(value)
+        case .array(let values): return values.map(describe).joined(separator: ", ")
+        case .object(let values): return values.keys.sorted().map { "\($0): \(describe(values[$0]!))" }.joined(separator: ", ")
+        }
+    }
+
 }

@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use tokio::sync::{Mutex, watch};
 use uuid::Uuid;
@@ -106,6 +106,7 @@ pub struct QuerySnapshot {
     pub planning_duration: Duration,
     pub execution_duration: Duration,
     pub started_at: Option<Instant>,
+    pub started_wall_time: Option<SystemTime>,
     pub finished_at: Option<Instant>,
 }
 
@@ -245,6 +246,7 @@ impl QueryEngine {
             planning_duration: Duration::ZERO,
             execution_duration: Duration::ZERO,
             started_at: None,
+            started_wall_time: None,
             finished_at: None,
         });
         Self {
@@ -328,6 +330,57 @@ impl QueryEngine {
                     "Disconnect worker failed: {error}"
                 )))
             });
+            engine.session_phase.send_replace(if result.is_ok() {
+                SessionPhase::Closed
+            } else {
+                SessionPhase::Open
+            });
+            if result.is_ok() {
+                engine
+                    .snapshot
+                    .send_modify(|snapshot| snapshot.capture = None);
+            }
+            result
+        });
+        Ok(SessionCloseHandle {
+            session: self.id,
+            task,
+        })
+    }
+
+    pub fn start_close_draining(
+        self: &Arc<Self>,
+    ) -> Result<SessionCloseHandle, crate::error::ExecutionError> {
+        let mut admitted = false;
+        self.session_phase.send_modify(|phase| {
+            if *phase == SessionPhase::Open {
+                *phase = SessionPhase::Closing;
+                admitted = true;
+            }
+        });
+        if !admitted {
+            return self.start_close();
+        }
+        let engine = self.clone();
+        let task = tokio::spawn(async move {
+            let worker = engine.clone();
+            let result = tokio::spawn(async move {
+                let mut snapshots = worker.subscribe();
+                let operation = loop {
+                    let phase = snapshots.borrow_and_update().phase.clone();
+                    if let QueryPhase::Queued(id) | QueryPhase::Explaining(id) | QueryPhase::Executing(id) = phase {
+                        worker.cancel_detailed(id).await?;
+                    }
+                    tokio::select! {
+                        operation = worker.operation.clone().lock_owned() => break operation,
+                        changed = snapshots.changed() => {
+                            if changed.is_err() { return Err(crate::error::ExecutionError::Closed); }
+                        }
+                    }
+                };
+                let _operation = worker.track_operation(operation, OperationState::Closing);
+                worker.session.disconnect().await
+            }).await.unwrap_or_else(|error| Err(crate::error::ExecutionError::Message(format!("Disconnect worker failed: {error}"))));
             engine.session_phase.send_replace(if result.is_ok() {
                 SessionPhase::Closed
             } else {
@@ -757,6 +810,7 @@ impl QueryEngine {
             planning_duration: Duration::ZERO,
             execution_duration: Duration::ZERO,
             started_at: Some(Instant::now()),
+            started_wall_time: Some(SystemTime::now()),
             finished_at: None,
         });
         Ok((id, operation))
@@ -1298,6 +1352,7 @@ mod tests {
         assert!(matches!(state.borrow().phase, QueryPhase::Completed(_)));
         assert!(state.borrow().plan.is_some());
         assert!(state.borrow().started_at.is_some());
+        assert!(state.borrow().started_wall_time.is_some());
         assert!(state.borrow().finished_at.is_some());
         let elapsed = state.borrow().elapsed();
         tokio::task::yield_now().await;

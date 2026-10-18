@@ -46,6 +46,9 @@ public struct DocumentSnapshot: Decodable, Sendable {
     public let termination: String?
     public let captureError: JSONValue?
     public let commandResult: CommandResult?
+    public let startedAtSeconds: Double?
+    public let elapsedSeconds: Double?
+    public let executionPlan: JSONValue?
     public let executionSeconds: Double?
     public let history: Bool?
     public let historyTotalRows: Int?
@@ -57,6 +60,7 @@ public struct CommandResult: Decodable, Sendable {
 }
 
 public struct Connection: Decodable, Sendable {
+    public let tab: UUID
     public let request: UUID
     public let session: UUID
     public let selected: Bool

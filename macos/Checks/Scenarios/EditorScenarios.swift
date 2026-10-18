@@ -44,26 +44,27 @@ extension LifecycleScenarios {
         }
         let drafts = try await bridge.observeDocument(session: session, document: original.document)
         for try await snapshot in drafts { if snapshot.draft == "SELECT 99" { break } }
-        await store.newDocument()
+        _ = await store.connect(profile: "fixture")
+        let secondSession = store.selectedSession!
         let second = store.document!
         let waiting = store.editor(for: second)
         waiting.edit(text: "wait", selection: NSRange(location: 0, length: 0))
-        store.editorChanged(session: session, document: second.document)
+        store.editorChanged(session: secondSession, document: second.document)
         await store.performEditorIntent(.submit)
-        try await receiving(bridge, session: session, document: second.document)
+        try await receiving(bridge, session: secondSession, document: second.document)
         await store.selectDocument(original.document)
         try expect(store.editor(for: store.document!) === editor)
         try expect(editor.text == "SELECT 99" && editor.selection.location == 3)
         await store.performEditorIntent(.submit)
-        let unchanged = try await bridge.observeDocument(session: session, document: original.document)
-        for try await snapshot in unchanged { try expect(snapshot.generation == 3); break }
+        _ = try await finished(bridge, session: session, document: original.document, generation: 4)
+        await store.selectSession(secondSession)
         await store.performEditorIntent(.cancel)
-        let canceled = try await finished(bridge, session: session, document: second.document, generation: 1)
+        let canceled = try await finished(bridge, session: secondSession, document: second.document, generation: 1)
         try expect(canceled.error != nil && canceled.error != .null)
 
         await store.selectDocument(second.document)
         await store.performEditorIntent(.submit)
-        try await receiving(bridge, session: session, document: second.document)
+        try await receiving(bridge, session: secondSession, document: second.document)
         await store.chooseConnections()
         let otherConnected = await store.connect(profile: "fixture-slow")
         try expect(otherConnected)
@@ -78,11 +79,11 @@ extension LifecycleScenarios {
         try expect(store.controls?.primaryAction == "stop")
         await store.performEditorIntent(.primary)
         _ = try await finished(bridge, session: otherSession, document: otherDocument.document, generation: 1)
-        await store.selectSession(session)
+        await store.selectSession(secondSession)
         await store.refreshControls()
         try expect(store.controls?.primaryAction == "stop")
         await store.performEditorIntent(.cancel)
-        _ = try await finished(bridge, session: session, document: second.document, generation: 2)
+        _ = try await finished(bridge, session: secondSession, document: second.document, generation: 2)
         try expect(store.failure == nil, store.failure ?? "Unexpected editor failure")
         try await store.shutdown()
     }

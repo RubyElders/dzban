@@ -21,6 +21,181 @@ final class NavigationTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(5))
         }
     }
+    func testRepeatedRunWhileCommandHeldDoesNotNeedReturnKeyUp() async throws {
+        let (_, store, _) = try await connected()
+        let document = try XCTUnwrap(store.document)
+        let editor = store.editor(for: document)
+        editor.edit(text: "few", selection: NSRange(location: 3, length: 0))
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 300), styleMask: [.titled], backing: .buffered, defer: false)
+        window.contentView?.addSubview(editor.textView)
+        window.makeFirstResponder(editor.textView)
+        let configuration = NativeToolbarConfiguration(history: AnyView(EmptyView()), plan: AnyView(EmptyView()), primary: AnyView(EmptyView()), placeholder: "", searchText: "", searchVisible: false, menuHeight: 0, focusRequest: 0, search: { _ in }, move: { _ in }, submit: {}, dismiss: { _ in })
+        let coordinator = WindowPolicy.Coordinator(store: store, toolbar: configuration)
+        coordinator.attach(window)
+        defer { coordinator.detach() }
+        func event(repeating: Bool = false) throws -> NSEvent {
+            try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: .command, timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: repeating, keyCode: 36))
+        }
+        for _ in 0..<2 {
+            let generation = try XCTUnwrap(store.document).generation
+            XCTAssertNil(coordinator.handle(try event()))
+            try await until { (store.document?.generation ?? 0) > generation && store.document?.execution == "finished" }
+        }
+        let generation = try XCTUnwrap(store.document).generation
+        XCTAssertNil(coordinator.handle(try event(repeating: true)))
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertEqual(store.document?.generation, generation)
+        try await store.shutdown()
+    }
+
+    func testQuitRestoresOrderedTabsDraftsAndSelectionWithoutRunningQueries() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("workspace.json")
+        let store = ApplicationStore(bridge: try Bridge.fixture(), restorationURL: url)
+        await store.start()
+        let connected = await store.connect(profile: "fixture")
+        XCTAssertTrue(connected)
+        let first = try XCTUnwrap(store.document)
+        store.editor(for: first).edit(text: "SELECT 'unsaved 😀';", selection: NSRange(location: 0, length: 0))
+        await store.newDocument()
+        let secondConnected = await store.connect(profile: "fixture")
+        XCTAssertTrue(secondConnected)
+        let second = try XCTUnwrap(store.document)
+        store.editor(for: second).edit(text: "wait", selection: NSRange(location: 0, length: 0))
+        await store.performEditorIntent(.primary)
+        try await until { store.document?.execution == "running" }
+        await store.newDocument()
+        await store.selectPage(store.pages[1].id)
+        try await store.shutdown()
+
+        let restored = ApplicationStore(bridge: try Bridge.fixture(), restorationURL: url)
+        await restored.start()
+        XCTAssertEqual(restored.pages.count, 3)
+        XCTAssertEqual(restored.workspaces.count, 2)
+        XCTAssertEqual(restored.selectedPage, restored.pages[1].id)
+        XCTAssertEqual(restored.workspaces.map(\.profile), ["fixture", "fixture"])
+        XCTAssertEqual(restored.workspaces.flatMap(\.documents).map(\.draft), ["SELECT 'unsaved 😀';", "wait"])
+        XCTAssertFalse(restored.workspaces.flatMap(\.documents).contains { ["running", "planning"].contains($0.execution) })
+        XCTAssertNil(restored.pages[2].session)
+        await restored.closePage(restored.pages[0].id)
+        try await restored.shutdown()
+
+        let reopened = ApplicationStore(bridge: try Bridge.fixture(), restorationURL: url)
+        await reopened.start()
+        XCTAssertEqual(reopened.pages.count, 2)
+        XCTAssertEqual(reopened.document?.draft, "wait")
+        try await reopened.shutdown()
+    }
+
+    func testUnavailableRestoredConnectionKeepsItsDraftForReconnect() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("workspace.json")
+        try Data(#"{"version":1,"tabs":[{"profile":"missing","draft":"SELECT 42;"}],"selected":0}"#.utf8).write(to: url)
+        let store = ApplicationStore(bridge: try Bridge.fixture(), restorationURL: url)
+        await store.start()
+        XCTAssertEqual(store.pages.count, 1)
+        XCTAssertNil(store.selectedSession)
+        XCTAssertEqual(store.pages[0].savedDraft, "SELECT 42;")
+        let reconnected = await store.connect(profile: "fixture")
+        XCTAssertTrue(reconnected)
+        XCTAssertEqual(store.document?.draft, "SELECT 42;")
+        try await store.shutdown()
+    }
+
+    func testClosingTheLastConnectionPageShutsDown() async throws {
+        let store = ApplicationStore(bridge: try Bridge.fixture())
+        await store.closeCurrentTab()
+        XCTAssertTrue(store.isClosed)
+        XCTAssertTrue(store.pages.isEmpty)
+    }
+
+    func testConnectionPickerPagesBecomeSessionsWithoutAddingAnotherTab() async throws {
+        let bridge = try Bridge.fixture()
+        let store = ApplicationStore(bridge: bridge)
+        await store.loadProfiles()
+        let firstPage = store.selectedPage
+        XCTAssertEqual(store.pages.count, 1)
+        XCTAssertNil(store.selectedSession)
+        let firstConnected = await store.connect(profile: "fixture")
+        XCTAssertTrue(firstConnected)
+        let firstSession = try XCTUnwrap(store.selectedSession)
+        XCTAssertEqual(store.selectedPage, firstPage)
+        XCTAssertEqual(store.pages.count, 1)
+        await store.newDocument()
+        let secondPage = store.selectedPage
+        XCTAssertNil(store.selectedSession)
+        XCTAssertTrue(store.connectionsVisible)
+        XCTAssertEqual(store.pages.count, 2)
+        XCTAssertEqual(store.workspaces.count, 1)
+        await store.cycleWorkspace(-1)
+        XCTAssertEqual(store.selectedSession, firstSession)
+        await store.cycleWorkspace(1)
+        XCTAssertEqual(store.selectedPage, secondPage)
+        XCTAssertNil(store.selectedSession)
+        let secondConnected = await store.connect(profile: "fixture")
+        XCTAssertTrue(secondConnected)
+        XCTAssertEqual(store.selectedPage, secondPage)
+        XCTAssertEqual(store.pages.count, 2)
+        XCTAssertNotEqual(store.selectedSession, firstSession)
+        await store.newDocument()
+        await store.closeCurrentTab()
+        XCTAssertEqual(store.pages.count, 2)
+        XCTAssertNotNil(store.selectedSession)
+        try await store.shutdown()
+        XCTAssertTrue(store.pages.isEmpty)
+    }
+
+    func testAwayCompletionMarksSelectedTabAndCancellationDoesNotNotify() async throws {
+        let (_, store, session) = try await connected()
+        var updates: [QueryAttentionUpdate] = []
+        store.attentionChanged = { updates.append($0) }
+        store.updateApplicationVisibility(false)
+        let document = try XCTUnwrap(store.document)
+        store.editor(for: document).edit(text: "fail", selection: NSRange(location: 0, length: 0))
+        await store.performEditorIntent(.submit)
+        try await until { store.document?.execution == "finished" && store.unseenCompletionCount == 1 }
+        XCTAssertTrue(try XCTUnwrap(store.workspace).unseenResultFailed)
+        XCTAssertEqual(try XCTUnwrap(store.workspace).completionRevision, 1)
+        XCTAssertEqual(updates.filter(\.requestAttention).count, 1)
+        XCTAssertEqual(store.selectedSession, session)
+        await store.selectSession(session)
+        XCTAssertEqual(store.unseenCompletionCount, 1)
+        store.updateApplicationVisibility(true)
+        XCTAssertEqual(store.unseenCompletionCount, 0)
+        XCTAssertTrue(try XCTUnwrap(updates.last).cancelAttention)
+        XCTAssertFalse(try XCTUnwrap(store.workspace).hasUnseenResult)
+        store.editor(for: try XCTUnwrap(store.document)).edit(text: "wait", selection: NSRange(location: 0, length: 0))
+        await store.performEditorIntent(.submit)
+        try await until { store.document?.execution == "running" }
+        store.updateApplicationVisibility(false)
+        await store.performEditorIntent(.cancel)
+        try await until { store.document?.execution == "finished" }
+        XCTAssertEqual(store.unseenCompletionCount, 0)
+        XCTAssertEqual(updates.filter(\.requestAttention).count, 1)
+        try await store.shutdown()
+        XCTAssertEqual(try XCTUnwrap(updates.last).unreadCount, 0)
+    }
+
+    func testBackgroundCompletionMarksOnlyItsTabUntilSelected() async throws {
+        let (bridge, store, first) = try await connected()
+        let document = try XCTUnwrap(store.document)
+        let _: Submission = try await bridge.request(.submit(session: first, document: document.document, sql: "delayed_result"), as: Submission.self)
+        try await until { store.document?.execution == "running" }
+        let opened = await store.connect(profile: "fixture")
+        XCTAssertTrue(opened)
+        let second = try XCTUnwrap(store.selectedSession)
+        try await until { store.workspaces.first(where: { $0.id == first })?.hasUnseenResult == true }
+        XCTAssertFalse(try XCTUnwrap(store.workspaces.first(where: { $0.id == second })).hasUnseenResult)
+        await store.selectSession(first)
+        XCTAssertFalse(try XCTUnwrap(store.workspace).hasUnseenResult)
+        await store.selectSession(second)
+        XCTAssertFalse(try XCTUnwrap(store.workspaces.first(where: { $0.id == first })).hasUnseenResult)
+        try await store.shutdown()
+    }
+
     func testHistoryRestoresSavedOutputWithoutSubmittingAndRefreshRetiresSelection() async throws {
         let (bridge, store, session) = try await connected()
         let original = try XCTUnwrap(store.document)
@@ -59,36 +234,6 @@ final class NavigationTests: XCTestCase {
         try await store.shutdown()
     }
 
-    func testCatalogListsDescribesFiltersAndRetires() async throws {
-        let (bridge, store, session) = try await connected()
-        let model = CatalogBrowserModel(bridge: bridge)
-        await model.open(session: session)
-        XCTAssertTrue(model.actions.contains { $0.id == "catalog.list.table" })
-        XCTAssertFalse(model.actions.contains { $0.id == "catalog.list.schema" })
-        model.read(.list(kind: "table"))
-        try await until { !model.loading }
-        let entry = try XCTUnwrap(model.entries.first)
-        XCTAssertEqual(entry.identity.name, "žluť table")
-        XCTAssertEqual(entry.attributes["comment"], .null)
-        model.read(.describe(entry.identity))
-        try await until { !model.loading }
-        XCTAssertEqual(model.entries.first?.attributes["column_name"], .string("id"))
-        model.read(.list(kind: "table", glob: "missing*"))
-        try await until { !model.loading }
-        XCTAssertTrue(model.entries.isEmpty)
-        model.read(.list(kind: "schema"))
-        try await until { !model.loading }
-        XCTAssertTrue(model.failure?.contains("Unsupported") == true)
-        model.read(.list(kind: "table"))
-        try await until { !model.loading }
-        XCTAssertNil(model.failure)
-        model.read(.list(kind: "table"))
-        model.retire()
-        try await Task.sleep(for: .milliseconds(30))
-        XCTAssertNil(model.session)
-        XCTAssertTrue(model.entries.isEmpty)
-        try await store.shutdown()
-    }
     func testPreviewSelectsCurrentStatementAndDropsDelayedOutputAfterNavigation() async throws {
         let (_, store, session) = try await connected()
         let document = try XCTUnwrap(store.document)
@@ -103,7 +248,7 @@ final class NavigationTests: XCTestCase {
         editor.edit(text: sql, selection: NSRange(location: sql.utf16.count, length: 0))
         let delayed = Task { await store.previewCurrent() }
         try await until { store.plan.loading }
-        await store.newDocument()
+        _ = await store.connect(profile: "fixture")
         await delayed.value
         XCTAssertFalse(store.plan.visible)
         XCTAssertNil(store.plan.plan)
@@ -111,11 +256,11 @@ final class NavigationTests: XCTestCase {
         let current = try XCTUnwrap(store.document)
         let buffer = store.editor(for: current)
         buffer.edit(text: "SELECT 'preview_error'", selection: NSRange(location: 0, length: 0))
-        store.editorChanged(session: session, document: current.document)
+        store.editorChanged(session: store.selectedSession!, document: current.document)
         await store.previewCurrent()
         XCTAssertEqual(store.plan.failure, "Fixture plan rejected")
         buffer.edit(text: "SELECT 42", selection: NSRange(location: 0, length: 0))
-        store.editorChanged(session: session, document: current.document)
+        store.editorChanged(session: store.selectedSession!, document: current.document)
         await store.previewCurrent()
         XCTAssertNotNil(store.plan.plan)
         XCTAssertNil(store.plan.failure)
@@ -130,7 +275,7 @@ final class NavigationTests: XCTestCase {
         try await until { !store.plan.visible }
         try await store.shutdown()
     }
-    func testRowInspectionPagesColumnsAndUsesSharedTapHoldPolicy() async throws {
+    func testRowInspectionAppendsColumnsAndUsesSharedTapHoldPolicy() async throws {
         let (bridge, store, session) = try await connected()
         let document = try XCTUnwrap(store.document)
         let editor = store.editor(for: document)
@@ -142,11 +287,26 @@ final class NavigationTests: XCTestCase {
         let row = RowInspectorModel(bridge: bridge, source: BridgeResultSource(bridge: bridge))
         row.show(address, pinned: true, columns: 128)
         try await until { row.values.count == 16 && !row.loading }
-        XCTAssertEqual(row.columnStart, 112)
+        XCTAssertEqual(row.values[0].text, "499")
+        for count in stride(from: 32, through: 128, by: 16) {
+            row.loadMore(columns: 128)
+            try await until { row.values.count == count && !row.loading }
+        }
         XCTAssertEqual(row.values.last?.text, "r499c127")
-        row.load(start: 0, columns: 128)
+        XCTAssertNil(row.moveRow(1, rows: 500, columns: 128, column: 127))
+        XCTAssertEqual(row.moveRow(-1, rows: 500, columns: 128, column: 127)?.row, 498)
+        _ = row.moveRow(-1, rows: 500, columns: 128, column: 127)
+        _ = row.moveRow(1, rows: 500, columns: 128, column: 127)
+        try await until { row.values.count == 16 && !row.loading }
+        XCTAssertEqual(row.values[0].text, "498")
+        XCTAssertEqual(row.address?.column, 127)
+        XCTAssertEqual(row.moveRow(1, rows: 500, columns: 128, column: 127)?.row, 499)
         try await until { row.values.count == 16 && !row.loading }
         XCTAssertEqual(row.values[0].text, "499")
+        row.inspectedCell = address
+        row.backOrClose()
+        XCTAssertNil(row.inspectedCell)
+        XCTAssertNotNil(row.address)
         row.release(milliseconds: 500)
         try await Task.sleep(for: .milliseconds(30))
         XCTAssertNotNil(row.address)
@@ -185,7 +345,7 @@ final class NavigationTests: XCTestCase {
         let editor = store.editor(for: document)
         editor.edit(text: "SELECT 42", selection: NSRange(location: 0, length: 0))
         store.editorChanged(session: session, document: document.document)
-        let coordinator = WindowPolicy.Coordinator(store: store, toolbar: NativeToolbarConfiguration(history: AnyView(EmptyView()), plan: AnyView(EmptyView()), newQuery: AnyView(EmptyView()), primary: AnyView(EmptyView()), placeholder: "", busy: false, shortcuts: {}, search: { _ in }, move: { _ in }, submit: {}, dismiss: {}))
+        let coordinator = WindowPolicy.Coordinator(store: store, toolbar: NativeToolbarConfiguration(history: AnyView(EmptyView()), plan: AnyView(EmptyView()), primary: AnyView(EmptyView()), placeholder: "", searchText: "", searchVisible: false, menuHeight: 360, focusRequest: 0, search: { _ in }, move: { _ in }, submit: {}, dismiss: { _ in }))
         let window = NSWindow()
         coordinator.attach(window)
         defer { coordinator.detach() }
@@ -224,6 +384,44 @@ final class NavigationTests: XCTestCase {
         XCTAssertEqual(ConnectionHealth.latency(999), "999µs")
         XCTAssertEqual(ConnectionHealth.latency(1250), "1ms")
         XCTAssertEqual(ConnectionHealth.latency(1_250_000), "1.25s")
+        try await store.shutdown()
+    }
+
+    func testFailedShutdownRetainsOnlyTheTabNeedingCleanup() async throws {
+        let (bridge, store, firstSession) = try await connected()
+        let first = try XCTUnwrap(store.document)
+        let _: Submission = try await bridge.request(.submit(session: firstSession, document: first.document, sql: "reject_close"), as: Submission.self)
+        try await until { store.document?.execution == "finished" }
+        let connectedSecond = await store.connect(profile: "fixture")
+        XCTAssertTrue(connectedSecond)
+        do {
+            try await store.shutdown()
+            XCTFail("Cleanup rejection was lost")
+        } catch let error as BridgeFailure { XCTAssertEqual(error.kind, "shutdown") }
+        XCTAssertEqual(store.workspaces.map(\.id), [firstSession])
+        XCTAssertEqual(store.selectedSession, firstSession)
+        XCTAssertTrue(store.navigationAvailable)
+        try await store.shutdown()
+        XCTAssertTrue(store.isClosed)
+        XCTAssertTrue(store.workspaces.isEmpty)
+    }
+
+    func testOpenPlanPinsLiveEstimateAndSurvivesModifierRelease() async throws {
+        let (_, store, session) = try await connected()
+        let document = try XCTUnwrap(store.document)
+        store.editor(for: document).edit(text: "SELECT 42", selection: NSRange(location: 0, length: 0))
+        store.editorChanged(session: session, document: document.document)
+        store.sendSharedKey(.primary, pressed: true, at: 1)
+        store.sendSharedKey(.preview, pressed: true, at: 2)
+        try await until { store.sharedInput?.hint.kind == "estimate_ready" }
+        await store.openCurrentPlan()
+        store.sendSharedKey(.preview, pressed: false, at: 420)
+        store.sendSharedKey(.primary, pressed: false, at: 421)
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertTrue(store.plan.visible)
+        XCTAssertTrue(store.plan.pinned)
+        XCTAssertNotNil(store.plan.plan)
+        XCTAssertEqual(store.document?.generation, 0)
         try await store.shutdown()
     }
 
@@ -274,7 +472,7 @@ final class NavigationTests: XCTestCase {
         store.sendSharedKey(.primary, pressed: true, at: 600)
         store.sendSharedKey(.preview, pressed: true, at: 601)
         try await until { store.plan.loading }
-        await store.newDocument()
+        _ = await store.connect(profile: "fixture")
         try await Task.sleep(for: .milliseconds(650))
         XCTAssertFalse(store.plan.visible)
         XCTAssertNil(store.plan.plan)

@@ -375,6 +375,14 @@ impl DbConnection {
         obj
     }
 
+    pub fn profile_name(&self) -> String {
+        self.imp()
+            .database_config
+            .get()
+            .map(|config| config.name.clone())
+            .unwrap_or_default()
+    }
+
     pub fn backend(&self) -> DatabaseBackend {
         self.imp()
             .database_config

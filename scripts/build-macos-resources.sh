@@ -6,10 +6,11 @@ if [[ $# != 2 ]]; then
     exit 2
 fi
 iconset="$1/Dzban.iconset"
+icon_source="$repo_root/macos/Resources/DzbanIcon.png"
 mkdir -p "$iconset" "$2"
 for size in 16 32 128 256 512; do
-    /usr/bin/sips -z "$size" "$size" "$repo_root/data/icons/com.rubyelders.dzban.png" --out "$iconset/icon_${size}x${size}.png" >/dev/null
+    /usr/bin/sips -z "$size" "$size" "$icon_source" --out "$iconset/icon_${size}x${size}.png" >/dev/null
     doubled=$((size * 2))
-    /usr/bin/sips -z "$doubled" "$doubled" "$repo_root/data/icons/com.rubyelders.dzban.png" --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
+    /usr/bin/sips -z "$doubled" "$doubled" "$icon_source" --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
 done
 /usr/bin/iconutil -c icns "$iconset" -o "$2/Dzban.icns"

@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import DzbanBridge
 import Foundation
@@ -99,10 +100,17 @@ struct ResultTileCache {
 public final class ResultViewport: ObservableObject {
     public static let pageRows = 64
     public static let pageColumns = 8
+    var tablePositions: [UUID: ResultTablePosition] = [:]
+    var isFinished: Bool { terminal }
+    weak var focusCycle: WorkspaceFocusCycle?
+    var isFocusable: Bool { availableRows > 0 && !columns.isEmpty }
+    @Published private(set) var focusRequest: UInt64 = 0
     @Published public private(set) var revision: UInt64 = 0
     @Published public private(set) var columns: [Column] = []
     @Published public private(set) var availableRows = 0
     @Published public private(set) var loadError: String?
+    @Published private(set) var copyError: String?
+    private var copyTask: Task<Void, Never>?
     @Published public var selected: ResultAddress?
     public private(set) var scope: ResultScope?
     public private(set) var peakCacheBytes = 0
@@ -145,6 +153,8 @@ public final class ResultViewport: ObservableObject {
     public func update(session: UUID, document: DocumentSnapshot) {
         let next = ResultScope(session: session, document: document.document, generation: document.generation)
         if scope != next {
+            copyTask?.cancel()
+            copyError = nil
             epoch &+= 1
             for item in active.values { item.task.cancel() }
             scope = next
@@ -170,11 +180,21 @@ public final class ResultViewport: ObservableObject {
         }
         terminal = document.execution == "finished"
         canRead = document.generation > 0 && document.resultAvailable
+        restoreTableSelection()
         revision &+= 1
         pump()
     }
 
+    private func restoreTableSelection() {
+        guard selected == nil, let scope, let position = tablePositions[scope.document],
+              !columns.isEmpty, position.headers == columns, availableRows > 0,
+              let row = position.row, row < availableRows || terminal else { return }
+        selected = ResultAddress(scope: scope, row: min(row, availableRows - 1), column: min(position.column, columns.count - 1))
+    }
+
     public func retire() {
+        copyTask?.cancel()
+        copyError = nil
         epoch &+= 1
         scope = nil
         for item in active.values { item.task.cancel() }
@@ -185,6 +205,29 @@ public final class ResultViewport: ObservableObject {
         selected = nil
         canRead = false
         revision &+= 1
+    }
+
+    func copyRows(_ rows: IndexSet, to pasteboard: NSPasteboard? = nil) {
+        let pasteboard = pasteboard ?? ResultMarkdown.pasteboard
+        guard let scope, !columns.isEmpty, !rows.isEmpty else { return }
+        copyTask?.cancel()
+        copyError = nil
+        let columns = columns
+        let rows = rows.intersection(IndexSet(integersIn: 0..<availableRows))
+        copyTask = Task { [weak self, source] in
+            do {
+                let markdown = try await ResultMarkdown.read(source: source, scope: scope, columns: columns.map(\.name), rows: rows)
+                try Task.checkCancellation()
+                guard self?.scope == scope else { return }
+                pasteboard.declareTypes([.string, NSPasteboard.PasteboardType("net.daringfireball.markdown")], owner: nil)
+                pasteboard.setString(markdown, forType: .string)
+                pasteboard.setString(markdown, forType: NSPasteboard.PasteboardType("net.daringfireball.markdown"))
+            } catch is CancellationError {
+            } catch {
+                guard !Task.isCancelled, self?.scope == scope else { return }
+                self?.copyError = error.localizedDescription
+            }
+        }
     }
 
     public func show(rows: Range<Int>, columns: Range<Int>) {
@@ -198,6 +241,8 @@ public final class ResultViewport: ObservableObject {
         let key = ResultTileKey(row: row / Self.pageRows * Self.pageRows, column: column / Self.pageColumns * Self.pageColumns)
         return cache.cell(row: row, column: column, key: key)
     }
+    func requestFocus() { focusRequest &+= 1 }
+
     public func select(row: Int, column: Int) {
         guard let scope, row >= 0, row < availableRows, columns.indices.contains(column) else {
             if selected != nil { selected = nil }
@@ -286,6 +331,7 @@ public final class ResultViewport: ObservableObject {
                     self.schemaBytes = bytes
                     self.cache.maximumBytes = self.maximumBytes - bytes
                     self.schemaReady = true
+                    self.restoreTableSelection()
                 case .page(let key, let start, let count, let width):
                     let page = try await source.page(scope, start: start, count: count, columnStart: key.column, columnCount: width)
                     guard !Task.isCancelled, let self, self.epoch == epoch, self.scope == scope else { return }

@@ -281,7 +281,7 @@ impl DatabaseTabManager {
         tab_bar.set_autohide(false);
         tab_bar.set_expand_tabs(false);
         tab_bar.set_focusable(true);
-        tab_bar.update_property(&[gtk4::accessible::Property::Label("Database tabs")]);
+        tab_bar.update_property(&[gtk4::accessible::Property::Label("Query tabs")]);
 
         container.append(&tab_bar);
         container.append(&tab_view);
@@ -386,10 +386,10 @@ impl DatabaseTabManager {
                         .map(|(name, (_, _, config, _))| (name.clone(), config.connection()))
                 };
 
-                if let Some((name, connection)) = connection {
+                if let Some((_name, connection)) = connection {
                     manager_clone
                         .statusbar
-                        .bind_to_connection(&name, &connection);
+                        .bind_to_connection(&connection.profile_name(), &connection);
                     manager_clone
                         .dispatch(AppEvent::SessionSelected(connection.session_interaction()));
                     return;
@@ -524,6 +524,10 @@ impl DatabaseTabManager {
     }
 
     fn dispatch(&self, event: AppEvent) {
+        if let AppEvent::SessionSelected(session) = &event {
+            self.runtime_bridge
+                .select_session_tab(session.as_ref().map(|session| session.scope.session));
+        }
         let update_plan = matches!(
             event,
             AppEvent::PreviewLoading | AppEvent::PreviewReady(_) | AppEvent::PreviewFailed(_)
@@ -650,17 +654,11 @@ impl DatabaseTabManager {
     }
 
     pub fn close_current_query_tab(&self) -> bool {
-        let Some((database_page, query_manager)) = self.current_database_tab() else {
+        let Some((page, _)) = self.current_database_tab() else {
             return false;
         };
-        let query_tabs = query_manager.tab_count();
-        if query_tabs > 0 && !query_manager.close_current_tab() {
-            return false;
-        }
-        if query_tabs == 0 {
-            self.cancel_query_preview();
-            self.tab_view.close_page(&database_page);
-        }
+        self.cancel_query_preview();
+        self.tab_view.close_page(&page);
         true
     }
 
@@ -689,8 +687,7 @@ impl DatabaseTabManager {
     }
 
     pub fn focus_query_tabs(&self) -> bool {
-        self.current_query_manager()
-            .is_some_and(|manager| manager.focus_tab_bar())
+        self.focus_database_tabs()
     }
 
     pub fn focus_query_editor(&self) -> bool {
@@ -739,43 +736,53 @@ impl DatabaseTabManager {
     }
 
     pub fn select_next_query_tab(&self) -> bool {
-        self.current_query_manager()
-            .is_some_and(|manager| manager.select_next_tab())
+        self.select_next_database_tab()
     }
 
     pub fn select_previous_query_tab(&self) -> bool {
-        self.current_query_manager()
-            .is_some_and(|manager| manager.select_previous_tab())
+        self.select_previous_database_tab()
     }
 
     pub fn rename_current_query_tab(&self, title: &str) -> bool {
-        self.current_query_manager()
-            .is_some_and(|manager| manager.rename_current_tab(title))
+        let Some((page, queries)) = self.current_database_tab() else {
+            return false;
+        };
+        if !queries.rename_current_tab(title) {
+            return false;
+        }
+        let profile = self
+            .tabs
+            .borrow()
+            .values()
+            .find(|(tab, _, _, _)| tab == &page)
+            .and_then(|(_, _, config, _)| config.connection().session_engine())
+            .and_then(|engine| self.runtime_bridge.query_tab(engine.id()))
+            .map(|tab| tab.profile.0);
+        if let Some(profile) = profile {
+            page.set_title(&format!("{profile} - {title}"));
+        }
+        true
     }
 
     pub fn current_query_tab_title(&self) -> Option<String> {
         self.current_query_manager()?.current_tab_title()
     }
 
-    pub fn query_tabs(&self) -> Vec<(u32, String)> {
-        self.current_query_manager()
-            .map_or_else(Vec::new, |manager| manager.tab_titles())
-    }
-
-    pub fn select_query_tab(&self, query_num: u32) -> bool {
-        self.current_query_manager()
-            .is_some_and(|manager| manager.select_tab(query_num))
-    }
-
-    pub fn open_database_tabs(&self) -> Vec<String> {
+    pub fn open_database_tabs(&self) -> Vec<(String, String)> {
         let mut tabs = self
             .tabs
             .borrow()
             .iter()
-            .map(|(name, (page, _, _, _))| (self.tab_view.page_position(page), name.clone()))
+            .map(|(name, (page, _, _, _))| {
+                (
+                    self.tab_view.page_position(page),
+                    name.clone(),
+                    page.title().to_string(),
+                )
+            })
             .collect::<Vec<_>>();
-        tabs.sort_by_key(|(position, _)| *position);
-        tabs.into_iter().map(|(_, name)| name).collect()
+        tabs.sort_by_key(|(position, _, _)| *position);
+        tabs.into_iter().map(|(_, id, title)| (id, title)).collect()
     }
 
     pub fn select_database_tab(&self, name: &str) -> bool {
@@ -791,121 +798,144 @@ impl DatabaseTabManager {
     }
 
     pub fn open_database(&self, db_name: &str) {
-        // First check if tab already exists
-        let existing_tab = {
-            let tabs = self.tabs.borrow();
-            tabs.get(db_name)
-                .map(|(page, query_manager, _, _)| (page.clone(), query_manager.clone()))
-        };
+        // Find database config
+        let config = Config::load().ok();
+        let db_config =
+            config.and_then(|c| c.databases.iter().find(|db| db.name == db_name).cloned());
 
-        if let Some((page, query_manager)) = existing_tab {
-            // Tab already exists, just select it
-            self.tab_view.set_selected_page(&page);
-            // Focus the current query editor
-            query_manager.focus_current_editor();
-        } else {
-            // Find database config
-            let config = Config::load().ok();
-            let db_config =
-                config.and_then(|c| c.databases.iter().find(|db| db.name == db_name).cloned());
+        if let Some(db_config) = db_config {
+            let profile_name = db_name.to_string();
+            let tab_name = gtk4::glib::uuid_string_random().to_string();
+            let db_name = tab_name.as_str();
+            if !self
+                .db_manager
+                .add_query_tab_config(tab_name.clone(), db_config)
+            {
+                return;
+            }
+            let config = self
+                .db_manager
+                .get_config(db_name)
+                .expect("newly added database config is available");
+            let connection = config.connection();
+            let (page, query_manager, state_widget) =
+                self.create_database_tab_for_profile(db_name, &profile_name);
+            let core_bridge = self.runtime_bridge.clone();
+            let core_queries = query_manager.clone();
+            let core_page = page.clone();
+            let label_profile = profile_name.clone();
+            connection.connect_notify_local(Some("state"), move |connection, _| {
+                if connection.state() == ConnectionState::Connected
+                    && let Some(tab) = connection
+                        .session_engine()
+                        .and_then(|engine| core_bridge.query_tab(engine.id()))
+                {
+                    core_page.set_title(&format!(
+                        "{} - {}",
+                        label_profile,
+                        tab.document.snapshot().title
+                    ));
+                    core_queries.use_session_tab(tab.document);
+                }
+            });
 
-            if let Some(db_config) = db_config {
-                if !self.db_manager.add_database_config(db_config) {
+            self.tabs.borrow_mut().insert(
+                db_name.to_string(),
+                (
+                    page.clone(),
+                    query_manager.clone(),
+                    config,
+                    state_widget.clone(),
+                ),
+            );
+
+            if self.tab_view.selected_page().as_ref() == Some(&page) {
+                self.statusbar
+                    .bind_to_connection(&profile_name, &connection);
+                self.dispatch(AppEvent::SessionSelected(connection.session_interaction()));
+            }
+
+            let page_for_state = page.clone();
+            let state_widget_for_state = state_widget.clone();
+            let db_name_for_state = profile_name.clone();
+            connection.connect_notify_local(Some("state"), move |connection, _| {
+                let state = connection.state();
+                let (_css_class, label) = match state {
+                    ConnectionState::Disconnected => ("dim-label", "Disconnected"),
+                    ConnectionState::Connecting => ("warning", "Connecting"),
+                    ConnectionState::Connected => ("success", "Connected"),
+                    ConnectionState::Error => ("error", "Error"),
+                };
+                page_for_state.set_icon(Some(&gtk4::gio::ThemedIcon::new(
+                    super::icons::database_backend(connection.backend()),
+                )));
+                page_for_state.set_loading(
+                    state == ConnectionState::Connecting || connection.query_running(),
+                );
+                state_widget_for_state
+                    .update_state(state, Some(&format!("{} - {}", db_name_for_state, label)));
+                if state == ConnectionState::Connected {
+                    connection.ping();
+                }
+            });
+
+            let manager_for_availability = self.clone();
+            let page_for_availability = page.clone();
+            connection.connect_notify_local(Some("operation-available"), move |connection, _| {
+                if manager_for_availability.tab_view.selected_page().as_ref()
+                    == Some(&page_for_availability)
+                {
+                    manager_for_availability
+                        .dispatch(AppEvent::SessionSelected(connection.session_interaction()));
+                }
+            });
+
+            let manager_for_operation = self.clone();
+            let page_for_operation = page.clone();
+            connection.connect_notify_local(Some("operation"), move |connection, _| {
+                if manager_for_operation.tab_view.selected_page().as_ref()
+                    != Some(&page_for_operation)
+                {
                     return;
                 }
-                let config = self
-                    .db_manager
-                    .get_config(db_name)
-                    .expect("newly added database config is available");
-                let connection = config.connection();
-                let (page, query_manager, state_widget) = self.create_database_tab(db_name);
+                page_for_operation.set_loading(connection.query_running());
+                manager_for_operation
+                    .dispatch(AppEvent::SessionSelected(connection.session_interaction()));
+            });
 
-                self.tabs.borrow_mut().insert(
-                    db_name.to_string(),
-                    (
-                        page.clone(),
-                        query_manager.clone(),
-                        config,
-                        state_widget.clone(),
-                    ),
-                );
-
-                if self.tab_view.selected_page().as_ref() == Some(&page) {
-                    self.statusbar.bind_to_connection(db_name, &connection);
-                    self.dispatch(AppEvent::SessionSelected(connection.session_interaction()));
+            let weak_connection = connection.downgrade();
+            gtk4::glib::timeout_add_seconds_local(5, move || {
+                let Some(connection) = weak_connection.upgrade() else {
+                    return gtk4::glib::ControlFlow::Break;
+                };
+                if connection.state() == ConnectionState::Disconnected {
+                    return gtk4::glib::ControlFlow::Break;
                 }
+                if connection.state() == ConnectionState::Connected {
+                    connection.ping();
+                }
+                gtk4::glib::ControlFlow::Continue
+            });
 
-                let page_for_state = page.clone();
-                let state_widget_for_state = state_widget.clone();
-                let db_name_for_state = db_name.to_string();
-                connection.connect_notify_local(Some("state"), move |connection, _| {
-                    let state = connection.state();
-                    let (css_class, label) = match state {
-                        ConnectionState::Disconnected => ("dim-label", "Disconnected"),
-                        ConnectionState::Connecting => ("warning", "Connecting"),
-                        ConnectionState::Connected => ("success", "Connected"),
-                        ConnectionState::Error => ("error", "Error"),
-                    };
-                    page_for_state.set_icon(Some(&create_colored_dot_icon(css_class)));
-                    state_widget_for_state
-                        .update_state(state, Some(&format!("{} - {}", db_name_for_state, label)));
-                    if state == ConnectionState::Connected {
-                        connection.ping();
-                    }
-                });
-
-                let manager_for_availability = self.clone();
-                let page_for_availability = page.clone();
-                connection.connect_notify_local(
-                    Some("operation-available"),
-                    move |connection, _| {
-                        if manager_for_availability.tab_view.selected_page().as_ref()
-                            == Some(&page_for_availability)
-                        {
-                            manager_for_availability.dispatch(AppEvent::SessionSelected(
-                                connection.session_interaction(),
-                            ));
-                        }
-                    },
-                );
-
-                let manager_for_operation = self.clone();
-                let page_for_operation = page.clone();
-                connection.connect_notify_local(Some("operation"), move |connection, _| {
-                    if manager_for_operation.tab_view.selected_page().as_ref()
-                        != Some(&page_for_operation)
-                    {
-                        return;
-                    }
-                    manager_for_operation
-                        .dispatch(AppEvent::SessionSelected(connection.session_interaction()));
-                });
-
-                let weak_connection = connection.downgrade();
-                gtk4::glib::timeout_add_seconds_local(5, move || {
-                    let Some(connection) = weak_connection.upgrade() else {
-                        return gtk4::glib::ControlFlow::Break;
-                    };
-                    if connection.state() == ConnectionState::Disconnected {
-                        return gtk4::glib::ControlFlow::Break;
-                    }
-                    if connection.state() == ConnectionState::Connected {
-                        connection.ping();
-                    }
-                    gtk4::glib::ControlFlow::Continue
-                });
-
-                connection.connect();
-            }
+            connection.connect();
         }
     }
 
+    #[cfg(test)]
     fn create_database_tab(
         &self,
         db_name: &str,
     ) -> (TabPage, QueryTabManager, ConnectionStateWidget) {
+        self.create_database_tab_for_profile(db_name, db_name)
+    }
+
+    fn create_database_tab_for_profile(
+        &self,
+        db_name: &str,
+        profile_name: &str,
+    ) -> (TabPage, QueryTabManager, ConnectionStateWidget) {
         // Create query tab manager for this database
-        let query_manager = QueryTabManager::new(db_name);
+        let query_manager = QueryTabManager::new(profile_name);
         query_manager.bind_preview_service(self.plan_preview.clone());
         let content = query_manager.get_widget().clone();
 
@@ -919,8 +949,7 @@ impl DatabaseTabManager {
         // Add page to TabView
         let page = self.tab_view.append(&content);
 
-        // Set title - just the database name
-        page.set_title(db_name);
+        page.set_title(&format!("{profile_name} - Connecting"));
 
         // Set orange/yellow dot icon for connecting state
         let icon = create_colored_dot_icon("warning");
@@ -941,6 +970,7 @@ impl DatabaseTabManager {
 
         // Open first query tab
         query_manager.new_query_tab();
+        query_manager.set_single_tab();
 
         // Select the newly created tab
         self.tab_view.set_selected_page(&page);
@@ -1155,15 +1185,7 @@ impl DatabaseTabManager {
     }
 
     pub fn new_query_in_current_db(&self) {
-        if let Some(current_page) = self.tab_view.selected_page() {
-            let tabs = self.tabs.borrow();
-            for (page, query_manager, _, _) in tabs.values() {
-                if page == &current_page {
-                    query_manager.new_query_tab();
-                    return;
-                }
-            }
-        }
+        self.open_connection_manager();
     }
 
     pub fn open_connection_manager(&self) {

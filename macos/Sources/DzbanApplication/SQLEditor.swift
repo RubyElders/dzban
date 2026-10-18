@@ -32,6 +32,11 @@ public enum EditorOffsets {
 }
 
 public enum EditorShortcuts {
+    static func queryPrimary(_ modifiers: NSEvent.ModifierFlags) -> Bool {
+        let keys = modifiers.intersection([.command, .control, .option, .shift])
+        return keys == .command || keys == [.command, .shift]
+    }
+
     public static func intent(keyCode: UInt16, modifiers: NSEvent.ModifierFlags, isRepeat: Bool, composing: Bool) -> EditorIntent? {
         guard !isRepeat, !composing else { return nil }
         let modifiers = modifiers.intersection([.command, .control, .option, .shift])
@@ -60,6 +65,7 @@ public final class EditorBuffer: ObservableObject {
     public init(text: String) {
         self.text = text
         textView.string = text
+        textView.highlightSyntax()
     }
 
     public func edit(text: String, selection: NSRange) {
@@ -73,6 +79,13 @@ public final class EditorBuffer: ObservableObject {
         textView.insertText(text, replacementRange: range)
         edit(text: textView.string, selection: textView.selectedRange())
         acknowledge(version)
+    }
+
+    weak var focusCycle: WorkspaceFocusCycle?
+
+    public func requestFocus() {
+        textView.focusWhenAttached = true
+        textView.focusIfNeeded()
     }
 
     func retire() {
@@ -107,6 +120,7 @@ public struct SQLEditor: NSViewRepresentable {
         let view = buffer.textView
         view.delegate = context.coordinator
         view.intent = action
+        buffer.requestFocus()
         return buffer.scrollView
     }
     public func updateNSView(_ scroll: NSScrollView, context: Context) {
@@ -114,6 +128,11 @@ public struct SQLEditor: NSViewRepresentable {
         context.coordinator.contextChanged = contextChanged
         buffer.textView.intent = action
         if buffer.textView.isEditable != editable { buffer.textView.isEditable = editable }
+        buffer.focusCycle?.update(buffer.textView, included: editable) { [weak buffer] in buffer?.requestFocus() }
+    }
+
+    public static func dismantleNSView(_ scroll: NSScrollView, coordinator: Coordinator) {
+        coordinator.buffer.focusCycle?.remove(coordinator.buffer.textView)
     }
 
     @MainActor
@@ -124,6 +143,7 @@ public struct SQLEditor: NSViewRepresentable {
         init(buffer: EditorBuffer, changed: @escaping () -> Void, contextChanged: @escaping () -> Void = {}) { self.buffer = buffer; self.changed = changed; self.contextChanged = contextChanged }
         public func textDidChange(_ notification: Notification) {
             buffer.edit(text: buffer.textView.string, selection: buffer.textView.selectedRange())
+            buffer.textView.needsDisplay = true
             changed()
         }
         public func textViewDidChangeSelection(_ notification: Notification) {
@@ -137,6 +157,15 @@ public struct SQLEditor: NSViewRepresentable {
 @MainActor
 final class SQLTextView: NSTextView {
     var intent: ((EditorIntent) -> Bool)?
+    var focusWhenAttached = false
+    override var textContainerOrigin: NSPoint {
+        NSPoint(x: WorkspaceLayout.outerInset + 2, y: super.textContainerOrigin.y)
+    }
+
+    func focusIfNeeded() {
+        guard focusWhenAttached, let window, window.attachedSheet == nil else { return }
+        if window.makeFirstResponder(self) { focusWhenAttached = false }
+    }
     private let documentUndoManager = UndoManager()
     private let documentStorage: NSTextStorage
     override var undoManager: UndoManager? { documentUndoManager }
@@ -159,7 +188,8 @@ final class SQLTextView: NSTextView {
         isAutomaticSpellingCorrectionEnabled = false
         isContinuousSpellCheckingEnabled = false
         font = .monospacedSystemFont(ofSize: 14, weight: .regular)
-        textContainerInset = NSSize(width: 14, height: 14)
+        textContainerInset = NSSize(width: (WorkspaceLayout.outerInset + 2 + WorkspaceLayout.textInset) / 2, height: 12)
+        textContainer?.lineFragmentPadding = 0
         isVerticallyResizable = true
         isHorizontallyResizable = false
         autoresizingMask = [.width]
@@ -169,6 +199,40 @@ final class SQLTextView: NSTextView {
         setAccessibilityHelp("Command-Return runs the selection or current statement. Escape cancels active work.")
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    func highlightSyntax() {
+        guard !hasMarkedText(), let layoutManager else { return }
+        let range = NSRange(location: 0, length: string.utf16.count)
+        layoutManager.removeTemporaryAttribute(.foregroundColor, forCharacterRange: range)
+        let dark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        for token in SQLSyntax.tokens(in: string) {
+            let color: NSColor
+            switch token.kind {
+            case .keyword: color = dark ? .systemPurple : NSColor(calibratedRed: 0.5, green: 0.12, blue: 0.58, alpha: 1)
+            case .string: color = dark ? .systemGreen : NSColor(calibratedRed: 0.08, green: 0.38, blue: 0.18, alpha: 1)
+            case .number: color = dark ? .systemBlue : NSColor(calibratedRed: 0.1, green: 0.28, blue: 0.62, alpha: 1)
+            case .comment: color = .secondaryLabelColor
+            case .identifier: color = dark ? .systemTeal : NSColor(calibratedRed: 0.05, green: 0.37, blue: 0.43, alpha: 1)
+            case .function: color = dark ? .systemOrange : NSColor(calibratedRed: 0.53, green: 0.28, blue: 0.02, alpha: 1)
+            }
+            layoutManager.addTemporaryAttribute(.foregroundColor, value: color, forCharacterRange: token.range)
+        }
+        needsDisplay = true
+    }
+
+    override func didChangeText() { super.didChangeText(); highlightSyntax() }
+    override func unmarkText() { super.unmarkText(); highlightSyntax() }
+    override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); highlightSyntax() }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard string.isEmpty else { return }
+        let origin = textContainerOrigin
+        ("Write a SQL query..." as NSString).draw(at: origin, withAttributes: [
+            .font: font ?? NSFont.monospacedSystemFont(ofSize: 14, weight: .regular),
+            .foregroundColor: NSColor.placeholderTextColor,
+        ])
+    }
 
     @objc func undo(_ sender: Any?) { if isEditable && documentUndoManager.canUndo { documentUndoManager.undo() } }
     @objc func redo(_ sender: Any?) { if isEditable && documentUndoManager.canRedo { documentUndoManager.redo() } }
@@ -204,6 +268,7 @@ final class SQLTextView: NSTextView {
     }
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        focusIfNeeded()
         NotificationCenter.default.removeObserver(self, name: NSWindow.didResignKeyNotification, object: nil)
         if let window { NotificationCenter.default.addObserver(self, selector: #selector(windowResigned), name: NSWindow.didResignKeyNotification, object: window) }
     }

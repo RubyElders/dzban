@@ -76,12 +76,153 @@ private actor ViewportSourceFixture: ResultSource {
 
 @MainActor
 final class ResultViewportTests: XCTestCase {
+    func testHeaderTracksHorizontalScrollBeforeReturningToRunLoop() throws {
+        XCTAssertFalse(ResultScrollView.isCompatibleWithResponsiveScrolling)
+        let table = NSTableView(frame: NSRect(x: 0, y: 0, width: 2400, height: 300))
+        for index in 0..<12 {
+            let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("column_\(index)"))
+            column.width = 200
+            table.addTableColumn(column)
+        }
+        let scroll = ResultScrollView(frame: NSRect(x: 0, y: 0, width: 600, height: 320))
+        scroll.hasHorizontalScroller = true
+        scroll.documentView = table
+        let ruler = NSRulerView(scrollView: scroll, orientation: .verticalRuler)
+        ruler.ruleThickness = 40
+        ruler.clientView = table
+        scroll.verticalRulerView = ruler
+        scroll.hasVerticalRuler = true
+        scroll.rulersVisible = true
+        scroll.tile()
+        let header = try XCTUnwrap(table.headerView)
+        let headerClip = try XCTUnwrap(header.superview as? NSClipView)
+        for offset in stride(from: 0, through: 1000, by: 17) {
+            scroll.contentView.scroll(to: NSPoint(x: CGFloat(offset), y: scroll.contentView.bounds.minY))
+            scroll.reflectScrolledClipView(scroll.contentView)
+            let bodyX = scroll.contentView.frame.minX - scroll.contentView.bounds.minX
+            let headerX = headerClip.frame.minX - headerClip.bounds.minX
+            XCTAssertEqual(headerX, bodyX, accuracy: 0.01)
+            XCTAssertEqual(headerClip.frame.minX, ruler.frame.maxX, accuracy: 0.01)
+        }
+    }
+
     private func eventually(_ condition: @MainActor () -> Bool) async throws {
         let deadline = ContinuousClock.now + .seconds(5)
         while !condition() {
             if ContinuousClock.now >= deadline { XCTFail("Viewport did not reach the expected state"); throw ViewportFailure("Viewport test timed out") }
             try await Task.sleep(for: .milliseconds(5))
         }
+    }
+
+    func testFocusCycleChangesResponderSynchronouslyForBackToBackShortcuts() async throws {
+        let model = ResultViewport(source: ViewportSourceFixture())
+        model.update(session: UUID(), document: try resultSnapshot(rows: 3))
+        defer { model.retire() }
+        try await eventually { !model.columns.isEmpty }
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 300), styleMask: [.titled], backing: .buffered, defer: false)
+        let editor = EditorBuffer(text: "SELECT 1")
+        editor.textView.frame = NSRect(x: 0, y: 0, width: 250, height: 280)
+        window.contentView?.addSubview(editor.textView)
+        let table = NativeResultTable(frame: NSRect(x: 280, y: 0, width: 300, height: 280))
+        table.addTableColumn(NSTableColumn(identifier: .init("value")))
+        let coordinator = ResultTable.Coordinator(model: model)
+        coordinator.table = table
+        table.dataSource = coordinator
+        table.allowsMultipleSelection = true
+        window.contentView?.addSubview(table)
+        table.reloadData()
+        let cycle = WorkspaceFocusCycle()
+        cycle.update(editor.textView, included: true) { editor.requestFocus() }
+        cycle.update(table, included: true) { coordinator.focus() }
+        editor.requestFocus()
+        XCTAssertTrue(window.firstResponder === editor.textView)
+        for _ in 0..<3 {
+            cycle.advance(in: window)
+            XCTAssertTrue(window.firstResponder === table)
+            table.selectAll(nil)
+            XCTAssertEqual(table.selectedRowIndexes, IndexSet(integersIn: 0..<3))
+            cycle.advance(in: window)
+            XCTAssertTrue(window.firstResponder === editor.textView)
+        }
+    }
+
+    func testRerunRestoresScrollAndCellOnlyForMatchingHeaders() async throws {
+        let model = ResultViewport(source: ViewportSourceFixture())
+        let session = UUID(), document = UUID()
+        model.update(session: session, document: try resultSnapshot(document: document, rows: 200))
+        defer { model.retire() }
+        try await eventually { !model.columns.isEmpty }
+        let table = NativeResultTable(frame: NSRect(x: 0, y: 0, width: 5440, height: 4800))
+        table.rowHeight = 24
+        for index in 0..<32 {
+            let column = NSTableColumn(identifier: .init("column_\(index)"))
+            column.width = 170
+            table.addTableColumn(column)
+        }
+        let coordinator = ResultTable.Coordinator(model: model)
+        coordinator.scope = model.scope
+        coordinator.columns = model.columns
+        coordinator.table = table
+        table.dataSource = coordinator
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 600, height: 240))
+        scroll.documentView = table
+        table.reloadData()
+        scroll.contentView.scroll(to: NSPoint(x: 900, y: 2400))
+        table.focusedColumn = 7
+        table.selectRowIndexes(IndexSet(integer: 110), byExtendingSelection: false)
+        coordinator.rememberPosition()
+        let position = try XCTUnwrap(model.tablePositions[document])
+        XCTAssertEqual(position.origin.x, 900, accuracy: 1)
+        XCTAssertEqual(position.origin.y, 2400, accuracy: 1)
+        model.update(session: session, document: try resultSnapshot(document: document, generation: 2, rows: 200))
+        try await eventually { !model.columns.isEmpty }
+        coordinator.scope = model.scope
+        coordinator.columns = model.columns
+        coordinator.pendingPosition = position
+        scroll.contentView.scroll(to: .zero)
+        table.deselectAll(nil)
+        coordinator.restorePosition()
+        XCTAssertEqual(scroll.contentView.bounds.minX, 900, accuracy: 1)
+        XCTAssertEqual(scroll.contentView.bounds.minY, 2400, accuracy: 1)
+        XCTAssertEqual(model.selected?.row, 110)
+        XCTAssertEqual(model.selected?.column, 7)
+        XCTAssertEqual(model.selected?.scope.generation, 2)
+        XCTAssertNil(coordinator.pendingPosition)
+        coordinator.pendingPosition = ResultTablePosition(headers: [], origin: position.origin, widths: position.widths, row: 110, column: 7, rowNumberSelected: false)
+        scroll.contentView.scroll(to: .zero)
+        coordinator.restorePosition()
+        XCTAssertEqual(scroll.contentView.bounds.origin, .zero)
+        XCTAssertNil(model.tablePositions[document])
+    }
+
+    func testRerunPositionWaitsForStreamingRowsAndClampsShorterResults() async throws {
+        let model = ResultViewport(source: ViewportSourceFixture())
+        let session = UUID(), document = UUID()
+        model.update(session: session, document: try resultSnapshot(document: document, rows: 20, phase: "receiving", execution: "running"))
+        defer { model.retire() }
+        try await eventually { !model.columns.isEmpty }
+        let table = NativeResultTable(frame: NSRect(x: 0, y: 0, width: 600, height: 480))
+        table.rowHeight = 24
+        table.addTableColumn(NSTableColumn(identifier: .init("value")))
+        let coordinator = ResultTable.Coordinator(model: model)
+        coordinator.scope = model.scope
+        coordinator.columns = model.columns
+        coordinator.table = table
+        table.dataSource = coordinator
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 600, height: 240))
+        scroll.documentView = table
+        table.reloadData()
+        let position = ResultTablePosition(headers: model.columns, origin: NSPoint(x: 0, y: 2400), widths: [600], row: 110, column: 0, rowNumberSelected: false)
+        model.tablePositions[document] = position
+        coordinator.pendingPosition = position
+        coordinator.restorePosition()
+        XCTAssertNotNil(coordinator.pendingPosition)
+        XCTAssertNil(model.selected)
+        model.update(session: session, document: try resultSnapshot(document: document, rows: 20))
+        coordinator.restorePosition()
+        XCTAssertNil(coordinator.pendingPosition)
+        XCTAssertEqual(model.selected?.row, 19)
+        XCTAssertLessThan(scroll.contentView.bounds.minY, 2400)
     }
 
     func testLateFailuresCannotReplaceNewOutputAndReadsStayBounded() async throws {
@@ -205,5 +346,85 @@ final class ResultViewportTests: XCTestCase {
         XCTAssertEqual(ResultStatus.describe(try resultSnapshot(rows: 5, phase: "failed_awaiting_cleanup", execution: "running")), "Result capture failed; waiting for cleanup")
         XCTAssertEqual(ResultStatus.describe(try resultSnapshot(rows: 5, termination: "canceled")), "Canceled - 5 rows")
         XCTAssertEqual(ResultStatus.describe(try resultSnapshot(rows: 0, phase: "waiting_for_schema", execution: "running")), "Waiting for schema")
+    }
+}
+
+@MainActor
+final class ResultMarkdownTests: XCTestCase {
+    func testEscapesMarkdownAndKeepsMultilineValuesInOneRow() {
+        XCTAssertEqual(ResultMarkdown.escape("a|b\\c\r\n<d>&*_`[]"), "a\\|b\\\\c<br>&lt;d&gt;&amp;\\*\\_\\`\\[\\]")
+    }
+
+    func testCopiesOnlySelectedRowWithAllColumnHeaders() async throws {
+        let source = ViewportSourceFixture()
+        let scope = ResultScope(session: UUID(), document: UUID(), generation: 1)
+        let result = try await ResultMarkdown.read(source: source, scope: scope, columns: ["First", "Second"], rows: IndexSet(integer: 75))
+        XCTAssertEqual(result, "| First | Second |\n| --- | --- |\n| \(scope.document.uuidString):75:0 | \(scope.document.uuidString):75:1 |\n")
+    }
+
+    func testCopiesAllRowsAndColumnsBeyondVisiblePages() async throws {
+        let source = ViewportSourceFixture()
+        let scope = ResultScope(session: UUID(), document: UUID(), generation: 1)
+        let result = try await ResultMarkdown.read(source: source, scope: scope, columns: (0..<12).map { "column_\($0)" }, rows: IndexSet(integersIn: 0..<130))
+        XCTAssertEqual(result.split(separator: "\n").count, 132)
+        XCTAssertTrue(result.contains("\(scope.document.uuidString):129:11"))
+        XCTAssertTrue(result.contains("\(scope.document.uuidString):0:0"))
+    }
+
+    func testSelectAllAndCopyUseNativeTableSelection() {
+        final class Rows: NSObject, NSTableViewDataSource {
+            func numberOfRows(in tableView: NSTableView) -> Int { 4 }
+        }
+        let rows = Rows()
+        let table = NativeResultTable()
+        table.dataSource = rows
+        table.allowsMultipleSelection = true
+        table.addTableColumn(NSTableColumn(identifier: .init("value")))
+        table.reloadData()
+        var copied = IndexSet()
+        table.copyRows = { copied = $0 }
+        table.selectAll(nil)
+        table.copy(nil)
+        XCTAssertEqual(copied, IndexSet(integersIn: 0..<4))
+        table.selectRowIndexes(IndexSet(integer: 2), byExtendingSelection: false)
+        table.copy(nil)
+        XCTAssertEqual(copied, IndexSet(integer: 2))
+    }
+}
+
+private actor MarkdownCellSource: ResultSource {
+    let original = String(repeating: "long|value\n", count: 300)
+    let stale: Bool
+    init(stale: Bool = false) { self.stale = stale }
+    func schema(_ scope: ResultScope) async throws -> ResultSchema { fatalError("Schema is supplied by the viewport") }
+    func page(_ scope: ResultScope, start: Int, count: Int, columnStart: Int, columnCount: Int) async throws -> ViewportPage {
+        try resultDTO(["document": scope.document.uuidString, "generation": stale ? scope.generation + 1 : scope.generation,
+                       "start": start, "column_start": columnStart,
+                       "rows": [[ ["text": "long", "length": original.unicodeScalars.count, "truncated": true] ]]], as: ViewportPage.self)
+    }
+    func cell(_ address: ResultAddress, offset: Int, count: Int) async throws -> CellChunk {
+        try resultDTO(["document": address.scope.document.uuidString, "generation": address.scope.generation,
+                       "row": address.row, "column": address.column, "offset": offset, "total": original.unicodeScalars.count,
+                       "text": String(original.unicodeScalars.dropFirst(offset).prefix(count))], as: CellChunk.self)
+    }
+}
+
+extension ResultMarkdownTests {
+    func testReadsFullValuesInsteadOfTruncatedPreviews() async throws {
+        let source = MarkdownCellSource()
+        let scope = ResultScope(session: UUID(), document: UUID(), generation: 1)
+        let result = try await ResultMarkdown.read(source: source, scope: scope, columns: ["Value"], rows: IndexSet(integer: 0))
+        let original = await source.original
+        XCTAssertEqual(result, "| Value |\n| --- |\n| " + ResultMarkdown.escape(original) + " |\n")
+    }
+
+    func testRejectsRetiredOutputInsteadOfCopyingWrongRows() async throws {
+        let scope = ResultScope(session: UUID(), document: UUID(), generation: 1)
+        do {
+            _ = try await ResultMarkdown.read(source: MarkdownCellSource(stale: true), scope: scope, columns: ["Value"], rows: IndexSet(integer: 0))
+            XCTFail("Retired output must not be copied")
+        } catch {
+            XCTAssertEqual(error.localizedDescription, "Results changed during copy")
+        }
     }
 }

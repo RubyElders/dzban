@@ -3,10 +3,21 @@ import DzbanBridge
 import Foundation
 
 public struct Workspace: Identifiable {
+    public let tab: UUID
     public let id: UUID
     public let profile: String
     public var documents: [DocumentSnapshot]
     public var selectedDocument: UUID?
+    public var hasUnseenResult = false
+    public var unseenResultFailed = false
+    public var completionRevision: UInt64 = 0
+}
+
+public struct WorkspacePage: Identifiable {
+    public let id: UUID
+    public var session: UUID?
+    public var savedProfile: String?
+    public var savedDraft = ""
 }
 
 @MainActor
@@ -15,14 +26,21 @@ public final class ApplicationStore: ObservableObject {
     @Published public private(set) var profiles: [Profiles.Profile] = []
     @Published public private(set) var workspaces: [Workspace] = []
     @Published public private(set) var selectedSession: UUID?
+    @Published public private(set) var pages: [WorkspacePage]
+    @Published public private(set) var selectedPage: UUID
     @Published public private(set) var pendingProfile: String?
-    @Published public private(set) var closingSession: UUID?
+    @Published public private(set) var closingSessions: Set<UUID> = []
     @Published public private(set) var controls: Controls?
     @Published public private(set) var isShuttingDown = false
     @Published public private(set) var isClosed = false
     @Published public var failure: String?
-    @Published public var historyVisible = true
+    public var historyFocused = false
+    @Published public var historyVisible = false {
+        didSet { if historyVisible != oldValue { historyFocused = historyVisible } }
+    }
+    @Published var actionSearchRequest = 0
     @Published public var shortcutsVisible = false
+    @Published public var connectionsVisible = true
     @Published public private(set) var health: [UUID: ConnectionHealth] = [:]
     @Published public private(set) var profileHealth: [String: ConnectionHealth] = [:]
     @Published public private(set) var sharedInput: InputProjection?
@@ -36,12 +54,31 @@ public final class ApplicationStore: ObservableObject {
     private var sharedInputMode = false
     private var inputHeld: Set<NativeInput.Key> = []
 
+    private var queryAttention = QueryAttentionState()
+    var attentionChanged: ((QueryAttentionUpdate) -> Void)?
+    var unseenCompletionCount: Int { queryAttention.unseen.count }
+
     public let bridge: Bridge
+    let focusCycle = WorkspaceFocusCycle()
     public let results: ResultViewport
+    public let cellInspector: CellInspectorModel
+    let rowInspector: RowInspectorModel
     public let plan: PlanPreviewModel
     #if DZBAN_TEST_FIXTURES
     let responsiveness = MainThreadProbe()
     #endif
+    private struct SavedWorkspace: Codable {
+        struct Tab: Codable {
+            let profile: String?
+            let draft: String
+        }
+        let version: Int
+        let tabs: [Tab]
+        let selected: Int
+    }
+    private let restorationURL: URL?
+    private var started = false
+    private var restoring = false
     private var connectionIntent: UUID?
     private var controlRevision: UInt64 = 0
     private var navigationRevision: UInt64 = 0
@@ -54,10 +91,18 @@ public final class ApplicationStore: ObservableObject {
     private var contextVersions: [UUID: UInt64] = [:]
     private var draftWorkers: [UUID: Task<Void, Never>] = [:]
 
-    public init(bridge: Bridge, resultSource: (any ResultSource)? = nil) {
+    public init(bridge: Bridge, resultSource: (any ResultSource)? = nil, restorationURL: URL? = nil) {
+        self.restorationURL = restorationURL
+        let page = WorkspacePage(id: UUID(), session: nil)
+        pages = [page]
+        selectedPage = page.id
         self.bridge = bridge
         plan = PlanPreviewModel(bridge: bridge)
-        results = ResultViewport(source: resultSource ?? BridgeResultSource(bridge: bridge))
+        let source = resultSource ?? BridgeResultSource(bridge: bridge)
+        results = ResultViewport(source: source)
+        results.focusCycle = focusCycle
+        cellInspector = CellInspectorModel(source: source)
+        rowInspector = RowInspectorModel(bridge: bridge, source: source)
         plan.userPin = { [weak self] in
             guard let self, self.sharedInputMode else { return false }
             self.enqueueInput(.pin)
@@ -66,17 +111,63 @@ public final class ApplicationStore: ObservableObject {
         plan.userClose = { [weak self] in self?.clearSharedInput() }
     }
 
+    public static var defaultRestorationURL: URL {
+        let environment = ProcessInfo.processInfo.environment
+        let data = environment["XDG_DATA_HOME"].map { URL(fileURLWithPath: $0, isDirectory: true) }
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/share", isDirectory: true)
+        return data.appendingPathComponent("dzban/native-workspace.json")
+    }
+
+    public func start() async {
+        guard !started else { return }
+        started = true
+        restoring = true
+        defer { restoring = false }
+        await loadProfiles()
+        guard navigationAvailable, let restorationURL, FileManager.default.fileExists(atPath: restorationURL.path) else { return }
+        do {
+            let saved = try JSONDecoder().decode(SavedWorkspace.self, from: Data(contentsOf: restorationURL))
+            guard saved.version == 1, !saved.tabs.isEmpty else { return }
+            pages = saved.tabs.map { WorkspacePage(id: UUID(), session: nil, savedProfile: $0.profile, savedDraft: $0.draft) }
+            let selected = pages[min(max(saved.selected, 0), pages.count - 1)].id
+            for page in pages {
+                guard navigationAvailable else { return }
+                await selectPage(page.id)
+                if let profile = page.savedProfile { _ = await connect(profile: profile) }
+            }
+            await selectPage(selected)
+            if let document { editor(for: document).requestFocus() }
+        } catch { show(error) }
+    }
+
+    private func saveWorkspace() throws {
+        guard let restorationURL, !restoring else { return }
+        let tabs = pages.map { page -> SavedWorkspace.Tab in
+            let workspace = workspaces.first { $0.id == page.session }
+            let document = workspace?.documents.first
+            let draft = document.map { editors[$0.document]?.text ?? $0.draft } ?? page.savedDraft
+            return SavedWorkspace.Tab(profile: workspace?.profile ?? page.savedProfile, draft: draft)
+        }
+        let saved = SavedWorkspace(version: 1, tabs: tabs, selected: pages.firstIndex { $0.id == selectedPage } ?? 0)
+        let directory = restorationURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try JSONEncoder().encode(saved).write(to: restorationURL, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: restorationURL.path)
+    }
+
     public var workspace: Workspace? { workspaces.first { $0.id == selectedSession } }
     public var document: DocumentSnapshot? {
         guard let workspace else { return nil }
         return workspace.documents.first { $0.document == workspace.selectedDocument }
     }
-    public var canPreview: Bool { navigationAvailable && controls?.primaryAction == "run" && backendActions.contains { $0.id == "query.plan" } }
-    public var navigationAvailable: Bool { closingSession == nil && !isShuttingDown && !isClosed }
+    public var canPreview: Bool { currentTabAvailable && !connectionsVisible && !shortcutsVisible && controls?.primaryAction == "run" && backendActions.contains { $0.id == "query.plan" } }
+    public var navigationAvailable: Bool { !isShuttingDown && !isClosed }
+    public var currentTabAvailable: Bool { navigationAvailable && !(selectedSession.map { closingSessions.contains($0) } ?? false) }
 
     public func editor(for document: DocumentSnapshot) -> EditorBuffer {
         if let editor = editors[document.document] { return editor }
         let editor = EditorBuffer(text: document.draft)
+        editor.focusCycle = focusCycle
         editors[document.document] = editor
         return editor
     }
@@ -131,7 +222,7 @@ public final class ApplicationStore: ObservableObject {
     }
 
     private func editorCommand(_ intent: EditorIntent, session: UUID?, document: UUID?) -> BridgeCommand? {
-        guard navigationAvailable, let session = session ?? selectedSession,
+        guard currentTabAvailable, !connectionsVisible, !shortcutsVisible, let session = session ?? selectedSession,
               let workspace = workspaces.first(where: { $0.id == session }),
               let snapshot = workspace.documents.first(where: { $0.document == (document ?? workspace.selectedDocument) }) else { return nil }
         let editor = editor(for: snapshot)
@@ -155,6 +246,12 @@ public final class ApplicationStore: ObservableObject {
             let _: EditorOutcome = try await bridge.request(command, as: EditorOutcome.self)
             await refreshControls()
         } catch { show(error) }
+    }
+
+    public func openCurrentPlan() async {
+        guard canPreview else { return }
+        await prepareLegacyPreview()
+        await previewCurrent(pinned: true)
     }
 
     public func previewCurrent(pinned: Bool = false, display: Bool = true) async {
@@ -199,13 +296,13 @@ public final class ApplicationStore: ObservableObject {
     @discardableResult
     public func connect(profile: String) async -> Bool {
         guard navigationAvailable, pendingProfile == nil else { return false }
+        let targetPage = pages.first(where: { $0.id == selectedPage })?.session == nil ? selectedPage : UUID()
         let intent = UUID()
         navigationRevision += 1
         let revision = navigationRevision
         connectionIntent = intent
         pendingProfile = profile
         controlObservation?.cancel()
-        selectedSession = nil
         backendActions = []
         controls = nil
         defer { pendingProfile = nil }
@@ -216,14 +313,26 @@ public final class ApplicationStore: ObservableObject {
                 struct Closed: Decodable, Sendable { let closed: UUID }
                 do { let _: Closed = try await bridge.request(.closeSession(session: connection.session), as: Closed.self) }
                 catch {
-                    workspaces.append(Workspace(id: connection.session, profile: profile, documents: [], selectedDocument: nil))
+                    workspaces.append(Workspace(tab: connection.tab, id: connection.session, profile: profile, documents: [], selectedDocument: nil))
+                    pages.append(WorkspacePage(id: UUID(), session: connection.session))
                     show(error)
                 }
                 return false
             }
-            workspaces.append(Workspace(id: connection.session, profile: profile, documents: [], selectedDocument: nil))
+            connectionsVisible = false
+            if let index = pages.firstIndex(where: { $0.id == targetPage }) { pages[index].session = connection.session }
+            else { pages.append(WorkspacePage(id: targetPage, session: connection.session)) }
+            selectedPage = targetPage
+            workspaces.append(Workspace(tab: connection.tab, id: connection.session, profile: profile, documents: [], selectedDocument: nil))
             selectedSession = connection.session
-            await newDocument()
+            await loadDocument()
+            if let page = pages.first(where: { $0.id == targetPage }), !page.savedDraft.isEmpty,
+               let document {
+                let editor = editor(for: document)
+                editor.restore(text: page.savedDraft)
+                let snapshot = try await bridge.request(.setDraft(session: connection.session, document: document.document, draft: page.savedDraft), as: DocumentSnapshot.self)
+                apply(snapshot, session: connection.session)
+            }
             observeControls(session: connection.session)
             await refreshActions(session: connection.session)
             await refreshControls()
@@ -241,34 +350,71 @@ public final class ApplicationStore: ObservableObject {
                 profileHealth[profile] = status
                 show(error)
             }
+            if let selectedSession { await selectSession(selectedSession) }
             return false
         }
     }
 
+    public func cancelConnectionPicker() {
+        connectionIntent = nil
+        let page = selectedPage
+        guard pages.count > 1 else { return }
+        Task { await closePage(page) }
+    }
+
     public func chooseConnections() async {
+        guard navigationAvailable else { return }
+        if selectedSession != nil { await newDocument() }
+    }
+
+    public func selectPage(_ page: UUID) async {
+        guard navigationAvailable, let target = pages.first(where: { $0.id == page }) else { return }
+        if let session = target.session { await selectSession(session); return }
+        connectionIntent = nil
         clearSharedInput()
         plan.dismiss()
-        guard navigationAvailable else { return }
-        connectionIntent = nil
-        navigationRevision += 1
-        let revision = navigationRevision
         controlObservation?.cancel()
+        controlObservation = nil
+        navigationRevision += 1
+        selectedPage = page
         selectedSession = nil
-        backendActions = []
+        connectionsVisible = true
         controls = nil
-        controlRevision &+= 1
-        do { let _: Controls = try await bridge.request(.selectSession(nil, revision: revision), as: Controls.self) }
+        backendActions = []
+        do { let _: Controls = try await bridge.request(.selectSession(nil, revision: navigationRevision), as: Controls.self) }
         catch { show(error) }
     }
+
+    public func closePage(_ page: UUID) async {
+        guard navigationAvailable, let index = pages.firstIndex(where: { $0.id == page }) else { return }
+        if let session = pages[index].session { await closeSession(session); return }
+        if pages.count == 1 {
+            connectionIntent = nil
+            do { try await shutdown() } catch {}
+            return
+        }
+        let selected = selectedPage == page
+        if selected { connectionIntent = nil }
+        pages.remove(at: index)
+        if pages.isEmpty { pages.append(WorkspacePage(id: UUID(), session: nil)) }
+        if selected { await selectPage(pages[min(index, pages.count - 1)].id) }
+    }
+
+    public func closeCurrentTab() async { await closePage(selectedPage) }
 
     public func selectSession(_ session: UUID) async {
         clearSharedInput()
         plan.dismiss()
-        guard navigationAvailable, workspaces.contains(where: { $0.id == session }) else { return }
+        guard navigationAvailable, !closingSessions.contains(session), workspaces.contains(where: { $0.id == session }) else { return }
         connectionIntent = nil
         navigationRevision += 1
         let revision = navigationRevision
+        connectionsVisible = false
         selectedSession = session
+        if let page = pages.first(where: { $0.session == session }) { selectedPage = page.id }
+        else { let page = WorkspacePage(id: UUID(), session: session); pages.append(page); selectedPage = page.id }
+        queryAttention.viewed(session)
+        synchronizeAttention()
         backendActions = []
         controls = nil
         do {
@@ -278,6 +424,10 @@ public final class ApplicationStore: ObservableObject {
     }
 
     public func selectDocument(_ document: UUID) async {
+        if let target = workspaces.first(where: { $0.documents.contains(where: { $0.document == document }) }), target.id != selectedSession {
+            await selectSession(target.id)
+            return
+        }
         clearSharedInput()
         plan.dismiss()
         guard navigationAvailable, let session = selectedSession else { return }
@@ -292,19 +442,22 @@ public final class ApplicationStore: ObservableObject {
         } catch { show(error) }
     }
 
-    public func cycleDocument(_ direction: Int) async {
-        guard let workspace, !workspace.documents.isEmpty else { return }
-        let index = workspace.documents.firstIndex { $0.document == workspace.selectedDocument } ?? 0
-        await selectDocument(workspace.documents[(index + direction + workspace.documents.count) % workspace.documents.count].document)
-    }
+    public func cycleDocument(_ direction: Int) async { await cycleWorkspace(direction) }
 
     public func cycleWorkspace(_ direction: Int) async {
-        guard !workspaces.isEmpty else { return }
-        let index = workspaces.firstIndex { $0.id == selectedSession } ?? 0
-        await selectSession(workspaces[(index + direction + workspaces.count) % workspaces.count].id)
+        guard !pages.isEmpty else { return }
+        let index = pages.firstIndex { $0.id == selectedPage } ?? 0
+        await selectPage(pages[(index + direction + pages.count) % pages.count].id)
     }
 
     public func newDocument() async {
+        guard navigationAvailable else { return }
+        let page = WorkspacePage(id: UUID(), session: nil)
+        pages.append(page)
+        await selectPage(page.id)
+    }
+
+    private func loadDocument() async {
         clearSharedInput()
         plan.dismiss()
         guard navigationAvailable, let session = selectedSession else { return }
@@ -320,37 +473,14 @@ public final class ApplicationStore: ObservableObject {
     }
 
     public func closeDocument(_ document: UUID) async {
-        clearSharedInput()
-        plan.dismiss()
-        guard navigationAvailable, let session = selectedSession else { return }
-        closingSession = session
-        defer { closingSession = nil }
-        do {
-            await draftWorkers[document]?.value
-            await contextWorkers[document]?.value
-            await probeWorkers[session]?.value
-            await plan.waitForCleanup()
-            let _: JSONValue = try await bridge.request(.awaitIdle(session: session), as: JSONValue.self)
-            let result = try await bridge.request(.closeDocument(session: session, document: document), as: DocumentClose.self)
-            if result.workspaceClosed { removeWorkspace(session) }
-            else if let index = workspaces.firstIndex(where: { $0.id == session }) {
-                observations.removeValue(forKey: document)?.cancel()
-                editors.removeValue(forKey: document)?.retire()
-                contextVersions.removeValue(forKey: document)
-                if results.scope?.document == document { results.retire() }
-                workspaces[index].documents.removeAll { $0.document == document }
-                workspaces[index].selectedDocument = result.selected?.document
-                if let selected = result.selected { apply(selected, session: session) }
-            }
-            await refreshControls()
-        } catch { show(error) }
+        guard let workspace = workspaces.first(where: { $0.documents.contains(where: { $0.document == document }) }) else { return }
+        await closeSession(workspace.id)
     }
 
     public func closeSession(_ session: UUID) async {
-        guard navigationAvailable else { return }
+        guard navigationAvailable, closingSessions.insert(session).inserted else { return }
         if selectedSession == session { clearSharedInput(); plan.dismiss() }
-        closingSession = session
-        defer { closingSession = nil }
+        defer { closingSessions.remove(session) }
         do {
             struct Closed: Decodable, Sendable { let closed: UUID }
             for document in workspaces.first(where: { $0.id == session })?.documents ?? [] {
@@ -361,8 +491,13 @@ public final class ApplicationStore: ObservableObject {
             await plan.waitForCleanup()
             let _: JSONValue = try await bridge.request(.awaitIdle(session: session), as: JSONValue.self)
             let _: Closed = try await bridge.request(.closeSession(session: session), as: Closed.self)
+            let wasSelected = selectedSession == session
+            let index = pages.firstIndex(where: { $0.session == session }) ?? 0
             removeWorkspace(session)
-            await refreshControls()
+            if wasSelected {
+                if pages.isEmpty { pages.append(WorkspacePage(id: UUID(), session: nil)) }
+                await selectPage(pages[min(index, pages.count - 1)].id)
+            } else { await refreshControls() }
         } catch { show(error) }
     }
 
@@ -401,7 +536,10 @@ public final class ApplicationStore: ObservableObject {
     public func shutdown() async throws {
         if isClosed { return }
         if let shutdownTask { try await shutdownTask.value; return }
+        try saveWorkspace()
         isShuttingDown = true
+        cellInspector.cancel()
+        rowInspector.close()
         clearSharedInput()
         inputPreview?.cancel()
         for task in healthTimers.values { task.cancel() }
@@ -432,14 +570,25 @@ public final class ApplicationStore: ObservableObject {
             controlObservation?.cancel()
             controlObservation = nil
             isClosed = true
+            queryAttention.clear()
+            synchronizeAttention()
             for task in observations.values { task.cancel() }
             observations.removeAll()
             workspaces.removeAll()
+            pages.removeAll()
             for editor in editors.values { editor.retire() }
             editors.removeAll()
             selectedSession = nil
             controls = nil
         } catch {
+            if let inventory = try? await bridge.request(.tabs, as: TabInventory.self) {
+                let sessions = Set(inventory.tabs.compactMap(\.session))
+                for workspace in workspaces where !sessions.contains(workspace.id) { removeWorkspace(workspace.id) }
+                if selectedSession == nil, let selected = inventory.tabs.first(where: { $0.tab == inventory.selected })?.session {
+                    isShuttingDown = false
+                    await selectSession(selected)
+                }
+            }
             for workspace in workspaces { startHealth(workspace.id) }
             show(error); throw error
         }
@@ -460,15 +609,44 @@ public final class ApplicationStore: ObservableObject {
         }
     }
 
+    func updateApplicationVisibility(_ visible: Bool) {
+        queryAttention.setVisible(visible, selected: connectionsVisible ? nil : selectedSession)
+        synchronizeAttention()
+    }
+
+    private func synchronizeAttention(request: Bool = false) {
+        for index in workspaces.indices {
+            let outcome = queryAttention.unseen[workspaces[index].id]
+            let unread = outcome != nil
+            let failed = outcome == .failure
+            if workspaces[index].hasUnseenResult != unread { workspaces[index].hasUnseenResult = unread }
+            if workspaces[index].unseenResultFailed != failed { workspaces[index].unseenResultFailed = failed }
+        }
+        attentionChanged?(QueryAttentionUpdate(unreadCount: unseenCompletionCount, requestAttention: request,
+            cancelAttention: queryAttention.applicationVisible || unseenCompletionCount == 0))
+    }
+
     private func apply(_ snapshot: DocumentSnapshot, session: UUID) {
         guard let workspace = workspaces.firstIndex(where: { $0.id == session }),
               let document = workspaces[workspace].documents.firstIndex(where: { $0.document == snapshot.document }) else { return }
         let retained = workspaces[workspace].documents[document]
         guard snapshot.generation >= retained.generation, snapshot.draftRevision >= retained.draftRevision else { return }
+        if snapshot.execution == "finished", snapshot.query != nil, snapshot.history != true,
+           snapshot.termination != "canceled", !restoring, !isShuttingDown, !closingSessions.contains(session),
+           snapshot.generation != retained.generation || retained.execution != "finished" {
+            let failed = snapshot.termination == "failed" || (snapshot.error != nil && snapshot.error != .null)
+                || (snapshot.captureError != nil && snapshot.captureError != .null)
+            let request = queryAttention.complete(session: session, outcome: failed ? .failure : .success,
+                selected: selectedSession == session && !connectionsVisible)
+            if queryAttention.unseen[session] != nil { workspaces[workspace].completionRevision &+= 1 }
+            synchronizeAttention(request: request)
+        }
         workspaces[workspace].documents[document] = snapshot
     }
 
     private func removeWorkspace(_ session: UUID) {
+        queryAttention.remove(session)
+        synchronizeAttention()
         healthTimers.removeValue(forKey: session)?.cancel()
         probeWorkers.removeValue(forKey: session)
         health.removeValue(forKey: session)
@@ -476,12 +654,14 @@ public final class ApplicationStore: ObservableObject {
         if results.scope?.session == session { results.retire() }
         if let workspace = workspaces.first(where: { $0.id == session }) {
             for document in workspace.documents {
+                results.tablePositions.removeValue(forKey: document.document)
                 observations.removeValue(forKey: document.document)?.cancel()
                 editors.removeValue(forKey: document.document)?.retire()
                 contextVersions.removeValue(forKey: document.document)
             }
         }
         workspaces.removeAll { $0.id == session }
+        pages.removeAll { $0.session == session }
         documentRevisions.removeValue(forKey: session)
         if selectedSession == session { selectedSession = nil; controls = nil }
     }

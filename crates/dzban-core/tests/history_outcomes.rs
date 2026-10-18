@@ -23,6 +23,7 @@ fn snapshot() -> QuerySnapshot {
         planning_duration: Duration::from_millis(10),
         execution_duration: Duration::ZERO,
         started_at: None,
+        started_wall_time: None,
         finished_at: None,
     }
 }

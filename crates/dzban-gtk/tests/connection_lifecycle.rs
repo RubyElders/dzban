@@ -183,7 +183,7 @@ async fn until_session_count(context: &ApplicationContext, count: usize) {
 }
 
 #[glib::async_test]
-async fn manager_removal_keeps_busy_and_failed_connections_until_cleanup_succeeds() {
+async fn manager_removal_drains_active_queries_and_keeps_failed_cleanup_for_retry() {
     use dzban_gtk::database::DbManager;
     for stage in [Stage::Query, Stage::DisconnectFailure] {
         let (_, context, gate) = fixture(stage);
@@ -201,14 +201,15 @@ async fn manager_removal_keeps_busy_and_failed_connections_until_cleanup_succeed
         if matches!(stage, Stage::Query) {
             let query = connection.execute_query_rows("external-wait".into());
             until(|| gate.entered.load(Ordering::SeqCst)).await;
-            assert!(matches!(
-                manager.request_remove_config("fixture"),
-                Err(ExecutionError::Busy)
-            ));
+            let removal = manager.request_remove_config("fixture").unwrap();
+            until(|| gate.cancellations.load(Ordering::SeqCst) == 1).await;
             assert_eq!(manager.get_config("fixture"), Some(config.clone()));
-            assert_eq!(connection.state(), ConnectionState::Connected);
             gate.release.notify_one();
-            query.await.unwrap().unwrap();
+            let _ = query.await;
+            assert!(removal.await.unwrap().unwrap());
+            assert_eq!(manager.config_count(), 0);
+            assert!(context.session_ids().await.is_empty());
+            continue;
         } else {
             assert_eq!(
                 manager
@@ -330,9 +331,8 @@ async fn core_document_finishes_while_main_context_delivery_is_withheld() {
         .session(context.session_ids().await[0])
         .await
         .unwrap();
+    let document = context.tabs.session(engine.id()).unwrap().document;
     let bridge = RuntimeBridge::with_context(context).unwrap();
-    let mut documents = dzban_core::documents::QueryDocuments::default();
-    let document = documents.open();
     let delivery = bridge
         .start_document(
             dzban_gtk::database::InternalConnection::new(engine, DatabaseBackend::Postgresql),

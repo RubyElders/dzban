@@ -1,6 +1,7 @@
 import AppKit
 import DzbanBridge
 import SwiftUI
+import QuartzCore
 
 public enum ResultStatus {
     public static func describe(_ document: DocumentSnapshot) -> String {
@@ -34,18 +35,18 @@ struct ResultPanel: View {
     let session: UUID
     let document: DocumentSnapshot
     let cancel: () -> Bool
-    @StateObject private var row: RowInspectorModel
-    @StateObject private var cell: CellInspectorModel
+    @ObservedObject private var row: RowInspectorModel
+    @ObservedObject private var cell: CellInspectorModel
     @State private var inspecting: ResultAddress?
 
-    init(model: ResultViewport, bridge: Bridge, session: UUID, document: DocumentSnapshot, cancel: @escaping () -> Bool) {
+    init(model: ResultViewport, cell: CellInspectorModel, row: RowInspectorModel, bridge: Bridge, session: UUID, document: DocumentSnapshot, cancel: @escaping () -> Bool) {
         self.model = model
         self.bridge = bridge
         self.session = session
         self.document = document
         self.cancel = cancel
-        _row = StateObject(wrappedValue: RowInspectorModel(bridge: bridge, source: model.source))
-        _cell = StateObject(wrappedValue: CellInspectorModel(source: model.source))
+        _row = ObservedObject(wrappedValue: row)
+        _cell = ObservedObject(wrappedValue: cell)
     }
 
     private struct Revision: Equatable {
@@ -58,57 +59,72 @@ struct ResultPanel: View {
     }
     private var revision: Revision { Revision(session: session, document: document.document, generation: document.generation, rows: document.rows, phase: document.resultPhase, execution: document.execution) }
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text(ResultStatus.describe(document)).accessibilityIdentifier("results.status")
-                Text(document.execution.capitalized).foregroundStyle(.secondary).accessibilityIdentifier("query.execution")
-                if document.generation > 0 { Text("Run \(document.generation)").foregroundStyle(.secondary).accessibilityIdentifier("query.generation") }
-                if model.isLoading || cell.copying { ProgressView().controlSize(.small).accessibilityLabel(cell.copying ? "Copying cell" : "Loading result pages") }
-                Spacer()
-                if document.historyPlanAvailable == true {
-                    SavedPlanButton(bridge: bridge, scope: ResultScope(session: session, document: document.document, generation: document.generation))
-                }
-                Button("Inspect Row") { if let selected = model.selected { row.show(selected, pinned: true, columns: model.columns.count) } }
-                    .disabled(model.selected == nil).accessibilityIdentifier("results.inspect-row")
-                    .overlay(alignment: .bottom) {
-                        RowPopover(model: row, columns: model.columns, inspect: { address in row.close(); inspecting = address }).frame(width: 1, height: 1)
-                    }
-                Button("Inspect Cell") { inspecting = model.selected }
-                    .disabled(model.selected == nil)
-                    .accessibilityIdentifier("results.inspect")
-                Button("Copy Cell") { if let selected = model.selected { cell.copy(selected) } }
-                    .disabled(model.selected == nil || cell.copying)
-                    .accessibilityIdentifier("results.copy")
-                if cell.copying { Button("Cancel Copy") { cell.cancelCopy() } }
-            }
-            .font(.caption)
-            if document.history == true {
-                Text("Saved samples contain legacy text values; SQL null identity and original column types are unavailable.").font(.caption).foregroundStyle(.secondary).accessibilityIdentifier("history.sample-note")
-            }
-            if let failure = model.loadError {
-                HStack {
-                    Text(failure).foregroundStyle(.red).textSelection(.enabled).accessibilityIdentifier("results.read-error")
-                    Button("Retry") { model.retry() }.accessibilityIdentifier("results.retry")
-                }
-            }
-            if let failure = cell.failure { Text(failure).foregroundStyle(.red).textSelection(.enabled).accessibilityIdentifier("results.cell-error") }
-            if let error = document.captureError, document.error == nil {
-                Text(QueryDiagnostic.describe(error)).foregroundStyle(.red).textSelection(.enabled).accessibilityIdentifier("results.capture-error")
-            }
-            ResultTable(model: model, inspect: { inspecting = model.selected }, copy: {
-                if let selected = model.selected { cell.copy(selected) }
-            }, cancel: cancel, peek: {
-                if let selected = model.selected { row.show(selected, pinned: false, columns: model.columns.count) }
-            }, releasePeek: { row.release(milliseconds: $0) })
-            .id(model.scope)
-            .overlay {
-                if model.availableRows == 0 && !model.isLoading {
-                    Text(document.generation == 0 ? "Results appear here" : "No rows").foregroundStyle(.secondary).allowsHitTesting(false)
-                }
-            }
+    private var issues: [ResultIssue] {
+        var issues: [ResultIssue] = []
+        if let error = document.error, error != .null, document.termination != "canceled" {
+            issues.append(ResultIssue(id: "query.error", title: "Query failed", detail: QueryDiagnostic.describe(error)))
         }
-        .padding(.top, 8)
+        if let failure = model.loadError { issues.append(ResultIssue(id: "results.read-error", title: "Unable to load results", detail: failure)) }
+        if let failure = model.copyError { issues.append(ResultIssue(id: "results.copy-error", title: "Unable to copy results", detail: failure)) }
+        if let failure = cell.failure { issues.append(ResultIssue(id: "results.cell-error", title: "Unable to copy cell", detail: failure)) }
+        if let error = document.captureError, document.error == nil {
+            issues.append(ResultIssue(id: "results.capture-error", title: "Result capture stopped", detail: QueryDiagnostic.describe(error)))
+        }
+        return issues
+    }
+
+    private var emptyTitle: String {
+        if document.generation == 0 { return "Ready to query" }
+        if document.commandResult != nil { return "Command complete" }
+        if document.termination == "canceled" { return "Query stopped" }
+        return "No rows returned"
+    }
+
+    private var emptyDetail: String {
+        if document.generation == 0 { return "Run your SQL to explore the results." }
+        if let command = document.commandResult { return command.affectedRows.map { "\($0) rows affected." } ?? "The command completed successfully." }
+        if document.termination == "canceled" { return "No rows were returned before the query stopped." }
+        return "The query completed without returning any rows."
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            QueryProgress(busy: ["planning", "running", "canceling"].contains(document.execution))
+                .frame(height: 2)
+            VStack(spacing: 0) {
+                if !issues.isEmpty && model.availableRows > 0 {
+                    ResultDiagnostic(issues: issues, retry: model.loadError == nil ? nil : { model.retry() })
+                        .padding(.horizontal, 12).padding(.vertical, 8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.red.opacity(0.04))
+                    Divider()
+                }
+                ResultTable(model: model, inspect: { inspecting = model.selected }, cancel: cancel, peek: { anchor, rect in
+                    if let selected = model.selected { row.show(selected, pinned: false, columns: model.columns.count, anchorView: anchor, anchorRect: rect) }
+                }, releasePeek: { row.release(milliseconds: $0) })
+                .overlay {
+                    if model.availableRows == 0 && !issues.isEmpty {
+                        ResultState(symbol: "exclamationmark.circle", title: issues.first?.title ?? "Unable to show results", tint: .red) {
+                            ResultDiagnostic(issues: issues, retry: model.loadError == nil ? nil : { model.retry() }, showTitle: false)
+                        }
+                    } else if ["planning", "running", "canceling"].contains(document.execution), let started = document.startedAtSeconds, document.history != true {
+                        QueryRunSummary(document: document, started: Date(timeIntervalSince1970: started))
+                            .allowsHitTesting(false)
+                    } else if model.availableRows == 0 && !model.isLoading {
+                        ResultState(symbol: document.generation == 0 ? "tablecells" : document.commandResult != nil ? "checkmark" : "line.3.horizontal.decrease", title: emptyTitle, tint: .secondary) {
+                            Text(emptyDetail).font(.callout).foregroundStyle(.secondary)
+                        }.allowsHitTesting(false)
+                    }
+                }
+            }
+
+        }
+        .overlay {
+            RowPopover(model: row, columns: model.columns, cell: cell, rows: model.availableRows) { address in
+                model.select(row: address.row, column: address.column)
+            }
+                .frame(maxWidth: .infinity, maxHeight: .infinity).allowsHitTesting(false)
+        }
         .onChange(of: revision, initial: true) { _, _ in
             let scope = ResultScope(session: session, document: document.document, generation: document.generation)
             if model.scope != scope { cell.cancel(); row.close(); inspecting = nil }
@@ -116,14 +132,153 @@ struct ResultPanel: View {
         }
         .onDisappear { model.retire(); cell.cancel(); row.close() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in row.reset() }
-        .sheet(item: $inspecting) { address in CellInspectorView(model: cell, address: address) }
+        .sheet(item: $inspecting) { address in
+            CellInspectorView(model: cell, address: address)
+                .frame(minWidth: 600, idealWidth: 760, minHeight: 400, idealHeight: 520)
+        }
     }
 }
 
-private struct CellInspectorView: View {
+struct ResultFooter: View {
+    @ObservedObject var model: ResultViewport
+    @ObservedObject var cell: CellInspectorModel
+    let document: DocumentSnapshot?
+    let bridge: Bridge
+
+    var body: some View {
+        HStack(spacing: 6) {
+            FooterArtwork(name: "dzban-result-rows-symbolic")
+            if let document {
+                Text(document.generation == 0 ? "Ready" : ResultStatus.describe(document).components(separatedBy: ";")[0])
+                    .accessibilityValue(ResultStatus.describe(document)).accessibilityIdentifier("results.status")
+                    .help(ResultStatus.describe(document))
+                if document.history != true, document.commandResult == nil, let plan = document.executionPlan, let estimate = PlanFormatting.rowEstimate(plan) {
+                    Text(estimate).foregroundStyle(.secondary).lineLimit(1)
+                        .help(PlanFormatting.summary(plan)).accessibilityIdentifier("results.row-estimate")
+                }
+                if document.execution == "finished", document.history != true, document.commandResult == nil,
+                   let plan = document.executionPlan, let cost = PlanFormatting.costEstimate(plan) {
+                    Text(cost).foregroundStyle(.secondary)
+                        .help("Planner cost estimate").accessibilityIdentifier("results.cost-estimate")
+                }
+                if document.history == true {
+                    Label("Text sample", systemImage: "info.circle").foregroundStyle(.secondary).lineLimit(1)
+                        .help("Saved results contain text previews. Original column types and SQL NULL identity are not preserved.")
+                        .accessibilityIdentifier("history.sample-note")
+                }
+                if document.historyPlanAvailable == true, let session = document.session {
+                    SavedPlanButton(bridge: bridge, scope: ResultScope(session: session, document: document.document, generation: document.generation))
+                }
+            } else { Text("-- rows") }
+            if model.isLoading || cell.copying {
+                ProgressView().controlSize(.small).accessibilityLabel(cell.copying ? "Copying cell" : "Loading result pages")
+            }
+            if cell.copying { Button("Cancel Copy") { cell.cancelCopy() } }
+        }.lineLimit(1)
+    }
+}
+
+private struct ResultIssue: Identifiable {
+    let id: String
+    let title: String
+    let detail: String
+}
+
+private struct ResultState<Content: View>: View {
+    let symbol: String
+    let title: String
+    let tint: Color
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        GeometryReader { geometry in
+            ScrollView {
+                VStack(spacing: 10) {
+                    Image(systemName: symbol).font(.system(size: 22, weight: .regular))
+                        .foregroundStyle(tint).frame(width: 44, height: 44)
+                        .background(tint.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+                    Text(title).font(.system(size: 15, weight: .semibold)).accessibilityIdentifier("results.state-title")
+                    content().frame(maxWidth: 520)
+                }
+                .multilineTextAlignment(.center).padding(20)
+                .frame(maxWidth: .infinity, minHeight: geometry.size.height)
+            }
+            .background(Color(nsColor: .textBackgroundColor))
+        }
+        .accessibilityElement(children: .contain).accessibilityIdentifier("results.feedback")
+    }
+}
+
+private struct ResultDiagnostic: View {
+    let issues: [ResultIssue]
+    let retry: (() -> Void)?
+    var showTitle = true
+
+    var body: some View {
+        VStack(alignment: showTitle ? .leading : .center, spacing: 6) {
+            if showTitle {
+                Label(issues.first?.title ?? "Unable to show results", systemImage: "exclamationmark.circle")
+                    .font(.caption.weight(.semibold)).foregroundStyle(.red)
+            }
+            ForEach(issues) { issue in
+                Text(issue.detail).font(.system(size: 12, design: .monospaced)).foregroundStyle(.primary)
+                    .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier(issue.id)
+            }
+            if let retry { Button("Retry", action: retry).controlSize(.small).accessibilityIdentifier("results.retry") }
+        }
+    }
+}
+
+private struct QueryRunSummary: View {
+    let document: DocumentSnapshot
+    let started: Date
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 0.1)) { context in summary(at: context.date) }
+    }
+
+    private func summary(at now: Date) -> some View {
+        VStack(spacing: 7) {
+            HStack(spacing: 7) {
+                ProgressView().controlSize(.small)
+                Text(document.execution == "canceling" ? "Stopping query" : document.execution == "planning" ? "Planning query" : "Running query")
+                    .font(.caption.weight(.medium)).foregroundStyle(.secondary)
+            }
+            Text(String(format: "Elapsed %.1fs", max(0, now.timeIntervalSince(started))))
+                .font(.system(size: 24, weight: .medium, design: .rounded)).monospacedDigit().foregroundStyle(.primary)
+                .accessibilityIdentifier("results.elapsed")
+            HStack(spacing: 12) {
+                Text("Started \(started.formatted(date: .omitted, time: .standard))")
+                    .help(started.formatted(date: .complete, time: .standard)).accessibilityIdentifier("results.started")
+                Text("\(document.rows) rows received").accessibilityIdentifier("results.received")
+            }.font(.caption).foregroundStyle(.secondary).monospacedDigit()
+            if let plan = document.executionPlan {
+                Text(PlanFormatting.compact(plan)).help(PlanFormatting.summary(plan))
+                    .accessibilityIdentifier("results.estimate")
+            } else {
+                Text(document.execution == "planning" ? "Estimating..." : "Estimate unavailable")
+                    .accessibilityIdentifier("results.estimate")
+            }
+        }
+        .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
+        .padding(.horizontal, 16).padding(.vertical, 24).frame(maxWidth: .infinity)
+        .background {
+            LinearGradient(stops: [.init(color: .clear, location: 0), .init(color: Color(nsColor: .textBackgroundColor).opacity(0.98), location: 0.18), .init(color: Color(nsColor: .textBackgroundColor).opacity(0.98), location: 0.82), .init(color: .clear, location: 1)], startPoint: .top, endPoint: .bottom)
+        }
+        .accessibilityElement(children: .contain).accessibilityIdentifier("results.metrics-box")
+    }
+}
+
+struct CellInspectorView: View {
     @ObservedObject var model: CellInspectorModel
     let address: ResultAddress
+    var back: (() -> Void)? = nil
+    var close: (() -> Void)? = nil
     @Environment(\.dismiss) private var dismiss
+
+    private var closeButton: some View {
+        Button("Close") { if let close { close() } else { dismiss() } }.accessibilityIdentifier("cell.close")
+    }
 
     private var rangeDescription: String {
         if model.total == 0 { return "Empty text" }
@@ -133,18 +288,23 @@ private struct CellInspectorView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
+                if let back {
+                    Button(action: back) { Label("Back to Row", systemImage: "chevron.left") }
+                        .accessibilityIdentifier("cell.back")
+                }
                 Text("Row \(address.row + 1), column \(address.column + 1)").font(.headline)
                 Spacer()
-                Button("Close") { dismiss() }.keyboardShortcut(.cancelAction).accessibilityIdentifier("cell.close")
+                if back == nil { closeButton.keyboardShortcut(.cancelAction) }
+                else { closeButton }
             }
             if model.loading { ProgressView("Loading cell") }
             if let error = model.failure {
                 Text(error).foregroundStyle(.red).textSelection(.enabled)
-                Button("Retry") { model.load(offset: model.offset) }
+                Button("Retry") { model.openEntire(address) }
             }
             if model.loaded {
                 if let text = model.text {
-                    ReadOnlyText(text: text)
+                    ReadOnlyText(text: text, focusOnAppear: true)
                     Text(verbatim: rangeDescription)
                         .font(.caption).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -154,12 +314,6 @@ private struct CellInspectorView: View {
             }
             Spacer(minLength: 0)
             HStack {
-                Button("Previous") { model.load(offset: max(0, model.offset - CellInspectorModel.chunkSize)) }
-                    .disabled(model.loading || model.offset == 0).accessibilityIdentifier("cell.previous")
-                Button("Next") { model.load(offset: model.offset + CellInspectorModel.chunkSize) }
-                    .disabled(model.loading || model.offset + CellInspectorModel.chunkSize >= model.total).accessibilityIdentifier("cell.next")
-                Button("Last") { model.load(offset: max(0, (model.total - 1) / CellInspectorModel.chunkSize * CellInspectorModel.chunkSize)) }
-                    .disabled(model.loading || model.offset + CellInspectorModel.chunkSize >= model.total).accessibilityIdentifier("cell.last")
                 Spacer()
                 if model.copying {
                     ProgressView().controlSize(.small)
@@ -170,8 +324,7 @@ private struct CellInspectorView: View {
             }
         }
         .padding(20)
-        .frame(minWidth: 600, idealWidth: 760, minHeight: 400, idealHeight: 520)
-        .onAppear { model.open(address) }
+        .onAppear { model.openEntire(address) }
         .onDisappear { model.cancel() }
     }
 }
@@ -179,11 +332,17 @@ private struct CellInspectorView: View {
 struct ReadOnlyText: NSViewRepresentable {
     let text: String
     var identifier = "cell.value"
+    var focusOnAppear = false
 
     func makeNSView(context: Context) -> NSScrollView {
-        let scroll = NSScrollView()
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 600, height: 400))
         scroll.hasVerticalScroller = true
-        let view = NSTextView()
+        let view = ReadOnlyTextView(frame: scroll.contentView.bounds)
+        view.focusOnAppear = focusOnAppear
+        view.minSize = .zero
+        view.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        view.layoutManager?.allowsNonContiguousLayout = true
+        view.layoutManager?.backgroundLayoutEnabled = false
         view.isEditable = false
         view.isSelectable = true
         view.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
@@ -200,5 +359,77 @@ struct ReadOnlyText: NSViewRepresentable {
         guard let view = scroll.documentView as? NSTextView, view.string != text else { return }
         view.string = text
         view.scrollRangeToVisible(NSRange(location: 0, length: 0))
+    }
+}
+
+private final class ReadOnlyTextView: NSTextView {
+    var focusOnAppear = false
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard focusOnAppear, let window else { return }
+        DispatchQueue.main.async { [weak self, weak window] in
+            guard let self, let window, self.window == window else { return }
+            window.makeKey()
+            window.makeFirstResponder(self)
+        }
+    }
+}
+
+private struct QueryProgress: NSViewRepresentable {
+    let busy: Bool
+    func makeNSView(context: Context) -> QueryProgressView { QueryProgressView() }
+    func updateNSView(_ view: QueryProgressView, context: Context) { view.setBusy(busy) }
+}
+
+@MainActor
+private final class QueryProgressView: NSView {
+    private let segment = CALayer()
+    private var busy = false
+    private var animationWidth: CGFloat = -1
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.masksToBounds = true
+        layer?.addSublayer(segment)
+        isHidden = true
+        setAccessibilityElement(true)
+        setAccessibilityRole(.progressIndicator)
+        setAccessibilityLabel("Query in progress")
+        setAccessibilityIdentifier("query.progress")
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    func setBusy(_ busy: Bool) {
+        guard busy != self.busy else { return }
+        self.busy = busy
+        isHidden = !busy
+        if busy { animate() } else { segment.removeAllAnimations() }
+    }
+
+    override func layout() {
+        super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.12).cgColor
+        segment.backgroundColor = NSColor.controlAccentColor.cgColor
+        segment.frame = CGRect(x: 0, y: 0, width: bounds.width * 0.2, height: bounds.height)
+        CATransaction.commit()
+        if busy && animationWidth != bounds.width { animate() }
+    }
+
+    private func animate() {
+        animationWidth = bounds.width
+        segment.removeAllAnimations()
+        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
+        let animation = CABasicAnimation(keyPath: "transform.translation.x")
+        animation.fromValue = 0
+        animation.toValue = bounds.width * 0.8
+        animation.duration = 1.1
+        animation.autoreverses = true
+        animation.repeatCount = .infinity
+        segment.add(animation, forKey: "pulse")
     }
 }

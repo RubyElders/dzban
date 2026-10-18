@@ -75,3 +75,20 @@ extension BridgeCommand {
 extension BridgeCommand {
     public static func observeControls(session: UUID) -> Self { Self(command: "observe_controls", session: session) }
 }
+
+public struct TabInventory: Decodable, Sendable {
+    public struct Tab: Decodable, Sendable {
+        public let tab: UUID
+        public let session: UUID?
+        public let profile: String
+        public let document: UUID
+        public let execution: String
+        public let phase: String
+    }
+    public let tabs: [Tab]
+    public let selected: UUID?
+}
+
+extension BridgeCommand {
+    public static var tabs: Self { Self(command: "tabs") }
+}

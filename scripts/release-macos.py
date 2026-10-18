@@ -23,7 +23,7 @@ def capture(*arguments):
 
 
 def source_fingerprint():
-    paths = {REPO / name for name in ("Cargo.toml", "Cargo.lock", "macos/Package.swift", "macos/Dzban.xcodeproj/project.pbxproj", "data/icons/com.rubyelders.dzban.png")}
+    paths = {REPO / name for name in ("Cargo.toml", "Cargo.lock", "macos/Package.swift", "macos/Dzban.xcodeproj/project.pbxproj", "macos/Resources/DzbanIcon.png")}
     for name in ("crates/dzban-core/src", "crates/dzban-db/src", "crates/dzban-macos-bridge/src", "crates/dzban-macos-bridge/include", "macos/Sources", "macos/Resources", "scripts"):
         paths.update(path for path in (REPO / name).rglob("*") if path.is_file() and path.suffix in (".rs", ".swift", ".h", ".modulemap", ".plist", ".sh", ".py", ".svg", ".json"))
     paths.update(REPO / name / "Cargo.toml" for name in ("crates/dzban-core", "crates/dzban-db", "crates/dzban-macos-bridge"))

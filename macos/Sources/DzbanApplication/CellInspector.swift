@@ -31,7 +31,7 @@ public enum FullCellReader {
             if let total, total != chunk.total { throw ViewportFailure("Cell changed during copy") }
             total = chunk.total
             guard let part = chunk.text else { return OriginalCell(text: nil) }
-            guard text.utf8.count + part.utf8.count <= 32 * 1024 * 1024 else { throw ViewportFailure("Cell is too large for the clipboard; copy individual chunks") }
+            guard text.utf8.count + part.utf8.count <= 32 * 1024 * 1024 else { throw ViewportFailure("Cell exceeds the 32 MiB limit") }
             text.append(part)
             offset += part.unicodeScalars.count
             if offset == chunk.total { return OriginalCell(text: text) }
@@ -70,6 +70,26 @@ public final class CellInspectorModel: ObservableObject {
         cancel()
         self.address = address
         load(offset: 0)
+    }
+    public func openEntire(_ address: ResultAddress) {
+        cancel()
+        self.address = address
+        loading = true
+        let epoch = epoch
+        loadTask = Task { [weak self, source] in
+            do {
+                let value = try await FullCellReader.read(source: source, address: address)
+                guard !Task.isCancelled, let self, self.epoch == epoch else { return }
+                self.text = value.text
+                self.total = value.text?.unicodeScalars.count ?? 0
+                self.loaded = true
+                self.loading = false
+            } catch {
+                guard !Task.isCancelled, let self, self.epoch == epoch else { return }
+                self.failure = (error as? BridgeFailure)?.message ?? error.localizedDescription
+                self.loading = false
+            }
+        }
     }
     public func load(offset: Int) {
         guard let address else { return }

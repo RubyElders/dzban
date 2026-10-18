@@ -62,14 +62,23 @@ impl DbManager {
     }
 
     pub fn add_database_config(&self, database_config: DatabaseConfig) -> bool {
-        let config_name = database_config.name.clone();
+        let name = database_config.name.clone();
+        self.add_query_tab_config(name, database_config)
+    }
+
+    pub fn add_query_tab_config(
+        &self,
+        config_name: String,
+        database_config: DatabaseConfig,
+    ) -> bool {
         let configs = self.imp().configs.borrow();
         if configs.contains_key(&config_name) {
             return false;
         }
         drop(configs);
 
-        let config = DbConfig::from_database_config_with_bridge(
+        let config = DbConfig::for_query_tab(
+            config_name.clone(),
             database_config,
             self.imp()
                 .runtime_bridge

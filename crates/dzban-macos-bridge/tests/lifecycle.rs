@@ -102,11 +102,6 @@ fn a_foreign_consumer_can_stream_detach_cancel_and_shutdown() {
         }
     }
     assert!(dzban_release(stream));
-    assert!(
-        request(app, json!({"command":"shutdown"}))
-            .get("failure")
-            .is_some()
-    );
     let page = request(
         app,
         json!({"command":"read_page", "session":session, "document":document, "generation":1, "start":0, "count":5}),
@@ -353,10 +348,9 @@ fn preview_intent_tombstones_reject_late_admission_and_old_cancellation() {
         request(app, preview(9))["failure"]["kind"],
         "preview_invalidated"
     );
-    assert_eq!(
-        request(app, preview(11))["plan"]["document"]["sql"],
-        "SELECT 1"
-    );
+    let captured = request(app, preview(11));
+    assert_eq!(captured["plan"]["document"]["sql"], "SELECT 1");
+    assert_eq!(captured["plan"]["text"], "fixture: true\nsql: SELECT 1");
     assert_eq!(
         request(
             app,
@@ -425,7 +419,17 @@ fn saved_history_replacement_keeps_background_execution_and_rejects_stale_pages(
         app,
         json!({"command":"submit","session":session,"document":document,"sql":"wait"}),
     );
-    wait("running", 5);
+    let running = wait("running", 5);
+    let started = running["started_at_seconds"].as_f64().unwrap();
+    assert!(started > 1_700_000_000.0);
+    assert_eq!(running["execution_plan"]["estimate"]["rows"], 500);
+    assert_eq!(running["execution_plan"]["estimate"]["total_cost"], 12.5);
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let later = snapshot();
+    assert_eq!(later["started_at_seconds"], running["started_at_seconds"]);
+    assert!(
+        later["elapsed_seconds"].as_f64().unwrap() > running["elapsed_seconds"].as_f64().unwrap()
+    );
     let restored = request(
         app,
         json!({"command":"restore_history","session":session,"document":document,"history_revision":revision,"index":0}),
@@ -559,5 +563,106 @@ fn probes_and_shared_input_preserve_query_and_selection_boundaries() {
         request(app, json!({"command":"shutdown"}))["shutdown"],
         true
     );
+    assert!(dzban_release(app));
+}
+
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn query_tabs_publish_independent_sessions_and_shutdown_drains_both() {
+    let app = dzban_macos_bridge::dzban_create_fixture();
+    let first = request(app, json!({"command":"connect","profile":"fixture"}));
+    let first_session = &first["session"];
+    let first_document = request(
+        app,
+        json!({"command":"open_document","session":first_session}),
+    )["document"]
+        .clone();
+    assert_eq!(
+        request(
+            app,
+            json!({"command":"submit","session":first_session,"document":first_document,"sql":"wait"})
+        )["generation"],
+        1
+    );
+    request(app, json!({"command":"select_session","session":null}));
+    let second = request(app, json!({"command":"connect","profile":"fixture"}));
+    let second_session = &second["session"];
+    let second_document = request(
+        app,
+        json!({"command":"open_document","session":second_session}),
+    )["document"]
+        .clone();
+    assert_ne!(first_session, second_session);
+    assert_ne!(first["tab"], second["tab"]);
+    assert_ne!(first_document, second_document);
+    assert_eq!(
+        request(
+            app,
+            json!({"command":"submit","session":second_session,"document":second_document,"sql":"rows"})
+        )["generation"],
+        1
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        assert!(std::time::Instant::now() < deadline);
+        let snapshot = request(
+            app,
+            json!({"command":"observe_document","session":second_session,"document":second_document}),
+        );
+        if snapshot["execution"] == "finished" {
+            assert_eq!(snapshot["rows"], 500);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let inventory = request(app, json!({"command":"tabs"}));
+    assert_eq!(inventory["tabs"].as_array().unwrap().len(), 2);
+    assert_eq!(inventory["selected"], second["tab"]);
+    let active = &inventory["tabs"][0]["execution"];
+    assert!(active == "running" || active == "planning");
+    assert_eq!(
+        request(
+            app,
+            json!({"command":"submit","session":second_session,"document":second_document,"sql":"wait"})
+        )["generation"],
+        2
+    );
+    assert_eq!(
+        request(app, json!({"command":"shutdown"}))["shutdown"],
+        true
+    );
+    assert!(dzban_release(app));
+}
+
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn shutdown_rejects_a_pending_tab_completion_without_losing_cleanup() {
+    let app = dzban_macos_bridge::dzban_create_fixture();
+    let bytes = serde_json::to_vec(&json!({"command":"connect","profile":"fixture-slow"})).unwrap();
+    let operation = unsafe { dzban_send(app, bytes.as_ptr(), bytes.len()) };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        assert!(std::time::Instant::now() < deadline);
+        if !request(app, json!({"command":"connections"}))["connections"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(
+        request(app, json!({"command":"shutdown"}))["shutdown"],
+        true
+    );
+    let buffer = dzban_wait(operation, 0, 5000);
+    assert_eq!(buffer.status, 0);
+    let record: Value =
+        serde_json::from_slice(unsafe { std::slice::from_raw_parts(buffer.data, buffer.length) })
+            .unwrap();
+    assert_eq!(record["payload"]["failure"]["kind"], "closed");
+    assert!(dzban_buffer_release(buffer.token));
+    assert!(dzban_release(operation));
     assert!(dzban_release(app));
 }

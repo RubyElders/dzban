@@ -577,7 +577,6 @@ fn create_header_bar(
         OpenDatabase(String),
         FocusConnection(String),
         SelectDatabase(String),
-        SelectQuery(u32),
     }
 
     #[derive(Clone)]
@@ -637,28 +636,15 @@ fn create_header_bar(
             }
         }
 
-        for db_name in manager_for_actions.open_database_tabs() {
-            let subtitle = "Select open database tab";
+        for (tab_id, db_name) in manager_for_actions.open_database_tabs() {
+            let subtitle = "Select open query tab";
             let searchable = format!("database tab {} {}", db_name, subtitle).to_lowercase();
             if search_text.is_empty() || searchable.contains(&search_lower) {
                 actions.push(SearchAction {
-                    title: format!("Database tab: {}", db_name),
+                    title: format!("Query tab: {}", db_name),
                     subtitle: subtitle.to_string(),
                     icon: "go-jump-symbolic".to_string(),
-                    action: SearchActionKind::SelectDatabase(db_name),
-                });
-            }
-        }
-
-        for (query_num, title) in manager_for_actions.query_tabs() {
-            let subtitle = "Select query tab";
-            let searchable = format!("query tab {} {}", title, subtitle).to_lowercase();
-            if search_text.is_empty() || searchable.contains(&search_lower) {
-                actions.push(SearchAction {
-                    title: format!("Query tab: {}", title),
-                    subtitle: subtitle.to_string(),
-                    icon: "go-jump-symbolic".to_string(),
-                    action: SearchActionKind::SelectQuery(query_num),
+                    action: SearchActionKind::SelectDatabase(tab_id),
                 });
             }
         }
@@ -693,10 +679,6 @@ fn create_header_bar(
                 }
                 SearchActionKind::SelectDatabase(db_name) => {
                     db_manager.select_database_tab(db_name);
-                    Some(format!("Selected database tab: {}", db_name))
-                }
-                SearchActionKind::SelectQuery(query_num) => {
-                    db_manager.select_query_tab(*query_num);
                     None
                 }
             };
