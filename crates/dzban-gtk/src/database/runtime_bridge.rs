@@ -99,7 +99,16 @@ impl RuntimeBridge {
         let engine = connection.engine();
         let query = {
             let _runtime = self.runtime.enter();
-            document.submit(engine.clone(), sql, Default::default(), history)?
+            if let Some(tab) = self.context.tabs.session(engine.id()) {
+                if tab.document.id() != document.id() {
+                    return Err(dzban_core::error::ExecutionError::Message(
+                        "Document belongs to another tab".into(),
+                    ));
+                }
+                tab.submit(sql, Default::default(), history)?
+            } else {
+                document.submit(engine.clone(), sql, Default::default(), history)?
+            }
         };
         let id = query.query;
         let generation = Some(query.generation);
@@ -255,13 +264,24 @@ impl RuntimeBridge {
         rx
     }
 
+    pub fn query_tab(
+        &self,
+        session: dzban_core::execution::SessionId,
+    ) -> Option<dzban_core::tabs::QueryTab> {
+        self.context.tabs.session(session)
+    }
+
+    pub fn select_session_tab(&self, session: Option<dzban_core::execution::SessionId>) {
+        self.context.tabs.select_session(session);
+    }
+
     pub fn start_connect(&self, db_config: DatabaseConfig) -> ConnectionDelivery {
         let (tx, rx) = oneshot::channel();
         let context = self.context.clone();
         let backend = db_config.backend;
         let request = {
             let _runtime = self.runtime.enter();
-            context.start_connect(db_config)
+            context.start_connect_tab(db_config)
         };
         let state = request.subscribe();
 
@@ -340,7 +360,7 @@ impl RuntimeBridge {
         let (tx, rx) = oneshot::channel();
         let closing = {
             let _runtime = self.runtime.enter();
-            self.context.track_close(conn.engine().start_close()?)
+            self.context.begin_close(conn.engine())?
         };
         self.runtime.spawn(async move {
             let result = closing.wait().await.map_err(|error| match error {

@@ -321,3 +321,134 @@ async fn frontend_can_connect_preview_stream_navigate_cancel_restart_and_close_w
         ApplicationPhase::Closed
     );
 }
+
+struct IndependentFactory;
+impl AdapterFactory for IndependentFactory {
+    fn backend(&self) -> DatabaseBackend {
+        DatabaseBackend::Postgresql
+    }
+    fn create(&self, _: DatabaseConfig) -> Result<Arc<dyn DatabaseSession>, String> {
+        Ok(Arc::new(Fixture::default()))
+    }
+}
+
+#[tokio::test]
+async fn query_tabs_have_independent_sessions_and_close_cancels_only_the_owning_query() {
+    let mut registry = AdapterRegistry::default();
+    registry.register(Arc::new(IndependentFactory)).unwrap();
+    let context = Arc::new(ApplicationContext::new(registry));
+    let profile =
+        DatabaseConfig::from_connection_string("host=localhost user=fixture dbname=fixture");
+    let first_request = context.start_connect_tab(profile.clone());
+    let first_id = first_request.tab.unwrap();
+    let first_engine = first_request.wait().await.unwrap();
+    let second_engine = context.start_connect_tab(profile).wait().await.unwrap();
+    let first = context.tabs.session(first_engine.id()).unwrap();
+    let second = context.tabs.session(second_engine.id()).unwrap();
+    assert_eq!(first.id, first_id);
+    assert_ne!(first.id, second.id);
+    assert_ne!(first_engine.id(), second_engine.id());
+    assert_ne!(first.document.id(), second.document.id());
+    assert_eq!(context.tabs.snapshot().selected, Some(second.id));
+    assert!(context.tabs.select(Some(first.id)));
+    first.document.set_draft("wait".into());
+    second.document.set_draft("rows".into());
+    let slow = first
+        .document
+        .submit(
+            first_engine.clone(),
+            "wait".into(),
+            ResultLimits::default(),
+            None,
+        )
+        .unwrap();
+    let mut progress = first.document.subscribe();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while progress
+            .borrow_and_update()
+            .operation
+            .as_ref()
+            .and_then(|operation| operation.capture.as_ref())
+            .map_or(0, |capture| capture.rows)
+            < 5
+        {
+            progress.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    let quick = second
+        .document
+        .submit(
+            second_engine.clone(),
+            "rows".into(),
+            ResultLimits::default(),
+            None,
+        )
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(3), quick.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .result
+            .is_ok()
+    );
+    assert!(first.document.is_active());
+    assert_eq!(first.document.draft(), "wait");
+    assert_eq!(second.document.draft(), "rows");
+    let waiting = second
+        .submit("wait".into(), ResultLimits::default(), None)
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), context.close(first_engine.id()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(slow.wait().await.unwrap().result.is_err());
+    assert!(second.document.is_active());
+    assert!(context.tabs.session(first_engine.id()).is_none());
+    assert!(context.tabs.session(second_engine.id()).is_some());
+    assert_eq!(context.tabs.snapshot().selected, Some(second.id));
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        context.start_shutdown().unwrap().wait(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(waiting.wait().await.unwrap().result.is_err());
+    assert!(context.tabs.snapshot().tabs.is_empty());
+    assert!(context.session_ids().await.is_empty());
+}
+
+#[tokio::test]
+async fn failed_tab_keeps_its_identity_and_draft_until_shutdown() {
+    struct Rejected;
+    impl AdapterFactory for Rejected {
+        fn backend(&self) -> DatabaseBackend {
+            DatabaseBackend::Postgresql
+        }
+        fn create(&self, _: DatabaseConfig) -> Result<Arc<dyn DatabaseSession>, String> {
+            Err("connection rejected".into())
+        }
+    }
+    let mut registry = AdapterRegistry::default();
+    registry.register(Arc::new(Rejected)).unwrap();
+    let context = Arc::new(ApplicationContext::new(registry));
+    let request = context.start_connect_tab(DatabaseConfig::from_connection_string(
+        "host=localhost user=fixture dbname=fixture",
+    ));
+    let tab = request.tab.unwrap();
+    let document = context.tabs.snapshot().tabs[0].document.clone();
+    document.set_draft("SELECT 42".into());
+    assert!(request.wait().await.is_err());
+    let snapshot = context.tabs.snapshot();
+    assert_eq!(snapshot.tabs[0].id, tab);
+    assert_eq!(snapshot.tabs[0].document.draft(), "SELECT 42");
+    assert!(matches!(
+        snapshot.tabs[0].phase,
+        dzban_core::tabs::TabPhase::Failed(_)
+    ));
+    context.start_shutdown().unwrap().wait().await.unwrap();
+    assert!(context.tabs.snapshot().tabs.is_empty());
+}

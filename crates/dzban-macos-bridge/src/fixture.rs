@@ -107,7 +107,16 @@ impl DatabaseSession for Fixture {
         Ok(QueryPlan {
             backend: DatabaseBackend::Postgresql,
             document: serde_json::json!({"fixture": true, "sql": sql}),
-            estimate: Default::default(),
+            estimate: if matches!(sql, "wait" | "costed") {
+                dzban_core::QueryEstimate {
+                    rows: Some(500),
+                    startup_cost: Some(0.0),
+                    total_cost: Some(12.5),
+                    ..Default::default()
+                }
+            } else {
+                Default::default()
+            },
         })
     }
     async fn execute_streamed(
@@ -115,7 +124,10 @@ impl DatabaseSession for Fixture {
         sql: &str,
         sink: &mut ResultSink,
     ) -> Result<Option<dzban_core::CommandAcknowledgment>, ExecutionError> {
-        if sql == "fail" {
+        if matches!(sql, "delayed_result" | "delayed_failure") {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        }
+        if matches!(sql, "fail" | "delayed_failure") {
             return Err(ExecutionError::Message("Fixture query failed".into()));
         }
         if sql == "reject_close" {
@@ -130,7 +142,11 @@ impl DatabaseSession for Fixture {
             self.canceled.notified().await;
             return Err(ExecutionError::Canceled);
         }
-        let width = if sql == "wide" { 128 } else { 2 };
+        let width = match sql {
+            "wide" => 128,
+            "single" => 1,
+            _ => 2,
+        };
         sink.schema(
             (0..width)
                 .map(|column| ResultColumn {
@@ -152,7 +168,7 @@ impl DatabaseSession for Fixture {
         .await?;
         let rows = match sql {
             "empty" => 0,
-            "huge" => 3,
+            "huge" | "single" | "few" => 3,
             "limit" => 10_020,
             _ => 500,
         };

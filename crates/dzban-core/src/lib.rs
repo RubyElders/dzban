@@ -9,11 +9,13 @@ pub mod error;
 pub mod execution;
 pub mod history;
 pub mod interaction;
+mod plan_text;
 pub mod preview;
 pub mod query_selection;
 pub mod result;
 pub mod result_store;
 pub mod result_stream;
+pub mod tabs;
 
 pub use config::{Config, ConnectionProfileId, DatabaseBackend, DatabaseConfig, ProfileError};
 pub use result::{

@@ -30,6 +30,7 @@ use crate::transport::Stream;
 #[derive(Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
+    Tabs {},
     #[cfg(feature = "test-fixtures")]
     TestPanic {},
     #[cfg(feature = "test-fixtures")]
@@ -367,8 +368,13 @@ impl State {
     async fn submit(&self, session: Uuid, document: Uuid, sql: String) -> Result<Value, Value> {
         let (engine, document) = self.document(session, document)?;
         let history = self.history(session).await?;
-        let query = document
-            .submit(engine, sql, ResultLimits::default(), Some(history))
+        let tab = self
+            .context
+            .tabs
+            .session(engine.id())
+            .ok_or_else(|| failure("unknown_tab", "Query tab is not open"))?;
+        let query = tab
+            .submit(sql, ResultLimits::default(), Some(history))
             .map_err(execution_error)?;
         self.saved_outputs.lock().unwrap().remove(&document.id());
         let result = json!({"query": query.query.0, "document": query.document.0, "session": query.session.0, "generation": query.generation});
@@ -481,7 +487,20 @@ impl State {
             .unwrap()
             .connection
             .begin_close(SessionId(session));
-        let outcome = self.context.close(SessionId(session)).await;
+        let already_closed = self
+            .workspaces
+            .lock()
+            .unwrap()
+            .get(&SessionId(session))
+            .is_some_and(|workspace| {
+                *workspace.engine.subscribe_session().borrow()
+                    == dzban_core::execution::SessionPhase::Closed
+            });
+        let outcome = if already_closed {
+            Ok(())
+        } else {
+            self.context.close(SessionId(session)).await
+        };
         let cleanup = outcome.as_ref().map(|_| ()).map_err(|error| match error {
             ApplicationError::Operation(error) => error.clone(),
             _ => ExecutionError::Message(error.to_string()),
@@ -518,15 +537,13 @@ impl State {
         Ok(())
     }
     fn controls(&self) -> Value {
-        let selected = match self.selection.lock().unwrap().connection {
-            ConnectionSelection::Ready(id) => self
-                .workspaces
-                .lock()
-                .unwrap()
-                .get(&id)
-                .map(|workspace| SessionInteraction::from_engine(&workspace.engine)),
-            _ => None,
-        };
+        let snapshot = self.context.tabs.snapshot();
+        let selected = snapshot
+            .tabs
+            .iter()
+            .find(|tab| Some(tab.id) == snapshot.selected)
+            .and_then(|tab| tab.engine.as_ref())
+            .map(|engine| SessionInteraction::from_engine(engine));
         let mut interaction = self.interaction.lock().unwrap();
         interaction.transition(AppEvent::SessionSelected(selected));
         let primary_action = match interaction.primary_action() {
@@ -716,6 +733,17 @@ impl State {
                     json!({"record_bytes":record_bytes,"peak_record_bytes":peak_record_bytes,"buffer_bytes":buffer_bytes,"peak_buffer_bytes":peak_buffer_bytes}),
                 )
             }
+            Command::Tabs {} => {
+                let snapshot = self.context.tabs.snapshot();
+                let tabs: Vec<_> = snapshot.tabs.iter().map(|tab| json!({
+                    "tab": tab.id.0, "session": tab.engine.as_ref().map(|engine| engine.id().0),
+                    "profile": tab.profile.0, "backend": tab.backend,
+                    "document": tab.document.id().0,
+                    "execution": document_snapshot(&tab.document)["execution"],
+                    "phase": match &tab.phase { dzban_core::tabs::TabPhase::Connecting => "connecting", dzban_core::tabs::TabPhase::Ready => "ready", dzban_core::tabs::TabPhase::Failed(_) => "error" }
+                })).collect();
+                Ok(json!({"tabs": tabs, "selected": snapshot.selected.map(|tab|tab.0)}))
+            }
             Command::Controls {} => Ok(self.controls()),
             Command::Actions { session } => {
                 let engine = self
@@ -766,9 +794,6 @@ impl State {
             ),
             Command::SelectSession { session, revision } => {
                 let mut selection = self.selection.lock().unwrap();
-                if matches!(selection.connection, ConnectionSelection::Closing(_)) {
-                    return Err(execution_error(ExecutionError::Busy));
-                }
                 if !selection.accept_revision(revision) {
                     return Err(failure(
                         "selection_superseded",
@@ -788,6 +813,10 @@ impl State {
                 } else {
                     selection.connection.clear();
                 }
+                let tab = session
+                    .and_then(|id| self.context.tabs.session(SessionId(id)))
+                    .map(|tab| tab.id);
+                self.context.tabs.select(tab);
                 for workspace in self.workspaces.lock().unwrap().values_mut() {
                     workspace.input_document = None;
                     workspace.input_state = AppState::default();
@@ -903,7 +932,7 @@ impl State {
                     if !selection.connection.accepts_connection_request() {
                         return Err(execution_error(ExecutionError::Busy));
                     }
-                    let connection = self.context.start_connect(profile);
+                    let connection = self.context.start_connect_tab(profile);
                     selection.connection.begin(connection.id);
                     let snapshots = connection.subscribe();
                     (connection, snapshots)
@@ -917,39 +946,48 @@ impl State {
                     .connection
                     .apply(&snapshots.borrow());
                 let engine = outcome.map_err(|error| application_error("connection", error))?;
-                if *self.context.subscribe_phase().borrow() != ApplicationPhase::Running {
-                    return Err(failure("closed", "Application is closing"));
-                }
                 let session = engine.id();
-                self.workspaces.lock().unwrap().insert(
-                    session,
-                    Workspace {
-                        engine,
-                        documents: QueryDocuments::default(),
-                        preview: PlanPreviewService::default(),
-                        peeks: Default::default(),
-                        preview_revision: 0,
-                        input_document: None,
-                        input_state: AppState::default(),
-                        profile: profile_name,
-                        selection_revision: 0,
-                    },
-                );
-                Ok(json!({"request": request, "session": session.0, "selected":selected}))
+                let tab = self
+                    .context
+                    .tabs
+                    .session(session)
+                    .ok_or_else(|| failure("closed", "Query tab is closing"))?;
+                let tab_id = tab.id;
+                {
+                    let mut workspaces = self.workspaces.lock().unwrap();
+                    if *self.context.subscribe_phase().borrow() != ApplicationPhase::Running {
+                        return Err(failure("closed", "Application is closing"));
+                    }
+                    workspaces.insert(
+                        session,
+                        Workspace {
+                            engine,
+                            documents: QueryDocuments::from_document(tab.document),
+                            preview: PlanPreviewService::default(),
+                            peeks: Default::default(),
+                            preview_revision: 0,
+                            input_document: None,
+                            input_state: AppState::default(),
+                            profile: profile_name,
+                            selection_revision: 0,
+                        },
+                    );
+                }
+                Ok(
+                    json!({"request": request, "session": session.0, "tab": tab_id.0, "selected":selected}),
+                )
             }
             Command::OpenDocument { session, revision } => {
                 let mut workspaces = self.workspaces.lock().unwrap();
                 let workspace = workspaces
                     .get_mut(&SessionId(session))
                     .ok_or_else(|| failure("unknown_session", "Session is not open"))?;
-                let previous = workspace.documents.selected();
-                let document = workspace.documents.open();
-                if revision.is_some_and(|revision| revision < workspace.selection_revision) {
-                    if let Some(previous) = previous {
-                        workspace.documents.select(previous.id());
-                    }
-                } else if let Some(revision) = revision {
-                    workspace.selection_revision = revision;
+                let document = workspace
+                    .documents
+                    .selected()
+                    .ok_or_else(|| failure("unknown_document", "Tab has no query document"))?;
+                if let Some(revision) = revision {
+                    workspace.selection_revision = workspace.selection_revision.max(revision);
                 }
                 Ok(self.snapshot(&document))
             }
@@ -1243,6 +1281,7 @@ impl State {
                     }
                     match &snapshot.phase {
                         PreviewPhase::Ready(plan) if service.accepts(&snapshot, &document) => {
+                            let plan = json!({"backend":plan.backend, "document":plan.document, "estimate":plan.estimate, "text":plan.text()});
                             return Ok(
                                 json!({"request":target.request.0, "session":target.session.0, "document":target.document.0, "draft_revision":target.revision, "plan":plan}),
                             );
@@ -1396,6 +1435,9 @@ fn document_snapshot(document: &QueryDocument) -> Value {
         "termination": termination,
         "capture_error": capture_error,
         "command_result": command,
+        "started_at_seconds": snapshot.operation.as_ref().and_then(|operation| operation.started_wall_time).and_then(|start| start.duration_since(std::time::UNIX_EPOCH).ok()).map(|duration| duration.as_secs_f64()),
+        "elapsed_seconds": snapshot.operation.as_ref().map(|operation| operation.elapsed().as_secs_f64()),
+        "execution_plan": snapshot.plan.as_ref().map(|plan| json!({"backend": plan.backend, "estimate": plan.estimate})),
         "execution_seconds": snapshot.completion.as_ref().and_then(|completion|completion.as_ref().ok()).and_then(|completion|completion.result.as_ref().ok()).map(|result|result.duration.as_secs_f64()),
         "cutoff": capture.and_then(|capture| capture.cutoff),
         "error": error,

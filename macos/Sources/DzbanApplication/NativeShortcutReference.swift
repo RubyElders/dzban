@@ -2,40 +2,78 @@ import SwiftUI
 
 struct NativeShortcutReference: View {
     @Environment(\.dismiss) private var dismiss
+
+    private struct Shortcut: Identifiable {
+        let keys: String
+        let action: String
+        let context: String
+        let spokenKeys: String
+        var id: String { action }
+    }
+
     private let shortcuts = [
-        ("Command-Return / Command-Shift-Return", "Run selected SQL or the current statement"),
-        ("Escape / Command-period", "Cancel the running query"),
-        ("Hold Command/Control + Shift", "Estimate the current query in the top bar"),
-        ("Command/Control-Shift-Space", "Tap to pin the query plan; hold to peek"),
-        ("Command-Shift-P", "Tap to pin the query plan; hold to peek until release"),
-        ("Space in results", "Tap to pin the selected row; hold to peek"),
-        ("Return in results", "Inspect the selected cell's original value"),
-        ("Command-Shift-K", "Search actions, connections, and query tabs"),
-        ("Up / Down / Return in action search", "Select and invoke an action"),
-        ("Command-K", "Show connections"),
-        ("Command-B", "Toggle query history"),
-        ("Command-T / Command-W", "Open / close a query tab"),
-        ("Command-Shift-[ / Command-Shift-]", "Previous / next query tab"),
-        ("Command-Option-Left / Right", "Previous / next connection tab"),
-        ("F1 / Command-Shift-/", "Show keyboard shortcuts"),
-        ("Command-Q", "Quit after query and connection cleanup")
+        Shortcut(keys: "⌘↩", action: "Run or stop query", context: "Query", spokenKeys: "Command Return"),
+        Shortcut(keys: "⌘⇧↩", action: "Estimate and run query", context: "Query", spokenKeys: "Command Shift Return"),
+        Shortcut(keys: "⌘⇧␣", action: "Open query plan", context: "Query", spokenKeys: "Command Shift Space"),
+        Shortcut(keys: "⌘⇧", action: "Hold for live estimate", context: "Query", spokenKeys: "Hold Command Shift"),
+        Shortcut(keys: "␣", action: "Tap to pin row; hold to peek", context: "Results", spokenKeys: "Space"),
+        Shortcut(keys: "␣ / ↩", action: "Open selected cell value", context: "Row preview", spokenKeys: "Space or Return"),
+        Shortcut(keys: "← / →", action: "Previous / next result row", context: "Row preview", spokenKeys: "Left or Right"),
+        Shortcut(keys: "⎋", action: "Go back, dismiss, or stop query", context: "Current view", spokenKeys: "Escape"),
+        Shortcut(keys: "⌘K", action: "Switch query / results focus", context: "Window", spokenKeys: "Command K"),
+        Shortcut(keys: "⌘L", action: "Search actions and tabs", context: "Window", spokenKeys: "Command L"),
+        Shortcut(keys: "H J K L", action: "Move left / down / up / right", context: "Outside text", spokenKeys: "H, J, K, L"),
+        Shortcut(keys: "↑ ↓ / ↩", action: "Select / open item", context: "Lists", spokenKeys: "Up, Down, Return"),
+        Shortcut(keys: "␣", action: "Probe selected connection", context: "Connections", spokenKeys: "Space"),
+        Shortcut(keys: "⌘B", action: "Toggle history sidebar", context: "Window", spokenKeys: "Command B"),
+        Shortcut(keys: "⌘T / ⌘W", action: "New tab / close tab", context: "Window", spokenKeys: "Command T, Command W"),
+        Shortcut(keys: "⌃⇥ / ⌃⇧⇥", action: "Next / previous tab", context: "Window", spokenKeys: "Control Tab, Control Shift Tab"),
+        Shortcut(keys: "⌘A / C / V / X", action: "Select all / copy / paste / cut", context: "Text", spokenKeys: "Command A, C, V, X"),
+        Shortcut(keys: "⌘Z / ⌘⇧Z", action: "Undo / redo", context: "Text", spokenKeys: "Command Z, Command Shift Z"),
+        Shortcut(keys: "⌘?", action: "Show keyboard shortcuts", context: "Window", spokenKeys: "Command Question Mark"),
+        Shortcut(keys: "⌘Q", action: "Quit after query cleanup", context: "App", spokenKeys: "Command Q")
     ]
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(spacing: 0) {
             HStack {
-                Label("Keyboard Shortcuts", systemImage: "keyboard").font(.headline)
+                Text("Keyboard Shortcuts").font(.headline)
                 Spacer()
                 Button("Close") { dismiss() }.keyboardShortcut(.cancelAction).accessibilityIdentifier("shortcuts.close")
             }
+            .padding(16)
+            HStack(spacing: 16) {
+                Text("Where").frame(width: 110, alignment: .leading)
+                Text("Action").frame(maxWidth: .infinity, alignment: .leading)
+                Text("Shortcut").frame(width: 170, alignment: .trailing)
+            }
+            .font(.system(size: 14, weight: .medium))
+            .padding(.horizontal, 16)
+            .frame(height: 28)
+            .background(Color(nsColor: .controlBackgroundColor))
+            Divider()
             ScrollView {
-                Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 12) {
-                    ForEach(shortcuts, id: \.0) { key, action in
-                        GridRow { Text(key).font(.system(.body, design: .monospaced)); Text(action) }
+                LazyVStack(spacing: 0) {
+                    ForEach(Array(shortcuts.enumerated()), id: \.element.id) { index, shortcut in
+                        HStack(spacing: 16) {
+                            Text(shortcut.context).foregroundStyle(.secondary)
+                                .frame(width: 110, alignment: .leading)
+                            Text(shortcut.action).frame(maxWidth: .infinity, alignment: .leading)
+                            Text(shortcut.keys).font(.system(size: 14, weight: .medium, design: .monospaced))
+                                .frame(width: 170, alignment: .trailing)
+                                .accessibilityLabel(shortcut.spokenKeys)
+                                .accessibilityIdentifier("shortcut.\(shortcut.spokenKeys)")
+                        }
+                        .font(.system(size: 14))
+                        .padding(.horizontal, 16)
+                        .frame(height: 26)
+                        .background(Color(nsColor: NSColor.alternatingContentBackgroundColors[index % 2]))
                     }
                 }
             }
-            Text("Hold Command or Control for query actions, add Shift for an estimate, then Enter to execute or Space to inspect the plan. The footer probe refreshes measured database latency.")
-                .font(.caption).foregroundStyle(.secondary)
-        }.padding(20).frame(width: 760, height: 530)
+            .background(Color(nsColor: .textBackgroundColor))
+            .accessibilityIdentifier("shortcuts.table")
+        }
+        .frame(width: 720, height: 578)
     }
 }

@@ -18,7 +18,7 @@ extension LifecycleScenarios {
         try expect(connected)
         let session = store.selectedSession!
         let original = store.document!.document
-        await store.newDocument()
+        _ = await store.connect(profile: "fixture")
         let second = store.document!.document
         try expect(second != original)
         await store.selectDocument(original)
@@ -27,7 +27,9 @@ extension LifecycleScenarios {
         try expect(store.workspace?.documents.count == 1)
         try expect(store.selectedSession == session)
         await store.chooseConnections()
+        try expect(store.connectionsVisible)
         try expect(store.selectedSession == nil)
+        try expect(store.pages.count == 2)
         try expect(store.workspaces.count == 1)
         await store.selectSession(session)
         try expect(store.controls?.primaryAction == "run")
@@ -43,7 +45,7 @@ extension LifecycleScenarios {
             try expect(ContinuousClock.now < deadline, "Connection was never admitted")
             try await Task.sleep(for: .milliseconds(5))
         }
-        await store.chooseConnections()
+        store.cancelConnectionPicker()
         let stale = await connecting.value
         try expect(!stale)
         try expect(store.selectedSession == nil)
@@ -65,22 +67,13 @@ extension LifecycleScenarios {
         let active = try await bridge.observeDocument(session: session, document: document)
         for try await snapshot in active { if snapshot.rows >= 5 { break } }
         await store.closeDocument(document)
-        try expect(store.workspace?.documents.count == 1)
-        try expect(store.failure != nil)
-        store.failure = nil
-        await store.chooseConnections()
-        try expect(store.controls == nil)
-        await store.selectSession(session)
-        await store.refreshControls()
-        try expect(store.controls?.primaryAction == "stop")
-        do { try await store.shutdown(); throw CheckFailure(message: "Busy store shut down") }
-        catch let error as BridgeFailure { try expect(error.kind == "shutdown") }
-        try expect(!store.isClosed && !store.isShuttingDown)
-        let _: Ack = try await bridge.request(.cancel(session: session, document: document), as: Ack.self)
-        let completed = try await bridge.observeDocument(session: session, document: document)
-        for try await snapshot in completed { if snapshot.execution == "finished" { break } }
-        let _: Submission = try await bridge.request(.submit(session: session, document: document, sql: "reject_close"), as: Submission.self)
-        let rejecting = try await bridge.observeDocument(session: session, document: document)
+        try expect(store.workspaces.isEmpty)
+        try expect(store.failure == nil)
+        _ = await store.connect(profile: "fixture")
+        let retrySession = store.selectedSession!
+        let retryDocument = store.document!.document
+        let _: Submission = try await bridge.request(.submit(session: retrySession, document: retryDocument, sql: "reject_close"), as: Submission.self)
+        let rejecting = try await bridge.observeDocument(session: retrySession, document: retryDocument)
         for try await snapshot in rejecting { if snapshot.execution == "finished" { break } }
         do { try await store.shutdown(); throw CheckFailure(message: "Rejected cleanup was lost") }
         catch let error as BridgeFailure { try expect(error.kind == "shutdown") }

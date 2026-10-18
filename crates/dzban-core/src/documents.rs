@@ -65,7 +65,7 @@ pub struct QueryDocument {
 }
 
 impl QueryDocument {
-    fn new(number: u32) -> Self {
+    pub(crate) fn new(number: u32) -> Self {
         let snapshot = DocumentSnapshot {
             id: DocumentId(uuid::Uuid::new_v4()),
             number,
@@ -277,6 +277,14 @@ pub struct QueryDocuments {
 }
 
 impl QueryDocuments {
+    pub fn from_document(document: QueryDocument) -> Self {
+        Self {
+            counter: document.number(),
+            selected: Some(document.id()),
+            documents: vec![document],
+        }
+    }
+
     pub fn close_in_workspace(&mut self, id: DocumentId) -> CloseDocument {
         let Some(document) = self.find(id) else {
             return CloseDocument::Missing;

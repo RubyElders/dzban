@@ -29,31 +29,20 @@ Create `Arc<ApplicationContext>` with `dzban_db::adapters::registry()`. Tests ca
 inject an `AdapterRegistry` of `AdapterFactory` implementations instead. Register
 one factory per backend; each factory creates a `Send + Sync` `DatabaseSession`.
 
-Resolve the selected profile with `Config::resolve_profile`, then call
-`ApplicationContext::start_connect`. Keep its request ID, subscribe to the handle,
-and await `wait()` on the runtime. `ConnectionSelection::begin/apply` rejects old
-connection responses. The context retains pending requests and connected engines
-even if a frontend waiter disappears. Explicitly close a connection the user no
-longer wants; dropping a view is not disconnecting.
+Resolve a saved profile with `Config::resolve_profile`. Desktop frontends call `ApplicationContext::start_connect_tab`, which allocates a stable `TabId` and a retained query document before starting the connection. `ConnectionHandle::tab` identifies that tab; its connection request ID and snapshots retain the existing asynchronous connection contract. The context owns pending connections even if a frontend waiter disappears. Explicitly close a successful connection the user no longer wants. The lower-level `start_connect`/`connect_profile` APIs remain available for the CLI and temporary profile probes without creating desktop tabs.
+
+`ApplicationContext::tabs` owns ordered query tabs, selection and the one-document/one-session association. Read `snapshot()` or subscribe to retained tab snapshots. Each tab has a profile identity, backend, document, connection phase and, when connected, its own engine. Two tabs using the same profile are independent database sessions. PostgreSQL transactions, temporary tables and settings are scoped to the tab's session. Use `tabs.select` or `tabs.select_session` when changing selection; no adapter owns UI tab policy.
 
 Store stable `SessionId`, `DocumentId`, `QueryId` and output-generation identities.
 Names, tab positions and widget addresses are not operation identities.
 
 ## Documents and submission
 
-Keep a `QueryDocuments` collection for each connection workspace. Its methods own
-document order, selection, rename and close policy. A `QueryDocument` starts empty;
-`set_draft` changes its shared draft. Translate cursor/selection context changes
-to `query_context_changed` to invalidate an estimate for the previous SQL region.
-`query_selection::query_at_cursor` accepts character offsets and returns character
-bounds. It preserves simple semicolon splitting; it is not a dialect parser.
+A desktop query tab has exactly one `QueryDocument`, provided by the shared tab model. Frontends may use `QueryDocuments::from_document` to adapt existing editor/result presentation to that retained document, but must not create an additional nested query collection or reuse one tab's engine for another tab. GTK and the native macOS bridge use the same core tab document. New Tab chooses a profile and opens another session rather than calling `QueryDocuments::open` on an existing connection.
 
-Submit using `QueryDocument::submit(engine, sql, limits, history)`. Core admits one
-operation per session, attempts plain EXPLAIN, executes, streams/spools, publishes
-history and updates retained document snapshots. A different session has its own
-admission. Do not run another EXPLAIN or SQL path in the frontend. Core legacy
-projection helpers such as `start`, `finish` and `set_execution_plan` are not the
-supported frontend execution path.
+`set_draft` changes the shared draft. Translate cursor/selection context changes to `query_context_changed` to invalidate an estimate for the previous SQL region. `query_selection::query_at_cursor` accepts character offsets and returns character bounds. It preserves simple semicolon splitting; it is not a dialect parser.
+
+Submit through `QueryTab::submit(sql, limits, history)`, which uses the tab's retained document and engine. The lower-level `QueryDocument::submit` remains available for direct consumers. Core admits one operation per session, attempts plain EXPLAIN, executes, streams/spools, publishes history and updates retained document snapshots. Different query tabs have different admission locks and can run concurrently. Do not add an EXPLAIN or SQL execution path in a frontend.
 
 Subscribe to the document before submission, or read its current snapshot after
 subscribing. `watch` is a coalescing state channel, not a lossless event log: always
@@ -158,18 +147,11 @@ replace them with a frontend-owned read/modify/write history file.
 
 ## Closing and shutdown
 
-Use `close_in_workspace` for a query tab. `Busy` keeps it open; `Closed` removes an
-ordinary tab; `CloseWorkspace` leaves the final draft intact while session cleanup
-is requested. `ApplicationContext::close(id)` admits/owns backend cleanup. Keep
-the page on rejection or cleanup failure. Only after success call
-`retire_closed_session(engine)` and remove the workspace. `ConnectionSelection`
-tracks `begin_close/finish_close`, blocks reconnect during cleanup and restores
-the ready selection on failure.
+The lower-level `QueryDocuments::close_in_workspace` API remains available for direct consumers of document collections. Its `Busy` result retains an active document. Desktop tab closure instead uses the shared session cleanup path below. Native presentation must retain a failed tab until backend cleanup succeeds; `ConnectionSelection::begin_close/finish_close` tracks cleanup in event-loop adapters.
 
-On application exit, call `start_shutdown`, await its handle and inspect the
-outcome. It owns pending connection drainage and session cleanup. A busy/failing
-shutdown restores admission for retry; keep the native window/runtime alive and
-offer cancellation/retry. Never treat dropping the runtime as successful shutdown.
+For desktop tabs, `ApplicationContext::close` and `begin_close` use `QueryEngine::start_close_draining`: stop new session admission, cancel the scoped active query, await operation cleanup, disconnect, retire the shared document and remove the tab. Cancellation/disconnection rejection restores an open session and retains the tab for retry. Direct sessions created without desktop tabs retain their existing idle-only close contract.
+
+On application exit, call `start_shutdown`, await its handle and inspect the outcome. It owns pending connection drainage and cleanup of all sessions, including cancellation of active desktop-tab queries. A failure restores application admission for retry; keep the native window/runtime alive and reconcile the surviving tabs with the shared inventory. Some other tabs may already have closed successfully. Never treat dropping the runtime as successful shutdown.
 
 ## Configuration and platform work
 
@@ -186,9 +168,17 @@ do not silently copy credentials or introduce a native history format. No native
 toolkit, ABI, supported macOS version/architecture matrix, signing or notarization
 is selected by this extraction.
 
+## Native tab presentation
+
+The macOS bridge's `connect` command returns both Tab and Session IDs. `open_document` retrieves the connected tab's sole retained document; it does not allocate another query in the same session. The `tabs` command returns the ordered shared inventory and selected Tab ID without connection configuration or credentials. Session/document identities continue to scope execution, reads, preview and cancellation commands. The native UI presents one tab strip with backend artwork, profile name and query title. The native frontend creates an unconnected presentation tab at startup and for New Tab, rendering the same inline connection selector in both cases. Selecting a profile attaches the shared-core session to that existing page identity. Unconnected pages allocate no database session, remain selectable with the other tabs, and can be closed independently. Query actions and progress belong to the selected tab, and the footer follows its health and result metrics. GTK's outer strip presents the same independent session tabs, and its old inner query strip is hidden.
+
 ## Native history and TLS gates
 
-The macOS bridge lists at most 100 history summaries with SQL previews bounded to 256 Unicode scalars. Each list has an opaque revision; restore requires that revision and its entry index. Refresh invalidates previous selections. Restored results retain their loaded history snapshot under the document's new output generation, independently of a live query that may still be finishing. A new submission replaces the saved output. Saved plans are fetched separately from document snapshots and remain subject to the bridge record-size limit.
+Live document snapshots expose the shared query start wall time, monotonic elapsed duration, and a compact execution-plan estimate without the full plan document. Native results render the elapsed timer while active and retain the frozen duration after cleanup. Saved history does not display the active query timing summary.
+
+The native macOS frontend saves its ordered open pages, connection profile names, SQL drafts and selected page to `$XDG_DATA_HOME/dzban/native-workspace.json` (or `~/.local/share/dzban/native-workspace.json`) before shutting down sessions. The file is written atomically with owner-only permissions. On launch it opens independent sessions for saved connected tabs and restores their drafts without submitting SQL. Unconnected pages remain unconnected. An unavailable profile retains its page and draft for reconnection. Live results, active executions and database session state are not restored.
+
+The macOS bridge lists at most 100 history summaries with SQL previews bounded to 256 Unicode scalars. Each list has an opaque revision; restore requires that revision and its entry index. Refresh invalidates previous selections. Restored results retain their loaded history snapshot under the document's new output generation, independently of a live query that may still be finishing. A new submission replaces the saved output. Saved plans are fetched separately from document snapshots and remain subject to the bridge record-size limit. The preview response includes `plan.text`, rendered by `QueryPlan::text()` from the captured PostgreSQL or ClickHouse plan document. Native plan inspection displays this text while the structured document remains available for estimates and diagnostics.
 
 The shared legacy history format stores sample cells as text, without original types or SQL null identity. Native saved samples label this limitation and preserve the literal text `NULL`. Live results retain typed SQL nulls. History keeps the selected profile name and existing XDG paths; restoring a query does not execute it or migrate files.
 

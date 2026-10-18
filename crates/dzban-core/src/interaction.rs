@@ -387,9 +387,7 @@ impl AppState {
                 }
                 commands
             }
-            InputRole::Submit if primary && self.primary_action() == PrimaryAction::Run => {
-                vec![AppCommand::RunQuery]
-            }
+            InputRole::Submit if primary => self.transition(AppEvent::PrimaryActionRequested),
             _ => Vec::new(),
         }
     }
@@ -645,6 +643,47 @@ mod tests {
             }),
             vec![AppCommand::HidePlan, AppCommand::CancelPreview]
         );
+    }
+
+    #[test]
+    fn execute_shortcut_follows_primary_action_and_ignores_repeats() {
+        let mut state = AppState::default();
+        state.transition(AppEvent::KeyPressed {
+            key: InputRole::PrimaryModifier,
+            at_ms: 0,
+        });
+        for (event, expected) in [
+            (AppEvent::QueryAvailabilityChanged(false), vec![]),
+            (
+                AppEvent::QueryAvailabilityChanged(true),
+                vec![AppCommand::RunQuery],
+            ),
+            (AppEvent::QueryPlanning, vec![AppCommand::CancelQuery]),
+            (AppEvent::QueryRunning(None), vec![AppCommand::CancelQuery]),
+            (AppEvent::QueryCanceling, vec![]),
+            (AppEvent::QueryFinished, vec![AppCommand::RunQuery]),
+        ] {
+            state.transition(event);
+            assert_eq!(
+                state.transition(AppEvent::KeyPressed {
+                    key: InputRole::Submit,
+                    at_ms: 1
+                }),
+                expected
+            );
+            assert!(
+                state
+                    .transition(AppEvent::KeyPressed {
+                        key: InputRole::Submit,
+                        at_ms: 2
+                    })
+                    .is_empty()
+            );
+            state.transition(AppEvent::KeyReleased {
+                key: InputRole::Submit,
+                at_ms: 3,
+            });
+        }
     }
 
     #[test]

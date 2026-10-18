@@ -33,6 +33,7 @@ for service in specification["services"].values():
     service.pop("container_name", None)
     for port in service["ports"]:
         port["host_ip"] = "127.0.0.1"
+        port["published"] = "0"
 (root / "compose.json").write_text(json.dumps(specification))
 PY
 trap cleanup EXIT
@@ -49,6 +50,8 @@ else
     workflows+=(-only-testing:DzbanUITests/ShellTests/testNativeAppearanceResizeAndAccessibleInspection)
 fi
 "${compose[@]}" up -d --wait
+pg_port=$("${compose[@]}" port postgres15 5432)
+ch_port=$("${compose[@]}" port clickhouse 8123)
 xcode_arguments=(-project macos/Dzban.xcodeproj -scheme Dzban -configuration Debug
     -derivedDataPath "$repo_root/target/macos-xcode-fixtures" -destination 'platform=macOS,arch=arm64'
     DZBAN_MACOS_FIXTURES=YES DZBAN_BUNDLE_IDENTIFIER=com.rubyelders.dzban.macos.dev.fixtures
@@ -56,7 +59,7 @@ xcode_arguments=(-project macos/Dzban.xcodeproj -scheme Dzban -configuration Deb
     'OTHER_SWIFT_FLAGS=$(inherited) -Xcc -DDZBAN_TEST_FIXTURES')
 xcodebuild "${xcode_arguments[@]}" build-for-testing
 live_run="$repo_root/target/macos-xcode-fixtures/Build/Products/DzbanLive-$(basename "$fixture_root").xctestrun"
-python3 - "$repo_root/target/macos-xcode-fixtures/Build/Products" "$live_run" "$installed_app" <<'PYTEST'
+python3 - "$repo_root/target/macos-xcode-fixtures/Build/Products" "$live_run" "$installed_app" "${pg_port##*:}" "${ch_port##*:}" <<'PYTEST'
 from pathlib import Path
 import plistlib
 import sys
@@ -70,7 +73,10 @@ else:
     targets = [target for target in specification.values() if isinstance(target, dict) and 'TestBundlePath' in target]
 assert targets, 'No test runner targets in generated xctestrun'
 for target in targets:
-    target.setdefault('EnvironmentVariables', {})['DZBAN_TEST_DATABASES'] = '1'
+    environment = target.setdefault('EnvironmentVariables', {})
+    environment['DZBAN_TEST_DATABASES'] = '1'
+    environment['DZBAN_TEST_PG_PORT'] = sys.argv[4]
+    environment['DZBAN_TEST_CH_PORT'] = sys.argv[5]
     if sys.argv[3]:
         original = target['UITargetAppPath']
         target['UITargetAppPath'] = sys.argv[3]

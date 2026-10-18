@@ -115,6 +115,7 @@ impl ConnectionSelection {
 
 pub struct ConnectionHandle {
     pub id: ConnectionRequestId,
+    pub tab: Option<crate::tabs::TabId>,
     snapshot: watch::Receiver<ConnectionSnapshot>,
     task: tokio::task::JoinHandle<Result<Arc<QueryEngine>, ApplicationError>>,
 }
@@ -146,6 +147,7 @@ fn worker_error(error: tokio::task::JoinError) -> ApplicationError {
 }
 
 pub struct ApplicationContext {
+    pub tabs: crate::tabs::QueryTabs,
     adapters: AdapterRegistry,
     sessions: RwLock<HashMap<SessionId, Arc<QueryEngine>>>,
     pending_connections: watch::Sender<Vec<ConnectionSnapshot>>,
@@ -172,6 +174,7 @@ impl ShutdownHandle {
 impl ApplicationContext {
     pub fn new(adapters: AdapterRegistry) -> Self {
         Self {
+            tabs: Default::default(),
             adapters,
             sessions: RwLock::new(HashMap::new()),
             pending_connections: watch::channel(Vec::new()).0,
@@ -187,6 +190,14 @@ impl ApplicationContext {
     }
 
     pub fn start_connect(self: &Arc<Self>, profile: DatabaseConfig) -> ConnectionHandle {
+        self.start_connection(profile, false)
+    }
+
+    pub fn start_connect_tab(self: &Arc<Self>, profile: DatabaseConfig) -> ConnectionHandle {
+        self.start_connection(profile, true)
+    }
+
+    fn start_connection(self: &Arc<Self>, profile: DatabaseConfig, tab: bool) -> ConnectionHandle {
         let id = ConnectionRequestId(uuid::Uuid::new_v4());
         let initial = ConnectionSnapshot {
             request: id,
@@ -208,10 +219,12 @@ impl ApplicationContext {
             drop(snapshot);
             return ConnectionHandle {
                 id,
+                tab: None,
                 snapshot: receiver,
                 task: tokio::spawn(async move { Err(error) }),
             };
         }
+        let tab = tab.then(|| self.tabs.begin(&profile));
         self.pending_connections
             .send_modify(|pending| pending.push(initial.clone()));
         drop(admission);
@@ -233,6 +246,9 @@ impl ApplicationContext {
         let supervisor_context = self.clone();
         let task = tokio::spawn(async move {
             let result = worker.await.map_err(worker_error).and_then(|result| result);
+            if let Some(tab) = tab {
+                supervisor_context.tabs.complete(tab, &result);
+            }
             snapshot.send_modify(|state| {
                 state.phase = match &result {
                     Ok(engine) => ConnectionPhase::Connected(engine.id()),
@@ -246,6 +262,7 @@ impl ApplicationContext {
         });
         ConnectionHandle {
             id,
+            tab,
             snapshot: receiver,
             task,
         }
@@ -294,6 +311,9 @@ impl ApplicationContext {
                     failure.get_or_insert(error);
                 }
             }
+            if failure.is_none() {
+                context.tabs.finish_shutdown();
+            }
             failure.map_or(Ok(()), Err)
         });
         let context = self.clone();
@@ -332,8 +352,22 @@ impl ApplicationContext {
 
     pub async fn close(self: &Arc<Self>, id: SessionId) -> Result<(), ApplicationError> {
         let engine = self.session(id).await?;
-        let closing = engine.start_close().map_err(ApplicationError::Operation)?;
-        self.track_close(closing).wait().await
+        self.begin_close(engine)
+            .map_err(ApplicationError::Operation)?
+            .wait()
+            .await
+    }
+
+    pub fn begin_close(
+        self: &Arc<Self>,
+        engine: Arc<QueryEngine>,
+    ) -> Result<CloseHandle, ExecutionError> {
+        let closing = if self.tabs.session(engine.id()).is_some() {
+            engine.start_close_draining()?
+        } else {
+            engine.start_close()?
+        };
+        Ok(self.track_close(closing))
     }
 
     pub fn track_close(
@@ -344,6 +378,10 @@ impl ApplicationContext {
         let context = self.clone();
         let task = tokio::spawn(async move {
             closing.wait().await.map_err(ApplicationError::Operation)?;
+            context
+                .tabs
+                .retire(id)
+                .map_err(ApplicationError::Operation)?;
             context.sessions.write().await.remove(&id);
             Ok(())
         });

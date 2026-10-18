@@ -7,7 +7,7 @@ fn press(state: &mut AppState, key: InputRole, at_ms: u64) -> Vec<AppCommand> {
 }
 
 #[test]
-fn submit_does_not_start_a_second_operation_during_execution_or_cancel() {
+fn submit_runs_or_cancels_using_the_primary_action() {
     let mut state = AppState::default();
     state.transition(AppEvent::QueryAvailabilityChanged(true));
     press(&mut state, InputRole::PrimaryModifier, 0);
@@ -15,17 +15,17 @@ fn submit_does_not_start_a_second_operation_during_execution_or_cancel() {
         press(&mut state, InputRole::Submit, 1),
         [AppCommand::RunQuery]
     );
-    for phase in [
-        AppEvent::QueryPlanning,
-        AppEvent::QueryRunning(None),
-        AppEvent::QueryCanceling,
+    for (phase, expected) in [
+        (AppEvent::QueryPlanning, vec![AppCommand::CancelQuery]),
+        (AppEvent::QueryRunning(None), vec![AppCommand::CancelQuery]),
+        (AppEvent::QueryCanceling, vec![]),
     ] {
         state.transition(phase);
         state.transition(AppEvent::KeyReleased {
             key: InputRole::Submit,
             at_ms: 2,
         });
-        assert!(press(&mut state, InputRole::Submit, 3).is_empty());
+        assert_eq!(press(&mut state, InputRole::Submit, 3), expected);
     }
     state.transition(AppEvent::QueryFinished);
     state.transition(AppEvent::KeyboardReset);

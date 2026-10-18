@@ -45,6 +45,19 @@ impl DbConfig {
         Self::build(config_name, connection_string, database_config, bridge)
     }
 
+    pub fn for_query_tab(
+        name: String,
+        database_config: DatabaseConfig,
+        bridge: crate::database::RuntimeBridge,
+    ) -> Self {
+        Self::build(
+            name,
+            database_config.connection_string(),
+            database_config,
+            bridge,
+        )
+    }
+
     fn build(
         config_name: String,
         connection_string: String,

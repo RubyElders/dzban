@@ -269,6 +269,32 @@ impl QueryTabManager {
         &self.container
     }
 
+    pub fn use_session_tab(&self, document: QueryDocument) {
+        self.tab_bar.set_visible(false);
+        if let Some(number) = self.current_query_id() {
+            let mut tabs = self.tabs.borrow_mut();
+            if let Some(tab) = tabs.get_mut(&number) {
+                document.set_draft(
+                    tab.editor
+                        .buffer()
+                        .text(
+                            &tab.editor.buffer().start_iter(),
+                            &tab.editor.buffer().end_iter(),
+                            false,
+                        )
+                        .to_string(),
+                );
+                tab.document = document.clone();
+            }
+        }
+        *self.documents.borrow_mut() = QueryDocuments::from_document(document);
+        self.focus_current_editor();
+    }
+
+    pub fn set_single_tab(&self) {
+        self.tab_bar.set_visible(false);
+    }
+
     pub fn new_query_tab(&self) {
         let document = self.documents.borrow_mut().open();
         let query_num = document.number();
@@ -295,18 +321,27 @@ impl QueryTabManager {
             },
         );
 
-        let cursor_document = document.clone();
+        let cursor_tabs = Rc::downgrade(&self.tabs);
         editor
             .buffer()
             .connect_notify_local(Some("cursor-position"), move |_, _| {
-                cursor_document.query_context_changed();
+                if let Some(tabs) = cursor_tabs.upgrade()
+                    && let Some(tab) = tabs.borrow().get(&query_num)
+                {
+                    tab.document.query_context_changed();
+                }
             });
+        let draft_tabs = Rc::downgrade(&self.tabs);
         editor.buffer().connect_changed(move |buffer| {
-            document.set_draft(
-                buffer
-                    .text(&buffer.start_iter(), &buffer.end_iter(), false)
-                    .to_string(),
-            );
+            if let Some(tabs) = draft_tabs.upgrade()
+                && let Some(tab) = tabs.borrow().get(&query_num)
+            {
+                tab.document.set_draft(
+                    buffer
+                        .text(&buffer.start_iter(), &buffer.end_iter(), false)
+                        .to_string(),
+                );
+            }
         });
 
         // Select the new tab
@@ -324,6 +359,7 @@ impl QueryTabManager {
         }
     }
 
+    #[cfg(test)]
     pub fn focus_tab_bar(&self) -> bool {
         self.tab_bar.grab_focus()
     }
@@ -728,6 +764,7 @@ impl QueryTabManager {
         self.container.shows_sidebar()
     }
 
+    #[cfg(test)]
     pub fn close_current_tab(&self) -> bool {
         let Some(page) = self.tab_view.selected_page() else {
             return false;
@@ -736,6 +773,7 @@ impl QueryTabManager {
         true
     }
 
+    #[cfg(test)]
     pub fn tab_count(&self) -> i32 {
         self.documents.borrow().documents().len() as i32
     }
@@ -769,11 +807,13 @@ impl QueryTabManager {
         self.preview_service.replace(Some(service));
     }
 
+    #[cfg(test)]
     pub fn select_next_tab(&self) -> bool {
         let next = self.documents.borrow_mut().select_relative(true);
         next.is_some_and(|document| self.select_tab(document.number()))
     }
 
+    #[cfg(test)]
     pub fn select_previous_tab(&self) -> bool {
         let next = self.documents.borrow_mut().select_relative(false);
         next.is_some_and(|document| self.select_tab(document.number()))
@@ -802,6 +842,7 @@ impl QueryTabManager {
         true
     }
 
+    #[cfg(test)]
     pub fn tab_titles(&self) -> Vec<(u32, String)> {
         self.documents
             .borrow()
@@ -814,6 +855,7 @@ impl QueryTabManager {
             .collect()
     }
 
+    #[cfg(test)]
     pub fn select_tab(&self, query_num: u32) -> bool {
         let page = self
             .tabs
@@ -1600,6 +1642,23 @@ mod tests {
         let mut documents = QueryDocuments::default();
         let document = documents.open();
         dzban_core::execution::QueryId(document.id().0)
+    }
+
+    #[gtk4::test]
+    fn session_tab_binding_keeps_editor_events_on_the_shared_document() {
+        let manager = QueryTabManager::new("fixture");
+        manager.new_query_tab();
+        let original = manager.tabs.borrow().get(&1).unwrap().document.clone();
+        let shared = QueryDocuments::default().open();
+        manager.use_session_tab(shared.clone());
+        let editor = manager.tabs.borrow().get(&1).unwrap().editor.clone();
+        editor.buffer().set_text("SELECT 42");
+        assert_eq!(shared.draft(), "SELECT 42");
+        assert_eq!(original.draft(), "");
+        let revision = shared.snapshot().draft_revision;
+        editor.buffer().place_cursor(&editor.buffer().start_iter());
+        assert!(shared.snapshot().draft_revision > revision);
+        assert_eq!(manager.current_query().unwrap().2.id(), shared.id());
     }
 
     #[gtk4::test]
