@@ -63,18 +63,24 @@ pub fn complete(sql: &str, dialect: Dialect) -> bool {
                     }
                 }
             }
+            byte if identifier_start(byte) => {
+                terminated = false;
+                index += 1;
+                while bytes.get(index).is_some_and(|byte| {
+                    identifier_start(*byte) || byte.is_ascii_digit() || *byte == b'$'
+                }) {
+                    index += 1;
+                }
+            }
             b'$' => {
                 terminated = false;
                 let start = index;
                 index += 1;
-                if bytes
-                    .get(index)
-                    .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
-                {
+                if bytes.get(index).is_some_and(|byte| identifier_start(*byte)) {
                     index += 1;
                     while bytes
                         .get(index)
-                        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                        .is_some_and(|byte| identifier_start(*byte) || byte.is_ascii_digit())
                     {
                         index += 1;
                     }
@@ -114,6 +120,10 @@ pub fn complete(sql: &str, dialect: Dialect) -> bool {
     terminated
 }
 
+fn identifier_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_' || byte >= 0x80
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Dialect, complete};
@@ -124,6 +134,20 @@ mod tests {
         assert!(!complete("SELECT '\\';", Dialect::Clickhouse));
         assert!(complete("SELECT 'a\\';b';", Dialect::Clickhouse));
         assert!(complete("SELECT \"\\\";", Dialect::Postgresql));
+    }
+
+    #[test]
+    fn dollar_quotes_and_identifier_dollars_have_distinct_boundaries() {
+        for sql in [
+            "SELECT price$usd$;",
+            "SELECT žluť$tag$;",
+            "SELECT $ž$content;$ž$;",
+        ] {
+            assert!(complete(sql, Dialect::Postgresql), "{sql}");
+        }
+        for sql in ["SELECT $tag$unfinished;", "SELECT $ž$unfinished;"] {
+            assert!(!complete(sql, Dialect::Postgresql), "{sql}");
+        }
     }
 
     #[test]
