@@ -210,7 +210,7 @@ async fn shared_restore_keeps_order_profiles_drafts_selection_and_missing_connec
 }
 
 #[tokio::test]
-async fn shutdown_joins_retained_restore_without_admitting_later_saved_connections() {
+async fn shutdown_aborts_a_retained_restore_without_admitting_later_saved_connections() {
     let (context, session, profile) = fixture();
     session.block_connect.store(true, Ordering::SeqCst);
     let file = WorkspaceFile::new(
@@ -239,7 +239,7 @@ async fn shutdown_joins_retained_restore_without_admitting_later_saved_connectio
         .unwrap();
     assert!(context.tabs.snapshot().tabs.is_empty());
     assert!(context.session_ids().await.is_empty());
-    assert_eq!(session.closes.load(Ordering::SeqCst), 1);
+    assert_eq!(session.closes.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -371,10 +371,9 @@ async fn chooser_keeps_one_document_through_connection_failure_and_retry() {
 }
 
 #[tokio::test]
-async fn closing_pending_connection_retains_ownership_and_shutdown_joins_cleanup() {
+async fn closing_a_pending_connection_aborts_it_without_waiting_for_the_server() {
     let (context, session, profile) = fixture();
     session.block_connect.store(true, Ordering::SeqCst);
-    session.block_close.store(true, Ordering::SeqCst);
     let tab = context.open_tab(None, "draft".into()).unwrap();
     let document = context.tabs.find(tab).unwrap().document;
     let connecting = context.start_connect_in_tab(tab, profile.clone());
@@ -385,28 +384,21 @@ async fn closing_pending_connection_retains_ownership_and_shutdown_joins_cleanup
         Err(ApplicationError::Operation(ExecutionError::Busy))
     ));
     assert_eq!(context.tabs.find(tab).unwrap().connection_request, request);
-    let closing = context.start_close_tab(tab).unwrap();
-    assert_eq!(context.tabs.find(tab).unwrap().phase, TabPhase::Closing);
-    drop(connecting);
     let other = context.open_tab(None, String::new()).unwrap();
-    session.connect_release.notify_one();
-    reached(&session.close_entered).await;
-    let engine = context.tabs.find(tab).unwrap().engine.unwrap();
-    let joined = context.begin_close(engine).unwrap();
-    assert_eq!(context.tabs.find(tab).unwrap().phase, TabPhase::Closing);
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        context.start_close_tab(tab).unwrap().wait(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(connecting.wait().await.is_err());
+    assert!(context.tabs.find(tab).is_none());
     assert_eq!(context.tabs.snapshot().selected, Some(other));
-    let shutdown = context.start_shutdown().unwrap();
-    drop(closing);
-    session.close_release.notify_one();
-    tokio::time::timeout(Duration::from_secs(3), shutdown.wait())
-        .await
-        .unwrap()
-        .unwrap();
-    joined.wait().await.unwrap();
-    assert!(context.tabs.snapshot().tabs.is_empty());
     assert!(context.session_ids().await.is_empty());
-    assert_eq!(session.closes.load(Ordering::SeqCst), 1);
+    assert_eq!(session.closes.load(Ordering::SeqCst), 0);
     assert_eq!(document.snapshot().lifecycle, DocumentLifecycle::Closed);
+    context.start_shutdown().unwrap().wait().await.unwrap();
 }
 
 #[tokio::test]
@@ -523,18 +515,40 @@ async fn tab_creation_and_cycle_share_navigation_revision_ordering() {
 }
 
 #[tokio::test]
-async fn failed_connection_cancellation_keeps_cleanup_retryable_without_losing_the_draft() {
+async fn canceling_connections_keeps_the_draft_and_failed_cleanup_retryable() {
     let (context, session, profile) = fixture();
     session.block_connect.store(true, Ordering::SeqCst);
-    session.reject_close.store(true, Ordering::SeqCst);
     let tab = context.open_tab(None, "keep draft".into()).unwrap();
     let document = context.tabs.find(tab).unwrap().document;
-    let connecting = context.start_connect_in_tab(tab, profile);
+    let connecting = context.start_connect_in_tab(tab, profile.clone());
     reached(&session.connect_entered).await;
-    let canceling = context.start_cancel_connection(tab).unwrap();
-    session.connect_release.notify_one();
+    context
+        .start_cancel_connection(tab)
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
     assert!(connecting.wait().await.is_err());
-    assert!(canceling.wait().await.is_err());
+    let chooser = context.tabs.find(tab).unwrap();
+    assert_eq!(chooser.phase, TabPhase::Choosing);
+    assert_eq!(chooser.document.draft(), "keep draft");
+    assert_eq!(session.closes.load(Ordering::SeqCst), 0);
+
+    session.block_connect.store(false, Ordering::SeqCst);
+    session.reject_close.store(true, Ordering::SeqCst);
+    context
+        .start_connect_in_tab(tab, profile)
+        .wait()
+        .await
+        .unwrap();
+    assert!(
+        context
+            .start_cancel_connection(tab)
+            .unwrap()
+            .wait()
+            .await
+            .is_err()
+    );
     let retained = context.tabs.find(tab).unwrap();
     assert_eq!(retained.phase, TabPhase::Ready);
     assert!(retained.engine.is_some());

@@ -454,7 +454,7 @@ impl QueryEngine {
     pub fn start_ping(&self) -> Result<AuxiliaryHandle<u64>, crate::error::ExecutionError> {
         let session = self.session.clone();
         self.start_auxiliary(OperationState::Ping, async move {
-            session.ping_detailed().await
+            bounded("Ping", session.ping_detailed()).await
         })
     }
 
@@ -471,7 +471,7 @@ impl QueryEngine {
     pub fn start_version(&self) -> Result<AuxiliaryHandle<String>, crate::error::ExecutionError> {
         let session = self.session.clone();
         self.start_auxiliary(OperationState::Version, async move {
-            session.version_detailed().await
+            bounded("Version check", session.version_detailed()).await
         })
     }
 
@@ -1042,6 +1042,22 @@ impl QueryEngine {
             ))
         })?
     }
+}
+
+pub const AUXILIARY_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn bounded<T>(
+    name: &str,
+    operation: impl std::future::Future<Output = Result<T, crate::error::ExecutionError>>,
+) -> Result<T, crate::error::ExecutionError> {
+    tokio::time::timeout(AUXILIARY_TIMEOUT, operation)
+        .await
+        .unwrap_or_else(|_| {
+            Err(crate::error::ExecutionError::Message(format!(
+                "{name} timed out after {} seconds",
+                AUXILIARY_TIMEOUT.as_secs()
+            )))
+        })
 }
 
 #[cfg(test)]

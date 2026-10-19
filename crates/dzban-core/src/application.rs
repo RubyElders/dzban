@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::{RwLock, watch};
 
@@ -32,6 +33,8 @@ impl std::fmt::Display for ApplicationError {
 }
 
 impl std::error::Error for ApplicationError {}
+
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ConnectionRequestId(pub uuid::Uuid);
@@ -172,6 +175,8 @@ pub struct ApplicationContext {
     sessions: RwLock<HashMap<SessionId, Arc<QueryEngine>>>,
     pending_connections: watch::Sender<Vec<ConnectionSnapshot>>,
     closing_sessions: std::sync::Mutex<HashMap<SessionId, CloseReceiver>>,
+    connection_workers: std::sync::Mutex<HashMap<ConnectionRequestId, tokio::task::AbortHandle>>,
+    abandoned_connections: std::sync::Mutex<HashSet<ConnectionRequestId>>,
     phase: watch::Sender<ApplicationPhase>,
 }
 
@@ -203,6 +208,8 @@ impl ApplicationContext {
             sessions: RwLock::new(HashMap::new()),
             pending_connections: watch::channel(Vec::new()).0,
             closing_sessions: Default::default(),
+            connection_workers: Default::default(),
+            abandoned_connections: Default::default(),
             phase: watch::channel(ApplicationPhase::Running).0,
         }
     }
@@ -314,21 +321,53 @@ impl ApplicationContext {
         let (snapshot, receiver) = watch::channel(initial);
         let context = self.clone();
         let worker = tokio::spawn(async move {
-            let engine = context
-                .adapters
-                .connect(profile)
-                .await
-                .map_err(ApplicationError::Adapter)?;
-            context
-                .sessions
-                .write()
-                .await
-                .insert(engine.id(), engine.clone());
-            Ok::<_, ApplicationError>(engine)
+            match tokio::time::timeout(CONNECT_TIMEOUT, context.adapters.connect(profile)).await {
+                Ok(result) => result.map_err(ApplicationError::Adapter),
+                Err(_) => Err(ApplicationError::Operation(ExecutionError::Message(
+                    format!(
+                        "Connection timed out after {} seconds",
+                        CONNECT_TIMEOUT.as_secs()
+                    ),
+                ))),
+            }
         });
+        self.connection_workers
+            .lock()
+            .unwrap()
+            .insert(id, worker.abort_handle());
         let supervisor_context = self.clone();
         let task = tokio::spawn(async move {
-            let mut result = worker.await.map_err(worker_error).and_then(|result| result);
+            let joined = worker.await;
+            let abandoned = {
+                let mut workers = supervisor_context.connection_workers.lock().unwrap();
+                workers.remove(&id);
+                supervisor_context
+                    .abandoned_connections
+                    .lock()
+                    .unwrap()
+                    .remove(&id)
+            };
+            let mut result = match joined {
+                Ok(Ok(engine)) if abandoned => {
+                    if let Ok(closing) = engine.start_close() {
+                        let _ = closing.wait().await;
+                    }
+                    Err(ApplicationError::Operation(ExecutionError::Closed))
+                }
+                Ok(Ok(engine)) => {
+                    supervisor_context
+                        .sessions
+                        .write()
+                        .await
+                        .insert(engine.id(), engine.clone());
+                    Ok(engine)
+                }
+                Ok(Err(error)) => Err(error),
+                Err(error) if error.is_cancelled() => {
+                    Err(ApplicationError::Operation(ExecutionError::Closed))
+                }
+                Err(error) => Err(worker_error(error)),
+            };
             if let Some(tab) = tab {
                 match supervisor_context.tabs.complete(tab, id, &result) {
                     crate::tabs::ConnectionCompletion::Attached => {}
@@ -386,6 +425,12 @@ impl ApplicationContext {
     ) -> Result<CloseHandle, ApplicationError> {
         let mut updates = self.tabs.subscribe();
         self.tabs.begin_close(tab, retain)?;
+        if let Some(current) = self.tabs.find(tab)
+            && current.engine.is_none()
+            && let Some(request) = current.connection_request
+        {
+            self.abort_connection(request);
+        }
         let context = self.clone();
         let (completion, receiver) = watch::channel(None);
         tokio::spawn(async move {
@@ -426,6 +471,14 @@ impl ApplicationContext {
         })
     }
 
+    pub(crate) fn abort_connection(&self, request: ConnectionRequestId) {
+        let workers = self.connection_workers.lock().unwrap();
+        if let Some(worker) = workers.get(&request) {
+            self.abandoned_connections.lock().unwrap().insert(request);
+            worker.abort();
+        }
+    }
+
     pub fn subscribe_pending_connections(&self) -> watch::Receiver<Vec<ConnectionSnapshot>> {
         self.pending_connections.subscribe()
     }
@@ -456,6 +509,15 @@ impl ApplicationContext {
         }
         self.attention().suspend(true);
         let context = self.clone();
+        let pending = self
+            .subscribe_pending_connections()
+            .borrow()
+            .iter()
+            .map(|snapshot| snapshot.request)
+            .collect::<Vec<_>>();
+        for request in pending {
+            self.abort_connection(request);
+        }
         let worker = tokio::spawn(async move {
             context.workspace.drain().await;
             context.health.drain().await;

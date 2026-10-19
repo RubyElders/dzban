@@ -1100,7 +1100,14 @@ impl State {
                 let request = connection.id.0;
                 let outcome = connection.wait().await;
                 let selected = self.context.tabs.snapshot().selected == tab_id;
-                let engine = outcome.map_err(|error| application_error("connection", error))?;
+                let engine = outcome.map_err(|error| {
+                    let kind = if error == ApplicationError::Operation(ExecutionError::Closed) {
+                        "closed"
+                    } else {
+                        "connection"
+                    };
+                    application_error(kind, error)
+                })?;
                 let session = engine.id();
                 let tab = self
                     .context

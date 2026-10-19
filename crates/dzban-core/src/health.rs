@@ -12,6 +12,8 @@ use crate::{ConnectionProfileId, DatabaseConfig};
 
 pub const HEALTH_INTERVAL: Duration = Duration::from_secs(5);
 
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HealthState {
@@ -104,6 +106,12 @@ impl ConnectionProbe {
             version: None,
             error: None,
         }
+    }
+    fn timed_out() -> Self {
+        Self::failed(format!(
+            "Connection check timed out after {} seconds",
+            PROBE_TIMEOUT.as_secs()
+        ))
     }
     fn failed(error: impl std::fmt::Display) -> Self {
         Self {
@@ -389,11 +397,20 @@ impl HealthService {
         self.start(
             ProbeTarget::Profile(ConnectionProfileId(profile.name.clone())),
             async move {
-                let engine = match context.connect_profile(profile).await {
-                    Ok(engine) => engine,
-                    Err(error) => return Ok(ConnectionProbe::failed(error)),
+                let deadline = tokio::time::Instant::now() + PROBE_TIMEOUT;
+                let connection = context.start_connect(profile);
+                let request = connection.id;
+                let engine = match tokio::time::timeout_at(deadline, connection.wait()).await {
+                    Ok(Ok(engine)) => engine,
+                    Ok(Err(error)) => return Ok(ConnectionProbe::failed(error)),
+                    Err(_) => {
+                        context.abort_connection(request);
+                        return Ok(ConnectionProbe::timed_out());
+                    }
                 };
-                let result = probe(&engine, true).await;
+                let result = tokio::time::timeout_at(deadline, probe(&engine, true))
+                    .await
+                    .unwrap_or_else(|_| ConnectionProbe::timed_out());
                 context.close(engine.id()).await?;
                 Ok(result)
             },
