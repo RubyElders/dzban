@@ -54,6 +54,7 @@ pub struct DocumentSnapshot {
     pub execution: DocumentExecution,
     pub session: Option<SessionId>,
     pub output_generation: u64,
+    pub execution_generation: u64,
     pub plan: Option<QueryPlan>,
     pub operation: Option<QuerySnapshot>,
     pub completion: Option<Result<Arc<StreamedQueryCompletion>, crate::error::ExecutionError>>,
@@ -76,6 +77,7 @@ impl QueryDocument {
             execution: DocumentExecution::Idle,
             session: None,
             output_generation: 0,
+            execution_generation: 0,
             plan: None,
             operation: None,
             completion: None,
@@ -146,6 +148,7 @@ impl QueryDocument {
                 return false;
             }
             state.execution = DocumentExecution::Running(query);
+            state.execution_generation = state.output_generation;
             state.plan = None;
             state.operation = None;
             state.completion = None;
@@ -203,6 +206,21 @@ impl QueryDocument {
         generation
     }
 
+    pub(crate) fn replace_draft_and_output(&self, draft: String) -> Option<DocumentSnapshot> {
+        let mut snapshot = None;
+        self.state.send_if_modified(|state| {
+            if state.lifecycle != DocumentLifecycle::Open {
+                return false;
+            }
+            state.draft = draft;
+            state.draft_revision = state.draft_revision.checked_add(1).unwrap();
+            state.output_generation = state.output_generation.checked_add(1).unwrap();
+            snapshot = Some(state.clone());
+            true
+        });
+        snapshot
+    }
+
     pub fn accepts_output(&self, generation: u64) -> bool {
         let state = self.state.borrow();
         state.lifecycle == DocumentLifecycle::Open && state.output_generation == generation
@@ -227,7 +245,7 @@ impl QueryDocument {
         self.state.send_if_modified(mutation)
     }
 
-    fn close(&self) -> bool {
+    pub(crate) fn close(&self) -> bool {
         self.state.send_if_modified(|state| {
             if state.execution.is_active() {
                 return false;

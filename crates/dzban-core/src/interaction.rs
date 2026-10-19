@@ -13,6 +13,276 @@ pub enum InputRole {
     Cancel,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputKey {
+    Primary,
+    Preview,
+    Inspect,
+    Submit,
+    Cancel,
+}
+
+impl From<InputKey> for InputRole {
+    fn from(key: InputKey) -> Self {
+        match key {
+            InputKey::Primary => Self::PrimaryModifier,
+            InputKey::Preview => Self::PreviewModifier,
+            InputKey::Inspect => Self::Inspect,
+            InputKey::Submit => Self::Submit,
+            InputKey::Cancel => Self::Cancel,
+        }
+    }
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum InputEvent {
+    PrimaryAction,
+    Cancel,
+    OpenPlan,
+    ShowPlan,
+    ReleasePlan { elapsed_ms: u64 },
+    Estimate,
+    Press { key: InputKey, at_ms: u64 },
+    Release { key: InputKey, at_ms: u64 },
+    Reset,
+    Pin,
+    ContextChanged,
+    PreviewCanceled,
+    PreviewReady { plan: QueryPlan },
+    PreviewFailed { message: String },
+}
+
+pub(crate) struct TabInput {
+    document: Option<(crate::documents::DocumentId, u64)>,
+    state: AppState,
+    retired: bool,
+    snapshots: tokio::sync::watch::Sender<Option<crate::presentation::InteractionPresentation>>,
+}
+
+impl Default for TabInput {
+    fn default() -> Self {
+        Self {
+            document: None,
+            state: Default::default(),
+            retired: false,
+            snapshots: tokio::sync::watch::channel(None).0,
+        }
+    }
+}
+
+impl TabInput {
+    pub(crate) fn health_available(&self) -> bool {
+        self.state.keyboard.pressed.is_empty()
+            && !matches!(
+                self.state.preview,
+                PlanPreviewState::Scheduled | PlanPreviewState::Loading
+            )
+    }
+    pub(crate) fn retire(&mut self) {
+        self.retired = true;
+        self.reset();
+    }
+    pub(crate) fn refresh(
+        &mut self,
+        engine: &crate::execution::QueryEngine,
+        document: crate::documents::DocumentId,
+        revision: u64,
+    ) {
+        self.state.transition(AppEvent::SessionSelected(Some(
+            SessionInteraction::from_engine(engine),
+        )));
+        self.publish(engine.id(), document, revision);
+    }
+    pub(crate) fn subscribe(
+        &mut self,
+        session: crate::execution::SessionId,
+        document: crate::documents::DocumentId,
+        revision: u64,
+    ) -> tokio::sync::watch::Receiver<Option<crate::presentation::InteractionPresentation>> {
+        if self.snapshots.borrow().is_none() {
+            self.publish(session, document, revision);
+        }
+        self.snapshots.subscribe()
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.document = None;
+        self.state = Default::default();
+        let previous = self.snapshots.borrow().clone();
+        if let Some(previous) = previous {
+            self.publish(
+                crate::execution::SessionId(previous.input.session),
+                crate::documents::DocumentId(previous.input.document),
+                previous.draft_revision,
+            );
+        }
+    }
+
+    pub(crate) fn invalidate_draft(
+        &mut self,
+        engine: &crate::execution::QueryEngine,
+        document: crate::documents::DocumentId,
+        expected_revision: u64,
+        current_revision: u64,
+    ) {
+        if self.document == Some((document, expected_revision)) {
+            self.transition(
+                engine,
+                document,
+                current_revision,
+                InputEvent::ContextChanged,
+            );
+        }
+    }
+
+    pub(crate) fn query_started(
+        &mut self,
+        session: crate::execution::SessionId,
+        document: crate::documents::DocumentId,
+        revision: u64,
+    ) {
+        self.state.transition(AppEvent::QueryPlanning);
+        self.publish(session, document, revision);
+    }
+
+    fn publish(
+        &self,
+        session: crate::execution::SessionId,
+        document: crate::documents::DocumentId,
+        draft_revision: u64,
+    ) {
+        let revision = self
+            .snapshots
+            .borrow()
+            .as_ref()
+            .map_or(1, |snapshot| snapshot.revision.checked_add(1).unwrap());
+        let (plan, error) = match &self.state.preview {
+            PlanPreviewState::Ready(plan) => (
+                Some(crate::presentation::PlanPresentation::from(plan)),
+                None,
+            ),
+            PlanPreviewState::Error(message) => (None, Some(message.clone())),
+            _ => (None, None),
+        };
+        self.snapshots
+            .send_replace(Some(crate::presentation::InteractionPresentation {
+                revision,
+                draft_revision,
+                retired: self.retired,
+                input: crate::presentation::InputPresentation {
+                    session: session.0,
+                    document: document.0,
+                    commands: Vec::new(),
+                    hint: self.state.action_hint().into(),
+                    pinned: self.state.plan_visibility == PlanVisibility::Pinned,
+                },
+                visible: self.state.plan_visibility != PlanVisibility::Hidden,
+                loading: matches!(
+                    self.state.preview,
+                    PlanPreviewState::Scheduled | PlanPreviewState::Loading
+                ),
+                plan,
+                error,
+            }));
+    }
+
+    pub(crate) fn transition(
+        &mut self,
+        engine: &crate::execution::QueryEngine,
+        document: crate::documents::DocumentId,
+        revision: u64,
+        input: InputEvent,
+    ) -> crate::presentation::InputPresentation {
+        use crate::execution::{OperationState, SessionPhase};
+        let mut interaction = SessionInteraction::from_engine(engine);
+        if *engine.subscribe_session().borrow() == SessionPhase::Open
+            && matches!(
+                *engine.subscribe_operation().borrow(),
+                OperationState::Preview | OperationState::Ping | OperationState::Version
+            )
+        {
+            interaction.query_available = true;
+        }
+        self.state
+            .transition(AppEvent::SessionSelected(Some(interaction)));
+        if self.document != Some((document, revision)) {
+            self.state.transition(AppEvent::KeyboardReset);
+            self.state.transition(AppEvent::PreviewCancelled);
+            self.document = Some((document, revision));
+        }
+        let state = &mut self.state;
+        let commands = match input {
+            InputEvent::OpenPlan | InputEvent::ShowPlan | InputEvent::Estimate
+                if !state.preview_available() =>
+            {
+                Vec::new()
+            }
+            InputEvent::PrimaryAction => state.transition(AppEvent::PrimaryActionRequested),
+            InputEvent::Cancel => state.transition(AppEvent::CancelRequested),
+            InputEvent::OpenPlan => {
+                state.plan_visibility = PlanVisibility::Pinned;
+                state.preview = PlanPreviewState::Scheduled;
+                vec![AppCommand::BeginPreview]
+            }
+            InputEvent::ShowPlan => {
+                state.plan_visibility = PlanVisibility::Transient;
+                state.preview = PlanPreviewState::Scheduled;
+                vec![AppCommand::BeginPreview]
+            }
+            InputEvent::ReleasePlan { elapsed_ms } => {
+                if state.plan_visibility == PlanVisibility::Transient {
+                    if elapsed_ms < PREVIEW_HOLD_MS {
+                        state.plan_visibility = PlanVisibility::Pinned;
+                        vec![AppCommand::PinPlan]
+                    } else {
+                        state.plan_visibility = PlanVisibility::Hidden;
+                        vec![AppCommand::HidePlan, AppCommand::CancelPreview]
+                    }
+                } else {
+                    Vec::new()
+                }
+            }
+            InputEvent::Estimate => {
+                state.preview = PlanPreviewState::Scheduled;
+                vec![AppCommand::BeginPreview]
+            }
+            InputEvent::Press { key, at_ms } => state.transition(AppEvent::KeyPressed {
+                key: key.into(),
+                at_ms,
+            }),
+            InputEvent::Release { key, at_ms } => state.transition(AppEvent::KeyReleased {
+                key: key.into(),
+                at_ms,
+            }),
+            InputEvent::Reset => state.transition(AppEvent::KeyboardReset),
+            InputEvent::Pin => {
+                state.plan_visibility = PlanVisibility::Pinned;
+                vec![AppCommand::PinPlan]
+            }
+            InputEvent::ContextChanged => {
+                state.transition(AppEvent::KeyboardReset);
+                state.transition(AppEvent::PreviewCancelled);
+                vec![AppCommand::HidePlan, AppCommand::CancelPreview]
+            }
+            InputEvent::PreviewCanceled => state.transition(AppEvent::PreviewCancelled),
+            InputEvent::PreviewReady { plan } => state.transition(AppEvent::PreviewReady(plan)),
+            InputEvent::PreviewFailed { message } => {
+                state.transition(AppEvent::PreviewFailed(message))
+            }
+        };
+        self.publish(engine.id(), document, revision);
+        crate::presentation::InputPresentation {
+            session: engine.id().0,
+            document: document.0,
+            commands,
+            hint: self.state.action_hint().into(),
+            pinned: self.state.plan_visibility == PlanVisibility::Pinned,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct KeyboardState {
     pressed: BTreeMap<InputRole, u64>,
@@ -164,7 +434,8 @@ impl AppEvent {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AppCommand {
     BeginPreview,
     CancelPreview,
@@ -187,7 +458,8 @@ pub enum ActionHint {
     Canceling(Option<QueryPlan>),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PrimaryAction {
     Unavailable,
     Run,

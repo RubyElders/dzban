@@ -89,6 +89,7 @@ public final class EditorBuffer: ObservableObject {
     }
 
     func retire() {
+        textView.retireHighlighting()
         textView.intent = nil
         textView.delegate = nil
         textView.breakUndoCoalescing()
@@ -117,6 +118,10 @@ public struct SQLEditor: NSViewRepresentable {
 
     public func makeCoordinator() -> Coordinator { Coordinator(buffer: buffer, changed: changed, contextChanged: contextChanged) }
     public func makeNSView(context: Context) -> NSScrollView {
+        #if DZBAN_TEST_FIXTURES
+        ViewUpdateDiagnostics.frames.append("SQLEditor.swift")
+        defer { ViewUpdateDiagnostics.frames.removeLast() }
+        #endif
         let view = buffer.textView
         view.delegate = context.coordinator
         view.intent = action
@@ -124,6 +129,10 @@ public struct SQLEditor: NSViewRepresentable {
         return buffer.scrollView
     }
     public func updateNSView(_ scroll: NSScrollView, context: Context) {
+        #if DZBAN_TEST_FIXTURES
+        ViewUpdateDiagnostics.frames.append("SQLEditor.swift")
+        defer { ViewUpdateDiagnostics.frames.removeLast() }
+        #endif
         context.coordinator.changed = changed
         context.coordinator.contextChanged = contextChanged
         buffer.textView.intent = action
@@ -158,6 +167,18 @@ public struct SQLEditor: NSViewRepresentable {
 final class SQLTextView: NSTextView {
     var intent: ((EditorIntent) -> Bool)?
     var focusWhenAttached = false
+    private var syntaxSnapshot: SQLSyntaxSnapshot?
+    private(set) var appliedSyntaxRevision: UInt64?
+    #if DZBAN_TEST_FIXTURES
+    private(set) var syntaxPaintMilliseconds = 0.0
+    #endif
+    var syntaxRevision: UInt64 { highlighting.revision }
+    private lazy var highlighting: SQLHighlighting = {
+        let pipeline = SQLHighlighting()
+        pipeline.completed = { [weak self] snapshot in self?.applySyntax(snapshot) }
+        pipeline.failed = { [weak self] in self?.clearSyntax() }
+        return pipeline
+    }()
     override var textContainerOrigin: NSPoint {
         NSPoint(x: WorkspaceLayout.outerInset + 2, y: super.textContainerOrigin.y)
     }
@@ -201,28 +222,61 @@ final class SQLTextView: NSTextView {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     func highlightSyntax() {
+        guard !hasMarkedText() else { highlighting.invalidate(); return }
+        highlighting.request(string)
+    }
+
+    func retireHighlighting() { highlighting.retire(); syntaxSnapshot = nil }
+
+    private func clearSyntax() {
         guard !hasMarkedText(), let layoutManager else { return }
-        let range = NSRange(location: 0, length: string.utf16.count)
+        syntaxSnapshot = nil
+        appliedSyntaxRevision = nil
+        layoutManager.removeTemporaryAttribute(.foregroundColor, forCharacterRange: NSRange(location: 0, length: documentStorage.length))
+        needsDisplay = true
+    }
+
+    private func applySyntax(_ snapshot: SQLSyntaxSnapshot) {
+        guard !hasMarkedText(), snapshot.revision == highlighting.revision,
+              snapshot.length.utf16 == documentStorage.length, let layoutManager else { return }
+        #if DZBAN_TEST_FIXTURES
+        let started = ContinuousClock.now
+        #endif
+        syntaxSnapshot = snapshot
+        let range = NSRange(location: 0, length: documentStorage.length)
         layoutManager.removeTemporaryAttribute(.foregroundColor, forCharacterRange: range)
         let dark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        for token in SQLSyntax.tokens(in: string) {
+        let keyword = dark ? NSColor.systemPurple : NSColor(calibratedRed: 0.5, green: 0.12, blue: 0.58, alpha: 1)
+        let string = dark ? NSColor.systemGreen : NSColor(calibratedRed: 0.08, green: 0.38, blue: 0.18, alpha: 1)
+        let number = dark ? NSColor.systemBlue : NSColor(calibratedRed: 0.1, green: 0.28, blue: 0.62, alpha: 1)
+        let identifier = dark ? NSColor.systemTeal : NSColor(calibratedRed: 0.05, green: 0.37, blue: 0.43, alpha: 1)
+        let function = dark ? NSColor.systemOrange : NSColor(calibratedRed: 0.53, green: 0.28, blue: 0.02, alpha: 1)
+        for token in snapshot.tokens {
             let color: NSColor
             switch token.kind {
-            case .keyword: color = dark ? .systemPurple : NSColor(calibratedRed: 0.5, green: 0.12, blue: 0.58, alpha: 1)
-            case .string: color = dark ? .systemGreen : NSColor(calibratedRed: 0.08, green: 0.38, blue: 0.18, alpha: 1)
-            case .number: color = dark ? .systemBlue : NSColor(calibratedRed: 0.1, green: 0.28, blue: 0.62, alpha: 1)
+            case .keyword: color = keyword
+            case .string: color = string
+            case .number: color = number
             case .comment: color = .secondaryLabelColor
-            case .identifier: color = dark ? .systemTeal : NSColor(calibratedRed: 0.05, green: 0.37, blue: 0.43, alpha: 1)
-            case .function: color = dark ? .systemOrange : NSColor(calibratedRed: 0.53, green: 0.28, blue: 0.02, alpha: 1)
+            case .identifier: color = identifier
+            case .function: color = function
             }
-            layoutManager.addTemporaryAttribute(.foregroundColor, value: color, forCharacterRange: token.range)
+            layoutManager.addTemporaryAttribute(.foregroundColor, value: color, forCharacterRange: NSRange(location: token.start.utf16, length: token.end.utf16 - token.start.utf16))
         }
+        appliedSyntaxRevision = snapshot.revision
+        #if DZBAN_TEST_FIXTURES
+        let duration = started.duration(to: .now)
+        syntaxPaintMilliseconds = Double(duration.components.seconds) * 1000 + Double(duration.components.attoseconds) / 1e15
+        #endif
         needsDisplay = true
     }
 
     override func didChangeText() { super.didChangeText(); highlightSyntax() }
     override func unmarkText() { super.unmarkText(); highlightSyntax() }
-    override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); highlightSyntax() }
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        if let syntaxSnapshot { applySyntax(syntaxSnapshot) } else { highlightSyntax() }
+    }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)

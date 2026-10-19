@@ -21,21 +21,7 @@ public struct OriginalCell: Sendable {
 
 public enum FullCellReader {
     public static func read(source: any ResultSource, address: ResultAddress) async throws -> OriginalCell {
-        var text = ""
-        var offset = 0
-        var total: Int?
-        while true {
-            try Task.checkCancellation()
-            let chunk = try await source.cell(address, offset: offset, count: 65_536)
-            try validate(chunk, address: address, offset: offset, count: 65_536)
-            if let total, total != chunk.total { throw ViewportFailure("Cell changed during copy") }
-            total = chunk.total
-            guard let part = chunk.text else { return OriginalCell(text: nil) }
-            guard text.utf8.count + part.utf8.count <= 32 * 1024 * 1024 else { throw ViewportFailure("Cell exceeds the 32 MiB limit") }
-            text.append(part)
-            offset += part.unicodeScalars.count
-            if offset == chunk.total { return OriginalCell(text: text) }
-        }
+        try await source.originalCell(address)
     }
 
     static func validate(_ chunk: CellChunk, address: ResultAddress, offset: Int, count: Int) throws {
@@ -151,6 +137,18 @@ public final class CellInspectorModel: ObservableObject {
         return .general
     }
     public func cancelCopy() { copyEpoch &+= 1; copyTask?.cancel(); copyTask = nil; copying = false }
+    @discardableResult
+    func presentationEnded() -> Task<Void, Never> {
+        epoch &+= 1
+        copyEpoch &+= 1
+        loadTask?.cancel()
+        copyTask?.cancel()
+        let epoch = epoch
+        return Task { @MainActor [weak self] in
+            guard let self, self.epoch == epoch else { return }
+            self.cancel()
+        }
+    }
     public func cancel() {
         epoch &+= 1
         loadTask?.cancel()

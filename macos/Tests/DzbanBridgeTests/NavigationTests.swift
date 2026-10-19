@@ -21,6 +21,81 @@ final class NavigationTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(5))
         }
     }
+    func testSharedExportCopiesOffscreenColumnsAndFullValuesAndRejectsRetiredOutput() async throws {
+        let (bridge, store, session) = try await connected()
+        let document = try XCTUnwrap(store.document)
+        store.editor(for: document).edit(text: "wide", selection: NSRange(location: 0, length: 0))
+        await store.performEditorIntent(.submit)
+        try await until { store.document?.execution == .finished && store.document?.rows == 500 }
+        let snapshot = try XCTUnwrap(store.document)
+        let scope = ResultScope(session: session, document: snapshot.document, generation: snapshot.generation)
+        let source = BridgeResultSource(bridge: bridge)
+        let markdown = try await ResultMarkdown.read(source: source, scope: scope, rows: IndexSet(integer: 499))
+        XCTAssertEqual(markdown.split(separator: "\n").count, 3)
+        XCTAssertTrue(markdown.contains("r499c127"))
+        XCTAssertFalse(markdown.contains("r498c127"))
+        let all = try await source.markdown(scope, rows: IndexSet(integersIn: 0..<500))
+        XCTAssertEqual(all.split(separator: "\n").count, 502)
+        XCTAssertTrue(all.contains("r0c127"))
+        XCTAssertTrue(all.contains("r499c127"))
+        let null = try await FullCellReader.read(source: source, address: ResultAddress(scope: scope, row: 1, column: 1))
+        XCTAssertNil(null.text)
+        store.editor(for: snapshot).edit(text: "huge", selection: NSRange(location: 0, length: 0))
+        await store.performEditorIntent(.submit)
+        try await until { store.document?.execution == .finished && store.document?.rows == 3 }
+        let current = try XCTUnwrap(store.document)
+        let largeScope = ResultScope(session: session, document: current.document, generation: current.generation)
+        let value = try await FullCellReader.read(source: source, address: ResultAddress(scope: largeScope, row: 0, column: 1))
+        XCTAssertEqual(value.text?.unicodeScalars.count, 2_500_000)
+        do {
+            _ = try await ResultMarkdown.read(source: source, scope: scope, rows: IndexSet(integer: 0))
+            XCTFail("Retired output must not be copied")
+        } catch let error as BridgeFailure { XCTAssertEqual(error.kind, "stale_output") }
+        let canceled = Task { try await source.markdown(largeScope, rows: IndexSet(integersIn: 0..<3)) }
+        canceled.cancel()
+        do { _ = try await canceled.value; XCTFail("Canceled copy must not publish") } catch is CancellationError {}
+        var readers = -1
+        for _ in 0..<100 {
+            readers = try await bridge.request(.testMetrics, as: BridgeByteMetrics.self).exportReaders
+            if readers == 0 { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(readers, 0)
+        try await store.shutdown()
+    }
+    func testRetiringSharedTabEndsPendingPlanPresentation() async throws {
+        let (bridge, store, session) = try await connected()
+        let document = try XCTUnwrap(store.document)
+        store.editor(for: document).edit(text: "SELECT 'preview_delayed'", selection: NSRange(location: 0, length: 0))
+        store.editorChanged(session: session, document: document.document)
+        let completed = expectation(description: "Retired preview returns")
+        let pending = Task { await store.previewCurrent(); completed.fulfill() }
+        defer { pending.cancel() }
+        try await until { store.plan.loading }
+        let tab = try XCTUnwrap(store.selectedPage)
+        let _: TabInventory = try await bridge.request(.closeTab(tab), as: TabInventory.self)
+        await fulfillment(of: [completed], timeout: 2)
+        pending.cancel()
+        await pending.value
+        XCTAssertNil(store.failure)
+        await store.chooseConnections()
+        try await store.shutdown()
+    }
+
+    func testLateBusyControlProjectionCannotReplaceNewerReadyState() async throws {
+        let (_, store, session) = try await connected()
+        let revision = try XCTUnwrap(store.controls).revision + 2
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let ready = try decoder.decode(Controls.self, from: JSONSerialization.data(withJSONObject: ["revision": revision, "session": session.uuidString, "primary_action": "run"]))
+        let stale = try decoder.decode(Controls.self, from: JSONSerialization.data(withJSONObject: ["revision": revision - 1, "session": session.uuidString, "primary_action": "unavailable"]))
+        store.applyControls(ready)
+        store.applyControls(stale)
+        XCTAssertEqual(store.controls?.revision, revision)
+        XCTAssertEqual(store.controls?.primaryAction, .run)
+        try await store.shutdown()
+    }
+
     func testRepeatedRunWhileCommandHeldDoesNotNeedReturnKeyUp() async throws {
         let (_, store, _) = try await connected()
         let document = try XCTUnwrap(store.document)
@@ -39,7 +114,7 @@ final class NavigationTests: XCTestCase {
         for _ in 0..<2 {
             let generation = try XCTUnwrap(store.document).generation
             XCTAssertNil(coordinator.handle(try event()))
-            try await until { (store.document?.generation ?? 0) > generation && store.document?.execution == "finished" }
+            try await until { (store.document?.generation ?? 0) > generation && store.document?.execution == .finished }
         }
         let generation = try XCTUnwrap(store.document).generation
         XCTAssertNil(coordinator.handle(try event(repeating: true)))
@@ -64,7 +139,7 @@ final class NavigationTests: XCTestCase {
         let second = try XCTUnwrap(store.document)
         store.editor(for: second).edit(text: "wait", selection: NSRange(location: 0, length: 0))
         await store.performEditorIntent(.primary)
-        try await until { store.document?.execution == "running" }
+        try await until { store.document?.execution == .running }
         await store.newDocument()
         await store.selectPage(store.pages[1].id)
         try await store.shutdown()
@@ -76,7 +151,7 @@ final class NavigationTests: XCTestCase {
         XCTAssertEqual(restored.selectedPage, restored.pages[1].id)
         XCTAssertEqual(restored.workspaces.map(\.profile), ["fixture", "fixture"])
         XCTAssertEqual(restored.workspaces.flatMap(\.documents).map(\.draft), ["SELECT 'unsaved 😀';", "wait"])
-        XCTAssertFalse(restored.workspaces.flatMap(\.documents).contains { ["running", "planning"].contains($0.execution) })
+        XCTAssertFalse(restored.workspaces.flatMap(\.documents).contains { [ExecutionPhase.running, .planning].contains($0.execution) })
         XCTAssertNil(restored.pages[2].session)
         await restored.closePage(restored.pages[0].id)
         try await restored.shutdown()
@@ -156,7 +231,7 @@ final class NavigationTests: XCTestCase {
         let document = try XCTUnwrap(store.document)
         store.editor(for: document).edit(text: "fail", selection: NSRange(location: 0, length: 0))
         await store.performEditorIntent(.submit)
-        try await until { store.document?.execution == "finished" && store.unseenCompletionCount == 1 }
+        try await until { store.document?.execution == .finished && store.unseenCompletionCount == 1 }
         XCTAssertTrue(try XCTUnwrap(store.workspace).unseenResultFailed)
         XCTAssertEqual(try XCTUnwrap(store.workspace).completionRevision, 1)
         XCTAssertEqual(updates.filter(\.requestAttention).count, 1)
@@ -164,26 +239,59 @@ final class NavigationTests: XCTestCase {
         await store.selectSession(session)
         XCTAssertEqual(store.unseenCompletionCount, 1)
         store.updateApplicationVisibility(true)
-        XCTAssertEqual(store.unseenCompletionCount, 0)
+        try await until { store.unseenCompletionCount == 0 }
         XCTAssertTrue(try XCTUnwrap(updates.last).cancelAttention)
         XCTAssertFalse(try XCTUnwrap(store.workspace).hasUnseenResult)
         store.editor(for: try XCTUnwrap(store.document)).edit(text: "wait", selection: NSRange(location: 0, length: 0))
         await store.performEditorIntent(.submit)
-        try await until { store.document?.execution == "running" }
+        try await until { store.document?.execution == .running }
         store.updateApplicationVisibility(false)
         await store.performEditorIntent(.cancel)
-        try await until { store.document?.execution == "finished" }
+        try await until { store.document?.execution == .finished }
         XCTAssertEqual(store.unseenCompletionCount, 0)
         XCTAssertEqual(updates.filter(\.requestAttention).count, 1)
         try await store.shutdown()
         XCTAssertEqual(try XCTUnwrap(updates.last).unreadCount, 0)
     }
 
+    func testCompletionOnAnotherTabIsUnseenWhileTheChooserIsSelected() async throws {
+        let (bridge, store, session) = try await connected()
+        let document = try XCTUnwrap(store.document)
+        var updates: [QueryAttentionUpdate] = []
+        store.attentionChanged = { updates.append($0) }
+        let _: Submission = try await bridge.request(.submit(session: session, document: document.document, sql: "delayed_result"), as: Submission.self)
+        try await until { store.document?.execution == .running }
+        await store.newDocument()
+        XCTAssertNil(store.selectedSession)
+        try await until { store.workspaces.first(where: { $0.id == session })?.hasUnseenResult == true }
+        XCTAssertEqual(store.unseenCompletionCount, 1)
+        XCTAssertFalse(updates.contains(where: \.requestAttention))
+        await store.selectSession(session)
+        XCTAssertEqual(store.unseenCompletionCount, 0)
+        try await store.shutdown()
+    }
+
+    func testOldAttentionDeliveryCannotRestoreABadgeOrRequestAfterForegroundAcknowledgement() async throws {
+        let (_, store, _) = try await connected()
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let latest = try decoder.decode(AttentionSnapshot.self, from: Data(#"{"revision":100,"application_visible":true,"request_revision":7,"cancel_attention":true,"tabs":[]}"#.utf8))
+        let stale = try decoder.decode(AttentionSnapshot.self, from: Data(#"{"revision":99,"application_visible":false,"request_revision":7,"cancel_attention":false,"tabs":[{"tab":"00000000-0000-0000-0000-000000000001","document":"00000000-0000-0000-0000-000000000002","completion_revision":1,"unseen":{"identity":{"output":{"tab":"00000000-0000-0000-0000-000000000001","document":"00000000-0000-0000-0000-000000000002","generation":1},"session":"00000000-0000-0000-0000-000000000003","query":"00000000-0000-0000-0000-000000000004"},"outcome":"success"}}]}"#.utf8))
+        var updates: [QueryAttentionUpdate] = []
+        store.attentionChanged = { updates.append($0) }
+        store.applyAttention(latest)
+        store.applyAttention(stale)
+        XCTAssertEqual(store.unseenCompletionCount, 0)
+        XCTAssertFalse(updates.contains(where: \.requestAttention))
+        XCTAssertTrue(try XCTUnwrap(updates.last).cancelAttention)
+        try await store.shutdown()
+    }
+
     func testBackgroundCompletionMarksOnlyItsTabUntilSelected() async throws {
         let (bridge, store, first) = try await connected()
         let document = try XCTUnwrap(store.document)
         let _: Submission = try await bridge.request(.submit(session: first, document: document.document, sql: "delayed_result"), as: Submission.self)
-        try await until { store.document?.execution == "running" }
+        try await until { store.document?.execution == .running }
         let opened = await store.connect(profile: "fixture")
         XCTAssertTrue(opened)
         let second = try XCTUnwrap(store.selectedSession)
@@ -202,8 +310,8 @@ final class NavigationTests: XCTestCase {
         let editor = store.editor(for: original)
         editor.edit(text: "SELECT 'saved 😀'", selection: NSRange(location: 0, length: 0))
         await store.performEditorIntent(.submit)
-        try await until { store.document?.execution == "finished" && store.document?.rows == 500 }
-        let model = HistoryBrowserModel(bridge: bridge)
+        try await until { store.document?.execution == .finished && store.document?.rows == 500 }
+        let model = HistoryBrowserModel(application: ApplicationClient(bridge: bridge))
         model.refresh(session: session)
         try await until { !model.loading }
         let list = try XCTUnwrap(model.list)
@@ -221,7 +329,7 @@ final class NavigationTests: XCTestCase {
         XCTAssertEqual(saved.rows, 200)
         XCTAssertEqual(saved.historyTotalRows, 500)
         XCTAssertEqual(editor.textView.string, "SELECT 'saved 😀'")
-        XCTAssertEqual(saved.execution, "finished")
+        XCTAssertEqual(saved.execution, .finished)
         model.refresh(session: session)
         try await until { !model.loading }
         XCTAssertNotEqual(model.list?.revision, list.revision)
@@ -229,7 +337,7 @@ final class NavigationTests: XCTestCase {
         XCTAssertNil(model.list)
         XCTAssertFalse(model.loading)
         await store.performEditorIntent(.submit)
-        try await until { store.document?.execution == "finished" && store.document?.rows == 500 }
+        try await until { store.document?.execution == .finished && store.document?.rows == 500 }
         XCTAssertNil(store.document?.history)
         try await store.shutdown()
     }
@@ -242,8 +350,8 @@ final class NavigationTests: XCTestCase {
         editor.edit(text: sql, selection: NSRange(location: 1, length: 0))
         store.editorChanged(session: session, document: document.document)
         await store.previewCurrent()
-        guard case .object(let plan) = store.plan.plan else { return XCTFail("Missing plan") }
-        XCTAssertEqual(plan["document"], .object(["fixture": .bool(true), "sql": .string("SELECT 1")]))
+        guard let plan = store.plan.plan else { return XCTFail("Missing plan") }
+        XCTAssertEqual(plan.document, .object(["fixture": .bool(true), "sql": .string("SELECT 1")]))
         store.plan.dismiss()
         editor.edit(text: sql, selection: NSRange(location: sql.utf16.count, length: 0))
         let delayed = Task { await store.previewCurrent() }
@@ -281,10 +389,10 @@ final class NavigationTests: XCTestCase {
         let editor = store.editor(for: document)
         editor.edit(text: "wide", selection: NSRange(location: 0, length: 0))
         await store.performEditorIntent(.submit)
-        try await until { store.document?.execution == "finished" && store.document?.rows == 500 }
+        try await until { store.document?.execution == .finished && store.document?.rows == 500 }
         let snapshot = try XCTUnwrap(store.document)
         let address = ResultAddress(scope: ResultScope(session: session, document: snapshot.document, generation: snapshot.generation), row: 499, column: 127)
-        let row = RowInspectorModel(bridge: bridge, source: BridgeResultSource(bridge: bridge))
+        let row = RowInspectorModel(application: ApplicationClient(bridge: bridge), source: BridgeResultSource(bridge: bridge))
         row.show(address, pinned: true, columns: 128)
         try await until { row.values.count == 16 && !row.loading }
         XCTAssertEqual(row.values[0].text, "499")
@@ -362,6 +470,46 @@ final class NavigationTests: XCTestCase {
         try await store.shutdown()
     }
 
+    func testReleasingNativeStoreRetiresItsGlobalObservations() async throws {
+        let bridge = try Bridge.fixture()
+        var store: ApplicationStore? = ApplicationStore(bridge: bridge)
+        var deadline = ContinuousClock.now + .seconds(2)
+        while true {
+            let metrics = try await bridge.request(.testMetrics, as: BridgeByteMetrics.self)
+            if metrics.observers == 2 { break }
+            guard ContinuousClock.now < deadline else { XCTFail("Global observations did not attach"); return }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let _: HealthSnapshot = try await bridge.request(.checkProfileHealth("lifetime-check"), as: HealthSnapshot.self)
+        try await until { store?.profileHealth["lifetime-check"]?.state == .error }
+        store = nil
+        deadline = ContinuousClock.now + .seconds(2)
+        while true {
+            let metrics = try await bridge.request(.testMetrics, as: BridgeByteMetrics.self)
+            if metrics.observers == 0 { break }
+            guard ContinuousClock.now < deadline else { XCTFail("Retired store kept a global observation"); try await bridge.shutdown(); return }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        try await bridge.shutdown()
+    }
+
+    func testSharedHealthObservationSurvivesConnectionsAndRetiresClosedSessions() async throws {
+        let (bridge, store, first) = try await connected()
+        let _: HealthSnapshot = try await bridge.request(.checkProfileHealth("missing-first"), as: HealthSnapshot.self)
+        try await until { store.profileHealth["missing-first"]?.state == .error }
+        let connected = await store.connect(profile: "fixture")
+        XCTAssertTrue(connected)
+        let second = try XCTUnwrap(store.selectedSession)
+        let _: HealthSnapshot = try await bridge.request(.checkProfileHealth("missing-second"), as: HealthSnapshot.self)
+        try await until { store.profileHealth["missing-second"]?.state == .error }
+        XCTAssertEqual(store.health[first]?.state, .connected)
+        XCTAssertEqual(store.health[second]?.version, "fixture")
+        await store.closeCurrentTab()
+        try await until { store.health[second] == nil }
+        XCTAssertEqual(store.health[first]?.state, .connected)
+        try await store.shutdown()
+    }
+
     func testProbesReportLatencyAndVersionWithoutOpeningAWorkspace() async throws {
         let bridge = try Bridge.fixture()
         let store = ApplicationStore(bridge: bridge)
@@ -391,7 +539,7 @@ final class NavigationTests: XCTestCase {
         let (bridge, store, firstSession) = try await connected()
         let first = try XCTUnwrap(store.document)
         let _: Submission = try await bridge.request(.submit(session: firstSession, document: first.document, sql: "reject_close"), as: Submission.self)
-        try await until { store.document?.execution == "finished" }
+        try await until { store.document?.execution == .finished }
         let connectedSecond = await store.connect(profile: "fixture")
         XCTAssertTrue(connectedSecond)
         do {
@@ -413,7 +561,7 @@ final class NavigationTests: XCTestCase {
         store.editorChanged(session: session, document: document.document)
         store.sendSharedKey(.primary, pressed: true, at: 1)
         store.sendSharedKey(.preview, pressed: true, at: 2)
-        try await until { store.sharedInput?.hint.kind == "estimate_ready" }
+        try await until { store.sharedInput?.hint.kind == .estimateReady }
         await store.openCurrentPlan()
         store.sendSharedKey(.preview, pressed: false, at: 420)
         store.sendSharedKey(.primary, pressed: false, at: 421)
@@ -432,7 +580,7 @@ final class NavigationTests: XCTestCase {
         store.editorChanged(session: session, document: document.document)
         store.sendSharedKey(.primary, pressed: true, at: 1)
         store.sendSharedKey(.preview, pressed: true, at: 2)
-        try await until { store.sharedInput?.hint.kind == "estimate_ready" }
+        try await until { store.sharedInput?.hint.kind == .estimateReady }
         XCTAssertEqual(store.document?.generation, 0)
         XCTAssertFalse(store.plan.visible)
         store.sendSharedKey(.inspect, pressed: true, at: 400)
@@ -449,7 +597,7 @@ final class NavigationTests: XCTestCase {
         store.sendSharedKey(.submit, pressed: true, at: 502)
         store.sendSharedKey(.submit, pressed: false, at: 503)
         store.sendSharedKey(.primary, pressed: false, at: 504)
-        try await until { store.document?.execution == "finished" }
+        try await until { store.document?.execution == .finished }
         XCTAssertEqual(store.document?.generation, 1)
         XCTAssertNotNil(store.document?.executionSeconds)
         try await store.shutdown()
@@ -465,7 +613,7 @@ final class NavigationTests: XCTestCase {
         try await until { store.plan.loading }
         store.sendSharedKey(.submit, pressed: true, at: 3)
         store.sendSharedKey(.submit, pressed: false, at: 4)
-        try await until { store.document?.execution == "finished" }
+        try await until { store.document?.execution == .finished }
         XCTAssertEqual(store.document?.generation, 1)
         XCTAssertNil(store.failure)
         store.clearSharedInput()

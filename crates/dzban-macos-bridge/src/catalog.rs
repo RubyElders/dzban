@@ -132,23 +132,7 @@ pub fn action(action: &ActionDescriptor) -> Value {
     json!({"id":action.id,"name":action.name,"description":action.description,"effect":effect,"arguments":arguments})
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Surface {
-    Plan,
-    Row,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PeekEvent {
-    Show,
-    Open,
-    Pin,
-    Close,
-    Release,
-    Reset,
-}
+pub use dzban_core::preview::{PeekEvent, PreviewSurface as Surface};
 
 pub fn error(error: dzban_core::catalog::CatalogError) -> Value {
     use dzban_core::catalog::CatalogError;

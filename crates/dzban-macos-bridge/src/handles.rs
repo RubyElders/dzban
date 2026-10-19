@@ -6,6 +6,7 @@ use crate::{service::App, transport::Stream};
 pub enum Handle {
     App(Arc<App>),
     Stream(Arc<Stream>),
+    Syntax(Arc<Mutex<dzban_core::sql::SqlLexer>>),
 }
 
 #[derive(Default)]
@@ -41,6 +42,16 @@ pub fn insert_stream(stream: Arc<Stream>) -> Option<u64> {
     insert(Handle::Stream(stream))
 }
 
+pub fn insert_syntax(lexer: dzban_core::sql::SqlLexer) -> Option<u64> {
+    insert(Handle::Syntax(Arc::new(Mutex::new(lexer))))
+}
+pub fn syntax(id: u64) -> Option<Arc<Mutex<dzban_core::sql::SqlLexer>>> {
+    match registry().lock().unwrap().handles.get(&id)? {
+        Handle::Syntax(lexer) => Some(lexer.clone()),
+        _ => None,
+    }
+}
+
 pub fn app(id: u64) -> Option<Arc<App>> {
     match registry().lock().unwrap().handles.get(&id)? {
         Handle::App(app) => Some(app.clone()),
@@ -66,7 +77,7 @@ pub fn release(id: u64) -> bool {
     drop(registry);
     match handle {
         Some(Handle::Stream(stream)) => stream.close(),
-        Some(Handle::App(_)) => (),
+        Some(Handle::App(_) | Handle::Syntax(_)) => (),
         None => return false,
     }
     true

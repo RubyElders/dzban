@@ -94,6 +94,8 @@ private actor FailingPageSource: ResultSource {
         if failNext { failNext = false; throw ViewportFailure("Fixture page read failed") }
         return try await source.page(scope, start: start, count: count, columnStart: columnStart, columnCount: columnCount)
     }
+    func originalCell(_ address: ResultAddress) async throws -> OriginalCell { try await source.originalCell(address) }
+    func markdown(_ scope: ResultScope, rows: IndexSet) async throws -> String { try await source.markdown(scope, rows: rows) }
     func cell(_ address: ResultAddress, offset: Int, count: Int) async throws -> CellChunk {
         try await source.cell(address, offset: offset, count: count)
     }

@@ -13,14 +13,14 @@ final class RowInspectorModel: ObservableObject {
     @Published private(set) var pinned = false
     private(set) weak var anchorView: NSView?
     private(set) var anchorRect: NSRect = .zero
-    private let bridge: Bridge
+    private let application: ApplicationClient
     private let source: any ResultSource
     private var epoch: UInt64 = 0
     private var visibilityWork: Task<Void, Never>?
     private var readWork: Task<Void, Never>?
     private var session: UUID?
 
-    init(bridge: Bridge, source: any ResultSource) { self.bridge = bridge; self.source = source }
+    init(application: ApplicationClient, source: any ResultSource) { self.application = application; self.source = source }
     func show(_ address: ResultAddress, pinned: Bool, columns: Int, anchorView: NSView? = nil, anchorRect: NSRect = .zero) {
         self.anchorView = anchorView
         self.anchorRect = anchorRect
@@ -40,16 +40,19 @@ final class RowInspectorModel: ObservableObject {
     }
     @discardableResult
     func moveRow(_ direction: Int, rows: Int, columns: Int, column: Int) -> ResultAddress? {
-        guard let address, rows > 0 else { return nil }
-        let row = min(max(0, address.row + direction), rows - 1)
-        guard row != address.row else { return nil }
+        guard let address else { return nil }
+        let position: ResultPosition
+        do {
+            guard let moved = try ResultViewPolicy.moveRow(ResultPosition(row: address.row, column: column), direction: direction, rows: rows, columns: columns) else { return nil }
+            position = moved
+        } catch { failure = error.localizedDescription; return nil }
         epoch &+= 1
         readWork?.cancel()
         values = []
         loading = false
         failure = nil
         inspectedCell = nil
-        let next = ResultAddress(scope: address.scope, row: row, column: column)
+        let next = ResultAddress(scope: address.scope, row: position.row, column: position.column)
         self.address = next
         pin()
         loadMore(columns: columns)
@@ -66,11 +69,11 @@ final class RowInspectorModel: ObservableObject {
     }
     private func enqueue(_ event: PeekEvent, epoch: UInt64, session: UUID, milliseconds: UInt64? = nil, applied: @escaping (Bool) -> Void) {
         let previous = visibilityWork
-        visibilityWork = Task { [weak self, bridge] in
+        visibilityWork = Task { [weak self, application] in
             await previous?.value
             guard let self, self.epoch == epoch else { return }
             do {
-                let response = try await bridge.request(.peek(session: session, surface: .row, event: event, elapsedMilliseconds: milliseconds), as: PeekVisibility.self)
+                let response = try await application.rowVisibility(session: session, event: event, elapsedMilliseconds: milliseconds)
                 guard self.epoch == epoch else { return }
                 self.pinned = response.pinned
                 applied(response.visible)
@@ -110,9 +113,9 @@ final class RowInspectorModel: ObservableObject {
         clear()
         pinned = false
         let previous = visibilityWork
-        visibilityWork = Task { [bridge] in
+        visibilityWork = Task { [application] in
             await previous?.value
-            if let session { let _: PeekVisibility? = try? await bridge.request(.peek(session: session, surface: .row, event: .close), as: PeekVisibility.self) }
+            if let session { _ = try? await application.rowVisibility(session: session, event: .close) }
         }
     }
 }
@@ -179,10 +182,10 @@ struct RowInspectorView: View {
                             .focused($focusedColumn, equals: index)
                             .onKeyPress(.upArrow) { move(-1); return .handled }
                             .onKeyPress(.downArrow) { move(1); return .handled }
-                            .onKeyPress(.leftArrow) { moveRow(-1); return .handled }
-                            .onKeyPress(.rightArrow) { moveRow(1); return .handled }
-                            .onKeyPress(.return) { openSelectedCell(); return .handled }
-                            .onKeyPress(.space, phases: .down) { _ in openSelectedCell(); return .handled }
+                            .onKeyPress(.leftArrow) { Task { @MainActor in moveRow(-1) }; return .handled }
+                            .onKeyPress(.rightArrow) { Task { @MainActor in moveRow(1) }; return .handled }
+                            .onKeyPress(.return) { Task { @MainActor in openSelectedCell() }; return .handled }
+                            .onKeyPress(.space, phases: .down) { _ in Task { @MainActor in openSelectedCell() }; return .handled }
                             .background(selectedColumn == index ? Color.accentColor.opacity(0.12) : Color.clear, in: RoundedRectangle(cornerRadius: 4))
                             .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(selectedColumn == index ? Color.accentColor : Color.clear, lineWidth: 1.5))
                             .accessibilityElement(children: .contain)
@@ -268,6 +271,10 @@ struct RowPopover: NSViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator(model: model) }
     func makeNSView(context: Context) -> NSView { NSView() }
     func updateNSView(_ view: NSView, context: Context) {
+        #if DZBAN_TEST_FIXTURES
+        ViewUpdateDiagnostics.frames.append("RowInspector.swift")
+        defer { ViewUpdateDiagnostics.frames.removeLast() }
+        #endif
         let coordinator = context.coordinator
         coordinator.updateRevision &+= 1
         let revision = coordinator.updateRevision

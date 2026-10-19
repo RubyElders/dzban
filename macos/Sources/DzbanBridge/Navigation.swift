@@ -76,19 +76,39 @@ extension BridgeCommand {
     public static func observeControls(session: UUID) -> Self { Self(command: "observe_controls", session: session) }
 }
 
+public enum TabPhase: String, Codable, Sendable {
+    case choosing, connecting, ready, closing, error
+}
+
 public struct TabInventory: Decodable, Sendable {
-    public struct Tab: Decodable, Sendable {
+    public struct Tab: Decodable, Sendable, Identifiable {
         public let tab: UUID
+        public var id: UUID { tab }
         public let session: UUID?
-        public let profile: String
+        public let profile: String?
+        public let backend: DatabaseBackend?
         public let document: UUID
-        public let execution: String
-        public let phase: String
+        public let execution: ExecutionPhase
+        public let phase: TabPhase
+        public let failure: String?
+        public var snapshot: DocumentSnapshot
     }
-    public let tabs: [Tab]
+    public let revision: UInt64
+    public var tabs: [Tab]
     public let selected: UUID?
+}
+
+public struct CreatedTab: Decodable, Sendable {
+    public let tab: UUID
+    public let workspace: TabInventory
 }
 
 extension BridgeCommand {
     public static var tabs: Self { Self(command: "tabs") }
+    public static func openTab(profile: String? = nil, draft: String = "", revision: UInt64? = nil) -> Self { Self(command: "open_tab", profile: profile, draft: draft, revision: revision) }
+    public static func cycleTabs(_ direction: Int, revision: UInt64? = nil) -> Self { Self(command: "cycle_tabs", revision: revision, direction: direction) }
+    public static func selectTab(_ tab: UUID, revision: UInt64? = nil) -> Self { Self(command: "select_tab", tab: tab, revision: revision) }
+    public static func cancelTabConnection(_ tab: UUID) -> Self { Self(command: "cancel_tab_connection", tab: tab) }
+    public static func closeTab(_ tab: UUID) -> Self { Self(command: "close_tab", tab: tab) }
+    public static func setTabDraft(_ tab: UUID, draft: String) -> Self { Self(command: "set_tab_draft", tab: tab, draft: draft) }
 }
