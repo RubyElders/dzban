@@ -8,7 +8,7 @@ import uuid
 import zipfile
 
 
-RELEASE = runpy.run_path(str(Path(__file__).resolve().parents[1] / "release-macos.py"))
+RELEASE = runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts/macos-release.py"))
 
 
 class ReleaseTests(unittest.TestCase):

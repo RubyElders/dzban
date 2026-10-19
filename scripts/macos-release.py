@@ -5,11 +5,12 @@ import json
 import os
 from pathlib import Path
 import platform
+import plistlib
+import re
 import shutil
 import stat
 import struct
 import subprocess
-import sys
 import time
 import zipfile
 import uuid
@@ -75,6 +76,129 @@ def package(app, destination, epoch):
             archive.writestr(entry, data)
 
 
+def cargo(*arguments):
+    return subprocess.check_output(["cargo", "+1.98.1", *arguments], cwd=REPO, text=True)
+
+
+def licenses(output):
+    metadata = json.loads(cargo("metadata", "--locked", "--format-version", "1", "--filter-platform", "aarch64-apple-darwin"))
+    packages = {(package["name"], package["version"]): package for package in metadata["packages"]}
+    tree = cargo("tree", "--locked", "-p", "dzban-macos-bridge", "--target", "aarch64-apple-darwin", "--edges", "normal,build", "--prefix", "none", "--format", "{p}")
+    selected = set()
+    for line in tree.splitlines():
+        name, version, *_ = line.split()
+        selected.add((name, version.removeprefix("v")))
+    sections = []
+    inventory = []
+    for identity in sorted(selected):
+        package = packages[identity]
+        if package["id"] in metadata["workspace_members"]:
+            continue
+        root = Path(package["manifest_path"]).parent.resolve()
+        files = set()
+        if package.get("license_file"):
+            files.add(root / package["license_file"])
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(root)
+            if any(part.upper().startswith(("LICENSE", "LICENCE", "COPYING", "COPYRIGHT", "NOTICE")) for part in relative.parts):
+                files.add(path)
+        if not files:
+            raise SystemExit(f"No license/notice text found for {identity[0]} {identity[1]}")
+        texts = []
+        for path in sorted(files):
+            resolved = path.resolve()
+            if not resolved.is_relative_to(root):
+                raise SystemExit(f"License path escapes package {identity[0]}")
+            texts.append(f"--- {path.relative_to(root)} ---\n{path.read_text(encoding='utf-8').rstrip()}\n")
+        name, version = identity
+        sections.append(f"{name} {version}\nLicense: {package.get('license') or 'See included license text'}\nSource: {package.get('repository') or package.get('source') or 'Path dependency'}\n\n" + "\n".join(texts))
+        inventory.append({"name": name, "version": version, "license": package.get("license"), "files": [str(path.relative_to(root)) for path in sorted(files)]})
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "ThirdPartyNotices.txt").write_text("Third-party components in the native Rust bridge\n\n" + "\n\n".join(sections), encoding="utf-8")
+    (output / "ThirdPartyInventory.json").write_text(json.dumps(inventory, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"Included license and notice texts for {len(inventory)} third-party packages")
+
+
+def output(*arguments):
+    return subprocess.check_output(arguments, text=True, stderr=subprocess.PIPE)
+
+
+def require(condition, message):
+    if not condition:
+        raise SystemExit(message)
+
+
+def versions(commands):
+    minimums = []
+    for block in re.split(r"^Load command \d+\n", commands, flags=re.MULTILINE):
+        if "cmd LC_BUILD_VERSION" in block:
+            value = re.search(r"^\s*minos (\d+(?:\.\d+)+)\s*$", block, re.MULTILINE)
+        elif "cmd LC_VERSION_MIN_MACOSX" in block:
+            value = re.search(r"^\s*version (\d+(?:\.\d+)+)\s*$", block, re.MULTILINE)
+        else:
+            continue
+        require(value is not None, "Malformed Mach-O deployment command")
+        minimums.append(tuple(map(int, value.group(1).split("."))))
+    return minimums
+
+
+def verify(app, archive):
+    app = app.resolve()
+    info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
+    require(info["LSMinimumSystemVersion"] == "14.0", "App deployment target must be macOS 14.0")
+    require(info["CFBundleIdentifier"].startswith("com.rubyelders.dzban"), "Unexpected application identifier")
+    for name in ("Dzban.icns", "ThirdPartyNotices.txt", "ThirdPartyInventory.json", "BuildInfo.json"):
+        require((app / "Contents/Resources" / name).is_file(), f"Missing bundled resource: {name}")
+    require(output("lipo", "-archs", str(archive)).strip() == "arm64", "Rust archive must contain only arm64")
+    archive_versions = versions(output("otool", "-l", str(archive)))
+    require(archive_versions and all(version <= (14, 0, 0) for version in archive_versions), "Rust archive requires a later macOS deployment target")
+    sysroot = Path(output("rustc", "+1.98.1", "--print", "sysroot").strip())
+    host = re.search(r"^host: (.+)$", output("rustc", "+1.98.1", "-vV"), re.MULTILINE).group(1)
+    nm = sysroot / "lib/rustlib" / host / "bin/llvm-nm"
+    require(nm.is_file(), "Install matching archive tools: rustup component add llvm-tools --toolchain 1.98.1")
+    symbols = output(str(nm), "--extern-only", "--defined-only", str(archive))
+    require(not re.search(r"\b_dzban_create_fixture\s*$", symbols, re.MULTILINE), "Release archive exposes fixture adapters")
+    files = []
+    for path in sorted(app.rglob("*")):
+        if path.is_symlink():
+            require(path.resolve().is_relative_to(app), f"Bundle symlink escapes app: {path.relative_to(app)}")
+        if not path.is_file() or path.is_symlink():
+            continue
+        description = output("file", "-b", str(path))
+        if "Mach-O" not in description:
+            continue
+        require(output("lipo", "-archs", str(path)).strip() == "arm64", f"Unexpected architecture: {path.name}")
+        commands = output("otool", "-l", str(path))
+        require("cmd LC_UUID" in commands, f"Missing required loader UUID: {path.name}")
+        minimums = versions(commands)
+        require(minimums and all(version <= (14, 0, 0) for version in minimums), f"Unsupported deployment target: {path.name}")
+        for rpath in re.findall(r"cmd LC_RPATH\n.*?\n\s*path (.*?) \(offset", commands):
+            require(rpath.startswith(("@executable_path/", "@loader_path/", "/System/Library/", "/usr/lib/")), f"External runtime search path: {rpath}")
+            if rpath.startswith(("@executable_path/", "@loader_path/")):
+                prefix = path.parent if rpath.startswith("@loader_path/") else app / "Contents/MacOS"
+                require((prefix / rpath.split("/", 1)[1]).resolve().is_relative_to(app), f"Runtime search path escapes app: {rpath}")
+        imports = []
+        for line in output("otool", "-L", str(path)).splitlines()[1:]:
+            library = line.strip().split(" (", 1)[0]
+            imports.append(library)
+            if library.startswith(("/System/Library/", "/usr/lib/")):
+                continue
+            require(library.startswith(("@rpath/", "@loader_path/", "@executable_path/")), f"External runtime dependency: {library}")
+            if library.startswith("@rpath/"):
+                require(any(candidate.name == Path(library).name for candidate in app.rglob(Path(library).name)), f"Unbundled runtime dependency: {library}")
+            else:
+                prefix = path.parent if library.startswith("@loader_path/") else app / "Contents/MacOS"
+                resolved = (prefix / library.split("/", 1)[1]).resolve()
+                require(resolved.is_relative_to(app) and resolved.exists(), f"Runtime dependency escapes app: {library}")
+        require(not any(re.search(r"(?:gtk|glib|adwaita|gobject|gtksource)", library, re.IGNORECASE) for library in imports), "Native app links a GTK/GNOME library")
+        files.append({"path": str(path.relative_to(app)), "architectures": ["arm64"], "imports": imports})
+    require(files, "No native executable found")
+    output("codesign", "--verify", "--deep", "--strict", str(app))
+    return json.dumps({"bundleIdentifier": info["CFBundleIdentifier"], "deploymentTarget": "14.0", "rustArchiveArchitectures": ["arm64"], "machOFiles": files}, indent=2, sort_keys=True) + "\n"
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("output", type=Path)
@@ -130,7 +254,7 @@ def main():
     subprocess.run(["xcrun", "strip", "-S", "-x", str(app / "Contents/MacOS/Dzban")], check=True)
     normalize_uuid(app / "Contents/MacOS/Dzban")
     resources = app / "Contents/Resources"
-    subprocess.run([sys.executable, str(REPO / "scripts/macos-licenses.py"), str(resources)], cwd=REPO, check=True)
+    licenses(resources)
     if source_fingerprint() != fingerprint:
         raise SystemExit("Release sources changed during the build")
     report = {"gitCommit": commit, "dirty": dirty, "sourceSHA256": fingerprint,
@@ -145,7 +269,7 @@ def main():
     for path in [app, *app.rglob("*")]:
         os.utime(path, (epoch, epoch), follow_symlinks=False)
     archive = rust_target / "release/libdzban_macos_bridge.a"
-    verification = subprocess.check_output([sys.executable, str(REPO / "scripts/verify-macos.py"), str(app), str(archive)], cwd=REPO, text=True)
+    verification = verify(app, archive)
     (artifact / "Verification.json").write_text(verification)
     (artifact / "BuildInfo.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     destination = artifact / "Dzban-macos-arm64-unsigned.zip"

@@ -1,15 +1,10 @@
 # Dzban agent instructions
 
-## Project skills
-
-- Use `skills/dzban-testing/SKILL.md` for Rust and database test planning and execution.
-- Use `skills/dzban-ui-testing/SKILL.md` for GTK/libadwaita interaction, rendering, animation, accessibility, and layout changes.
-
 ## Required validation
 
-The shared/frontend boundary is documented in `docs/frontend-integration.md`.
-Run `bash scripts/check-portable.sh` for the all-target dependency guard and
-`bash scripts/check-headless.sh` to build/test without native frontend libraries.
+`scripts/test.sh` is the single Linux test entry point and `scripts/macos.sh` the macOS one; run either without arguments for its commands.
+Run `bash scripts/test.sh portable` for the all-target dependency guard and
+`bash scripts/test.sh headless` to build/test without native frontend libraries.
 
 Choose tests based on the behavior changed. Compilation is not runtime or visual validation.
 
@@ -19,15 +14,15 @@ Choose tests based on the behavior changed. Compilation is not runtime or visual
 - GTK state and signals: use `#[gtk4::test]`.
 - Keyboard and chord semantics: isolate the key-to-action state machine in ordinary Rust tests; use `#[gtk4::test]` for widget state, signals, focus, and accessibility contracts.
 - External semantic UI automation: prefer an AT-SPI driver when installed. Give interactive widgets stable accessible labels and descriptions.
-- Theme rendering, animation, popovers, and layout: run the actual app under Xvfb with a disposable D-Bus session, capture relevant states, compare the target region, and inspect the images. Coordinate replay is only a visual smoke-test aid.
+- Theme rendering, animation, popovers, and layout: run the actual app under Xvfb with a disposable D-Bus session (`bash scripts/test.sh display`), capture relevant states, compare the target region, and inspect the images. Coordinate replay is only a visual smoke-test aid.
 
-Run `skills/dzban-ui-testing/scripts/run-dogtail-integration.sh` for screen-level workflows. It uses pinned Dogtail through `uv`, a private Mutter/D-Bus/AT-SPI session, temporary application data, and disposable PostgreSQL and ClickHouse fixtures.
+Run `bash scripts/test.sh screens` for screen-level workflows; set `DZBAN_UI_SCENARIO` to run one scenario from `tests/ui/dzban_screens.py`. It uses pinned Dogtail through `uv`, a private Mutter/D-Bus/AT-SPI session, temporary application data, and disposable PostgreSQL and ClickHouse fixtures.
 
-Run `bash scripts/test-gtk.sh` for display-backed widget and injected-adapter lifecycle tests. It uses Xvfb, a private D-Bus session, empty configuration, and temporary application data without database services.
+Run `bash scripts/test.sh gtk` for display-backed widget and injected-adapter lifecycle tests. It uses Xvfb, a private D-Bus session, empty configuration, and temporary application data without database services.
 
 Run the workspace test suite, strict Clippy, formatting check, and `git diff --check` before handoff. Report ignored and skipped coverage explicitly.
 
-Run `bash scripts/test-cli.sh` for ShellSpec CLI process contracts. The database runner enables its PTY case with `DZBAN_TEST_DATABASES=1`. Test actual terminal key sequences, not only editor reducer calls or `\g` submission; cover Enter, Ctrl+Enter, multiline input, quit, catalog listing, cancellation, and pager handoff.
+Run `bash scripts/test.sh cli` for ShellSpec CLI process contracts and `bash scripts/test.sh databases` for the serial PostgreSQL, ClickHouse and terminal suites against Compose fixtures. The database runner enables its PTY case with `DZBAN_TEST_DATABASES=1`. Test actual terminal key sequences, not only editor reducer calls or `\g` submission; cover Enter, Ctrl+Enter, multiline input, quit, catalog listing, cancellation, and pager handoff.
 
 ## Adding tests
 

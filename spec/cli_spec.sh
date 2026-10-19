@@ -23,7 +23,7 @@ Describe 'dzb process contracts'
 
   It 'submits, lists tables, quits and restores the terminal on both adapters'
     Skip if 'disposable databases are not enabled' test "${DZBAN_TEST_DATABASES:-}" != 1
-    When run python3 scripts/test-cli-pty.py
+    When run python3 tests/cli_pty.py
     The status should equal 0
     The output should include 'terminal cleanup passed'
     The stderr should equal ''

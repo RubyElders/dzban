@@ -14,7 +14,7 @@ fn session(backend: DatabaseBackend, host: &str) -> Arc<dyn DatabaseSession> {
         DatabaseBackend::Clickhouse => "DZBAN_TLS_CH_PORT",
     };
     let port: u16 = std::env::var(variable)
-        .expect("use scripts/test-macos-tls.py")
+        .expect("use tests/macos_tls.py")
         .parse()
         .unwrap();
     let config = DatabaseConfig {
@@ -35,7 +35,7 @@ fn session(backend: DatabaseBackend, host: &str) -> Arc<dyn DatabaseSession> {
 }
 
 #[tokio::test]
-#[ignore = "requires disposable TLS endpoints from scripts/test-macos-tls.py"]
+#[ignore = "requires disposable TLS endpoints from tests/macos_tls.py"]
 async fn certificate_validation_and_cancel_recovery() {
     let mode = std::env::var("DZBAN_TLS_EXPECT").expect("TLS expectation is required");
     for backend in [DatabaseBackend::Postgresql, DatabaseBackend::Clickhouse] {

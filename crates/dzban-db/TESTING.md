@@ -27,7 +27,7 @@ The integration suite covers connections, pings, multi-version configuration, Po
 ## Required checks
 
 ```bash
-cargo +1.88.0 check --workspace --all-targets
+cargo +1.98.1 check --workspace --all-targets
 cargo check --workspace --all-targets
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets
