@@ -776,3 +776,32 @@ async fn shared_peek_surfaces_keep_independent_pin_and_hold_state() {
     assert!(row.visible && row.pinned);
     context.start_shutdown().unwrap().wait().await.unwrap();
 }
+
+#[tokio::test]
+async fn moving_a_tab_reorders_the_inventory_without_changing_selection() {
+    let (context, _, _) = fixture();
+    let first = context.open_tab(None, "first".into()).unwrap();
+    let second = context.open_tab(None, "second".into()).unwrap();
+    let third = context.open_tab(None, "third".into()).unwrap();
+    let revision = context.tabs.snapshot().revision;
+    assert!(context.tabs.move_tab(third, 0));
+    let snapshot = context.tabs.snapshot();
+    assert!(snapshot.revision > revision);
+    assert_eq!(
+        snapshot.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>(),
+        vec![third, first, second]
+    );
+    assert_eq!(snapshot.selected, Some(third));
+    assert!(context.tabs.move_tab(first, usize::MAX));
+    assert_eq!(
+        context
+            .tabs
+            .snapshot()
+            .tabs
+            .iter()
+            .map(|tab| tab.id)
+            .collect::<Vec<_>>(),
+        vec![third, second, first]
+    );
+    assert!(!context.tabs.move_tab(TabId(uuid::Uuid::new_v4()), 0));
+}

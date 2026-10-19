@@ -774,6 +774,20 @@ impl QueryTabs {
         true
     }
 
+    pub fn move_tab(&self, id: TabId, index: usize) -> bool {
+        let mut state = self.state.lock().unwrap();
+        let Some(current) = state.snapshot.tabs.iter().position(|tab| tab.id == id) else {
+            return false;
+        };
+        let index = index.min(state.snapshot.tabs.len() - 1);
+        if current != index {
+            let tab = state.snapshot.tabs.remove(current);
+            state.snapshot.tabs.insert(index, tab);
+            self.publish(&mut state);
+        }
+        true
+    }
+
     pub(crate) fn finish_shutdown(&self) {
         self.attention.clear();
         let mut state = self.state.lock().unwrap();
