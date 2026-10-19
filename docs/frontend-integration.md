@@ -1,10 +1,6 @@
 # Frontend integration
 
-This is the shared Rust boundary for a macOS or other frontend. The shipping GTK
-frontend is `dzban-gtk`; it is not a dependency of either shared crate. A new
-frontend needs `dzban-core` and the adapter registry from `dzban-db`, not GTK's
-GObjects or runtime bridge. Toolkit choice and the Rust/native ABI remain Mac-side
-work. Linux validation is not evidence that a macOS binary runs.
+This is the shared Rust boundary for a macOS or other frontend. The shipping GTK frontend is `dzban-gtk`; it is not a dependency of either shared crate. A new frontend needs `dzban-core` and the adapter registry from `dzban-db`, not GTK's GObjects or runtime bridge. The native transport contract is documented in [the macOS bridge contract](macos-bridge.md). Linux validation is not evidence that a macOS binary runs.
 
 ## Ownership
 
@@ -14,71 +10,61 @@ work. Linux validation is not evidence that a macOS binary runs.
 | `dzban-db` | PostgreSQL and ClickHouse adapters, transport, decoding, native diagnostics and cancellation |
 | Frontend | Windows/widgets, native keys and menus, focus, selection gestures, styling, accessibility, viewport/cache and event-loop bridge |
 
-The workspace members in the root `Cargo.toml` are the build graph. The older
-root `src/` tree is not a workspace package or a frontend integration API.
+The workspace members in the root `Cargo.toml` are the build graph. The older root `src/` tree is not a workspace package or a frontend integration API.
+
+## Typed presentation contracts
+
+`dzban_core::presentation` projects retained domain snapshots into portable serialized types. `DocumentPresentation` owns the execution/capture/termination mapping, output identity, timings and estimate projection. `ControlsPresentation` and `InputPresentation` use shared `PrimaryAction` and `AppCommand` enums; the bridge serializes them directly. These are read models, not a second mutable document owner.
+
+Swift decodes those phases, actions, effects and estimates into typed contracts in `DzbanBridge`. Revision/generation fields and integer estimate quantities use `UInt64`; backend plan documents remain arbitrary JSON. The common fixture at `tests/fixtures/application-contract-v1.json` is decoded by both Rust and Swift, including values beyond floating-point integer precision, NULLs, legacy metadata omissions and all phase/effect spellings. Unknown phases/effects fail decoding rather than being ignored.
+
+The foreign ABI remains version 1 and stream records remain schema 1. Swift checks the record schema before interpreting the payload and reports an explicit schema failure for unsupported versions. FFI handles, coalescing observations, record limits and ownership are unchanged. Shared application services own saved-output adaptation, result access/export, workspace persistence, diagnostics, input orchestration, health and attention. The bridge serializes these services rather than implementing their application policy. Actual native interaction/rendering parity remains a separate validation gate.
 
 ## Runtime and connection lifetime
 
-Keep one Tokio runtime alive for the application, including pending connections,
-queries, result-page reads and shutdown. A synchronous native callback can enter
-that runtime to admit a command, then bridge completion/snapshots to its own event
-loop. Do not block the UI thread with `block_on`, SQL or disk I/O. GTK's
-`RuntimeBridge` is one platform implementation, not a required dependency.
+Keep one Tokio runtime alive for the application, including pending connections, queries, result-page reads and shutdown. A synchronous native callback can enter that runtime to admit a command, then bridge completion/snapshots to its own event loop. Do not block the UI thread with `block_on`, SQL or disk I/O. GTK's `RuntimeBridge` is one platform implementation, not a required dependency.
 
-Create `Arc<ApplicationContext>` with `dzban_db::adapters::registry()`. Tests can
-inject an `AdapterRegistry` of `AdapterFactory` implementations instead. Register
-one factory per backend; each factory creates a `Send + Sync` `DatabaseSession`.
+Create `Arc<ApplicationContext>` with `dzban_db::adapters::registry()`. Tests can inject an `AdapterRegistry` of `AdapterFactory` implementations instead. Register one factory per backend; each factory creates a `Send + Sync` `DatabaseSession`.
 
-Resolve a saved profile with `Config::resolve_profile`. Desktop frontends call `ApplicationContext::start_connect_tab`, which allocates a stable `TabId` and a retained query document before starting the connection. `ConnectionHandle::tab` identifies that tab; its connection request ID and snapshots retain the existing asynchronous connection contract. The context owns pending connections even if a frontend waiter disappears. Explicitly close a successful connection the user no longer wants. The lower-level `start_connect`/`connect_profile` APIs remain available for the CLI and temporary profile probes without creating desktop tabs.
+Desktop frontends can create a chooser with `ApplicationContext::open_tab(profile, draft)` before resolving a saved profile. The optional profile is a restoration hint; an unavailable profile does not discard the tab or draft. `start_connect_in_tab(tab, profile)` connects that same tab after configuration resolution, retaining its document through failure and retry. A second attempt while the tab is connecting or closing is rejected as busy, rather than replacing an unowned connection attempt. The compatibility helper `start_connect_tab` creates a tab and starts its first attempt in one call. The lower-level `start_connect`/`connect_profile` APIs remain available for CLI sessions and temporary profile probes without desktop tabs.
 
-`ApplicationContext::tabs` owns ordered query tabs, selection and the one-document/one-session association. Read `snapshot()` or subscribe to retained tab snapshots. Each tab has a profile identity, backend, document, connection phase and, when connected, its own engine. Two tabs using the same profile are independent database sessions. PostgreSQL transactions, temporary tables and settings are scoped to the tab's session. Use `tabs.select` or `tabs.select_session` when changing selection; no adapter owns UI tab policy.
+`ApplicationContext::tabs` owns ordered query tabs, selection and the one-document/one-session association. Read `snapshot()` or subscribe to retained tab snapshots. A chooser has no backend or session yet; its phase becomes connecting, ready, failed or closing. Tab snapshots carry a monotonic revision. Selection, cycling and revision-scoped creation reject stale navigation commands. Creation returns the created tab ID explicitly, independently of later selection changes. Two tabs using the same profile retain independent database sessions. PostgreSQL transactions, temporary tables and settings are scoped to the tab's session. Names, positions and widget addresses do not identify operations.
 
-Store stable `SessionId`, `DocumentId`, `QueryId` and output-generation identities.
-Names, tab positions and widget addresses are not operation identities.
+`start_close_tab` retains a pending tab until its connection attempt completes and any successful session is cleaned up. It drains active work using the existing engine cleanup path. Failed cleanup restores a retryable tab/session with its document intact. Session cleanup is tracked by the application context; multiple waiters join one cleanup operation, dropping a waiter does not cancel it, and shutdown joins cleanup already in progress. Closing the last tab leaves an empty inventory; the host chooses whether to close the window or present a new chooser.
+
+The macOS bridge exposes `open_tab`, `select_tab`, `cycle_tabs`, `set_tab_draft`, `cancel_tab_connection` and `close_tab`, plus an optional explicit tab target for `connect`. Canceling a pending connection can retain its chooser, document and draft while cleanup drains; a late successful connection cannot become the selected workspace. `tabs` returns `WorkspacePresentation`, including each tab's retained document projection. Its saved-history adapter applies existing history metadata without re-reading a second live snapshot. The bridge derives selected-session checks from this inventory and no longer retains a separate `NativeSelection`. Swift consumes these routes through `ApplicationClient` and one `TabInventory` read model. `ApplicationStore` derives its pages, connected workspaces and selection from that inventory; it does not allocate tab IDs or maintain separate membership arrays. Native editor/observer attachments and view state remain local. Background connection completion targets the created tab explicitly and does not change selection.
+
+Store stable `SessionId`, `DocumentId`, `QueryId` and output-generation identities. Names, tab positions and widget addresses are not operation identities.
 
 ## Documents and submission
 
-A desktop query tab has exactly one `QueryDocument`, provided by the shared tab model. Frontends may use `QueryDocuments::from_document` to adapt existing editor/result presentation to that retained document, but must not create an additional nested query collection or reuse one tab's engine for another tab. GTK and the native macOS bridge use the same core tab document. New Tab chooses a profile and opens another session rather than calling `QueryDocuments::open` on an existing connection.
+A desktop query tab has exactly one `QueryDocument`, provided by the shared tab model. Frontends may use `QueryDocuments::from_document` to adapt existing editor/result presentation to that retained document, but must not create an additional nested query collection or reuse one tab's engine for another tab. GTK and the native macOS bridge use the same core tab document. The Mac bridge resolves the document and engine directly from core tabs; it retains neither a second `QueryDocuments` collection nor a `Workspace` map. The remaining `open_document` compatibility route retrieves the owning tab's existing document. The unused nested-document selection route and its revision state are removed. New Tab chooses a profile and opens another session rather than calling `QueryDocuments::open` on an existing connection.
 
-`set_draft` changes the shared draft. Translate cursor/selection context changes to `query_context_changed` to invalidate an estimate for the previous SQL region. `query_selection::query_at_cursor` accepts character offsets and returns character bounds. It preserves simple semicolon splitting; it is not a dialect parser.
+`set_draft` changes the shared draft. Translate cursor/selection context changes to `query_context_changed` to invalidate an estimate for the previous SQL region. `query_selection::query_at_cursor` accepts character offsets and returns character bounds. `query_selection::selected_sql` validates scalar selection bounds, extracts selected text or the query at the cursor, and rejects empty SQL; native command and preview routes share it. It preserves simple semicolon splitting; it is not a dialect parser.
 
-Submit through `QueryTab::submit(sql, limits, history)`, which uses the tab's retained document and engine. The lower-level `QueryDocument::submit` remains available for direct consumers. Core admits one operation per session, attempts plain EXPLAIN, executes, streams/spools, publishes history and updates retained document snapshots. Different query tabs have different admission locks and can run concurrently. Do not add an EXPLAIN or SQL execution path in a frontend.
+Submit through `QueryTab::submit(sql, limits, history)`, which uses the tab's retained document and engine. The lower-level `QueryDocument::submit` remains available for direct consumers. Core admits one operation per session, attempts plain EXPLAIN, executes, streams/spools, publishes history and updates retained document snapshots. Shared editor commands accept an explicit `HistoryLocation` (the existing default profile history or a host-supplied file for isolated fixtures); the host chooses the location while core owns loading and command targeting. Different query tabs have different admission locks and can run concurrently. Do not add an EXPLAIN or SQL execution path in a frontend.
 
-Subscribe to the document before submission, or read its current snapshot after
-subscribing. `watch` is a coalescing state channel, not a lossless event log: always
-render the retained current snapshot before awaiting `changed()`. Completion and
-errors remain in `DocumentSnapshot::completion`; consumers need not observe every
-intermediate phase. Dropping the `DocumentQueryHandle` or a receiver does not
-cancel the query. Use its `wait()` result when direct completion delivery is wanted.
-Inspect both the outer result and `StreamedQueryCompletion::result`; native query
-failure can be a retained completion with an error result.
+Subscribe to the document before submission, or read its current snapshot after subscribing. `watch` is a coalescing state channel, not a lossless event log: always render the retained current snapshot before awaiting `changed()`. Completion and errors remain in `DocumentSnapshot::completion`; consumers need not observe every intermediate phase. Dropping the `DocumentQueryHandle` or a receiver does not cancel the query. Use its `wait()` result when direct completion delivery is wanted. Inspect both the outer result and `StreamedQueryCompletion::result`; native query failure can be a retained completion with an error result.
 
-Update the originating document even when it is not selected. Use
-`accepts_output(generation)` before displaying a delivered capture/error. Loading
-saved history calls `replace_output`, so late live output cannot replace that view.
+Update the originating document even when it is not selected. Use `accepts_output(generation)` before displaying a delivered capture/error. Loading saved history calls `replace_output`, so late live output cannot replace that view.
 
-Use the engine's `capabilities` and `action_registry` for backend actions, and the
-typed catalog requests for object listing/description. A backend can report an
-unsupported capability without the frontend guessing SQL dialects. Native focus,
-window and menu commands remain frontend commands; share database action IDs and
-descriptions rather than copying PostgreSQL catalog SQL into a new frontend.
+Use the engine's `capabilities` and `action_registry` for backend actions, and the typed catalog requests for object listing/description. A backend can report an unsupported capability without the frontend guessing SQL dialects. Native focus, window and menu commands remain frontend commands; share database action IDs and descriptions rather than copying PostgreSQL catalog SQL into a new frontend.
 
 ## Controls and input
 
-Maintain `interaction::AppState` in the frontend controller, not in widgets.
-Select a connection with `AppEvent::SessionSelected(Some(SessionInteraction::from_engine(engine)))`;
-select the chooser with `SessionSelected(None)`. Refresh the projection when the
-engine's operation/query/session subscriptions change. This derives run/stop,
-canceling and availability without frontend operation-to-phase switches.
+Desktop tabs retain their input policy in core. Dispatch `ApplicationContext::start_input_command` with a stable tab/document target, draft revision, captured draft/scalar selection and `interaction::InputEvent`. Sequence input commands by awaiting each handle; native transport/buffer attachment code preserves physical event order. Core rejects inactive or stale targets, refreshes admission/execution state, consumes portable effects and publishes a retained `InteractionPresentation`. Its revision, hint, plan, loading/visibility and terminal retirement state are shared contracts. The nested legacy `InputPresentation.commands` is empty in these managed snapshots; Swift renders state without executing application effects. Creation, selection and cycling reset tab input in the shared owner. `QueryTabs::input` remains a reducer compatibility API, rather than the live native effect executor.
 
-Use `AppEvent::scoped_document_execution` for document publication. The reducer
-checks the selected session/query scope again when the event is delivered, so a
-queued old event cannot change controls after navigation. Execute the returned
-`AppCommand`s and render `primary_action`, `action_hint` and preview visibility.
-Do not invent another set of running/canceling booleans.
+`interaction::AppState` remains the underlying reducer and is available for direct/session consumers. Its scoped document events check the session/query identity before updating controls. The bridge editor adapter delegates to `ApplicationContext::start_editor_command`. `EditorCommand` carries a stable tab/document target, captured draft and scalar selection plus semantic Submit/Primary/Cancel/Reset intent. Core chooses Run/Stop, cancels preview intent, waits for temporary operations to drain, loads profile history on a worker and uses the existing tab submission/cancellation path. It revalidates selection after asynchronous preparation. Dropping a command waiter does not cancel admitted work. Semantic editor commands use the current revision inside the shared input owner; a separately delivered draft acknowledgement cannot make their already captured source look like stale navigation. Physical `InputCommand` events still validate their expected draft revision. Internal command effects use the same identity-scoped semantic route. `QueryTabs::controls` owns the shared selected-action projection. Its revision advances when the selected session/query/action changes, with projection reads serialized in core. Native request responses and observations compare that shared revision; arrival order cannot let an old busy projection replace newer ready state. An explicit plan action refreshes current controls before its native availability check. Swift retains composition/focus and native view cleanup; it does not wait on database admission before dispatching that command. Buttons/menu intents and physical key events use the same shared effect executor; native code retains physical key capture, composition checks and responder behavior.
 
-Normalize physical input to roles; display actual platform key names only in the
-frontend's help and labels:
+`QueryTabs::subscribe_interaction` retains the latest projection, including a terminal snapshot when its tab closes. Preview completion rechecks the current request, draft and document lifecycle. Query publications refresh the originating interaction through completion. `await_plan` waits for a settled or retired projection without starting another EXPLAIN; the native convenience method uses a single retained request rather than attaching a temporary long-lived observation. Long-lived interaction observers must release their stream when the projection is retired. The native plan model renders snapshots and forwards intents; it has no database bridge, request counters, cleanup chain or independent preview workflow.
+
+`ApplicationContext::health` owns probe execution, deduplication, retained status and periodic scheduling. Opt in with `track_tab(context, tab)` when a desktop tab connects; direct CLI/session consumers do not acquire a periodic monitor automatically. Registration is idempotent. The shared monitor waits five seconds between checks, skips active query documents and selected input/preview activity, and pauses admission while the application drains. Cleanup failure keeps monitoring retryable; successful session retirement removes its status and monitor association.
+
+`check_tab`, `check_named_profile` and `check_all` implement the native probe intents. Named checks reuse a matching open tab as the existing native UI did; otherwise they use an independent temporary session. The lower-level `start_profile` always uses a temporary session. Profile association does not require enabling a monitor, so direct Rust consumers can check retained tab health without periodic polling. Matching in-flight requests share a retained result; dropping a waiter does not cancel the owner. Temporary-session cleanup errors leave application ownership available for retry. Shutdown joins admitted health work before session cleanup.
+
+`HealthSnapshot` carries a monotonic revision, per-session/per-profile `HealthStatus`, probing flags, optional server version/error, integer microsecond latency and Unix millisecond check time. Busy results preserve the last health measurement. Status transitions and version retention live in core; Swift only converts the typed snapshot into native presentation values and formats the existing labels/units. Its health observation remains global across tab changes and is canceled when the store is released. The common Rust/Swift fixture covers status states, nullable fields and full-width integer revisions/latencies. Fixture-only observer metrics verify that retiring the store releases its idle health reader.
+
+Normalize physical input to roles; display actual platform key names only in the frontend's help and labels:
 
 | Role | GTK binding | Meaning |
 | --- | --- | --- |
@@ -88,62 +74,61 @@ frontend's help and labels:
 | `Submit` | Enter/keypad Enter | Submit with primary modifier |
 | `Cancel` | Escape | Request cancellation while active |
 
-macOS may map Command rather than Control; core does not choose that binding.
-Send press/release times as monotonic milliseconds. Preserve the original press
-time across repeats. Collapse left/right physical aliases: release the role only
-after its last physical key is up. Reset native tracking and send `KeyboardReset`
-on focus loss. Menu/button actions dispatch semantic events directly; they need
-not synthesize key presses. A terminal can map Ctrl+C to `CancelRequested` without
-changing query cancellation policy.
+macOS may map Command rather than Control; core does not choose that binding. Send press/release times as monotonic milliseconds. Preserve the original press time across repeats. Collapse left/right physical aliases: release the role only after its last physical key is up. Reset native tracking and send `KeyboardReset` on focus loss. Menu/button actions dispatch semantic events directly; they need not synthesize key presses. A terminal can map Ctrl+C to `CancelRequested` without changing query cancellation policy.
 
 ## Preview and cancellation
 
-`PlanPreviewService::schedule` owns debounce and a request target containing the
-session, document and revision. Subscribe to its snapshots; render a result only
-when `accepts(snapshot, document)` succeeds. Edits, context changes, execution and
-document close invalidate stale previews. Notify `workspace_changed` when leaving
-that workspace and `cancel` when dismissing the preview context. View invalidation
-does not abort the native EXPLAIN transport; engine admission stays occupied until
-cleanup finishes. Do not interpret a hidden overlay as an idle connection.
+Managed input retains the captured source draft revision while waiting for temporary-operation cleanup. A queued plan must not attach the old SQL to a newer draft revision. Shared preview admission validates the original revision and schedules from that same document snapshot; later edits invalidate the target through the existing watcher. Rejected stale admission clears only input state still associated with that outdated draft, preserving a newer queued preview. Captured Run commands retain their separate immutable-source behavior and are not rejected merely because a draft acknowledgment advanced during dispatch.
 
-`PeekState` and `preview_release` share tap/hold/pin semantics for native plan and
-row overlays. Core emits visibility intent; widgets only display it. Query start
-closes the plan. Keep preview state separate from the submitted query's stored plan.
+`QueryTabs::start_preview` owns per-tab request ordering, draft/selection validation and a retained `PreviewHandle`. `cancel_preview` records request tombstones, so old starts or cancellation cannot replace newer intent. `peek` shares plan/row tap/hold/pin state; navigation resets visibility and retires preview intent. The bridge serializes these outcomes without retaining preview services, peek state or request counters. `PreviewHandle::wait` checks request identity and document validity before returning a plan.
 
-Cancel with `QueryDocument::request_cancel(engine)`, not by dropping its handle
-or aborting a Tokio task. Cancellation is scoped to the query ID. Render canceling
-until actual terminal completion, and retain any rejection/error. Capturing the
-row/byte limit is not cancellation: core/adapters drain the operation to preserve
-writes and transaction state. Show `Draining` as active, not a completed query.
+The underlying `PlanPreviewService::schedule` owns debounce and a request target containing the session, document and revision. Subscribe to its snapshots; render a result only when `accepts(snapshot, document)` succeeds. Edits, context changes, execution and document close invalidate stale previews. Notify `workspace_changed` when leaving that workspace and `cancel` when dismissing the preview context. View invalidation does not abort the native EXPLAIN transport; engine admission stays occupied until cleanup finishes. Do not interpret a hidden overlay as an idle connection.
+
+`PeekState` and `preview_release` share tap/hold/pin semantics for native plan and row overlays. Core emits visibility intent; widgets only display it. Query start closes the plan. Keep preview state separate from the submitted query's stored plan.
+
+Cancel with `QueryDocument::request_cancel(engine)`, not by dropping its handle or aborting a Tokio task. Cancellation is scoped to the query ID. Render canceling until actual terminal completion, and retain any rejection/error. Capturing the row/byte limit is not cancellation: core/adapters drain the operation to preserve writes and transaction state. Show `Draining` as active, not a completed query.
+
+## SQL text services
+
+`sql::SqlLexer` owns the existing SQL token categories and scan rules. It is an iterator over immutable source, with revision-tagged bounded `SyntaxBatch` reads. Each span exposes UTF-8 byte, Unicode scalar and UTF-16 start/end offsets; the source length uses the same explicit units. This preserves the original native UTF-16 behavior while giving GTK/CLI consumers appropriate addressing. The frozen native fixture covers the existing keyword set, quoted and dollar strings, nested comments, numeric literals, function lookahead, Unicode and incomplete text. This is the existing highlighting behavior, without an SQL dialect/parser expansion.
+
+`sql::selected_sql` and `query_at_cursor` expose the existing shared selection service alongside tokenization. The old `query_selection` path remains compatible. Execution-region selection retains its current behavior; tokenization does not rewrite submitted SQL. Native `NSRange`/text-system adaptation remains at the native boundary.
+
+The macOS syntax FFI owns standalone readers independent of database/app handles. `dzban_syntax_create` copies at most 32 MiB of UTF-8; empty source may use a null pointer. `dzban_syntax_read` returns at most 512 spans in an owned binary buffer, and `dzban_release` retires the reader. The version-1 little-endian header contains seven 64-bit words: schema, source revision, byte/scalar/UTF-16 source lengths, span count and done. Each span contains seven words: byte/scalar/UTF-16 start, byte/scalar/UTF-16 end and kind (0 keyword, 1 string, 2 number, 3 comment, 4 identifier, 5 function). Readers are consumed sequentially; any read failure discards the partial snapshot and releases the handle. The binary format keeps every reply bounded and avoids JSON decoding cost on dense SQL.
+
+Swift's `SQLHighlighting` retains only native scheduling/lifetime state: one active background tokenizer, one latest pending source, a 25 ms quiet interval and revision/composition/retirement guards. Stale results cannot color a newer draft. `SQLTextView` applies the shared spans as temporary layout-manager colors, retains the existing palette and caches colors per pass. It preserves native text storage, selection, undo, marked text and appearance handling; tokenization performs no synchronous FFI on the typing path. Appearance changes reuse a current span snapshot. The duplicate Swift lexer was removed after fixture parity and paired original/current widget measurements passed. Performance evidence is kept in `gen-docs/native/sql-syntax-benchmark.md`; the recurring stress benchmark is opt-in rather than part of every native correctness run.
 
 ## Results and history
 
-Render `ResultSnapshot` as it arrives. Before schema/rows, show a compact waiting
-state; once available, render the table while still indicating active work.
-`ResultHandle::read_page(start, count)` offloads disk access to blocking workers.
-Pages are capped at `MAX_PAGE_ROWS` (200). Keep a bounded native cache rather than
-building widgets or collecting values for every row. Preserve viewport positions
-when valid; clamp only when the available range shrinks.
+Render `ResultSnapshot` as it arrives. Before schema/rows, show a compact waiting state; once available, render the table while still indicating active work. `ResultHandle::read_page(start, count)` offloads disk access to blocking workers. Pages are capped at `MAX_PAGE_ROWS` (200). Keep a bounded native cache rather than building widgets or collecting values for every row. Preserve viewport positions when valid; clamp only when the available range shrinks.
 
-Default capture limits are 10,000 rows or 32 MiB, with an initial in-memory working
-set of at most 200 rows/2 MiB and the remainder spooled to private temporary files.
-These bound stored payload, not total process RSS: schema and display bytes are
-accounted, and encoded disk rows have a separate remaining-spool check. Oversized
-schema/cells and encoding expansion have explicit rejection/cutoff behavior.
-Use `cutoff` and terminal state to label truncated results. Retain handles while a
-view needs pages; release them on close so their temporary spool can be removed.
+Default capture limits are 10,000 rows or 32 MiB, with an initial in-memory working set of at most 200 rows/2 MiB and the remainder spooled to private temporary files. These bound stored payload, not total process RSS: schema and display bytes are accounted, and encoded disk rows have a separate remaining-spool check. Oversized schema/cells and encoding expansion have explicit rejection/cutoff behavior. Use `cutoff` and terminal state to label truncated results. Retain handles while a view needs pages; release them on close so their temporary spool can be removed.
 
-Keep original column/row order, full values and `ResultCell::Null` distinct from
-the text `NULL`. Ellipsis, newline flattening, alignment, tooltips and expanded
-row presentation belong to the frontend. They must not change stored values.
-Use `ExecutionError` and its native backend/code/detail/hint for useful errors.
+Keep original column/row order, full values and `ResultCell::Null` distinct from the text `NULL`. Ellipsis, newline flattening, alignment, tooltips and expanded row presentation belong to the frontend. They must not change stored values. Use `ExecutionError` and its native backend/code/detail/hint for useful errors.
 
-Use the same history key as existing GTK/CLI: the selected profile name. Pass a
-fresh `QueryHistoryStore` to each submission; refresh a history view after other
-writers publish. Readers retain the latest 100 entries, with bounded saved result
-snapshots (200 rows/1,000,000 bytes), not the full live capture. Immutable private
-entry files and rename-based publication support concurrent frontends; do not
-replace them with a frontend-owned read/modify/write history file.
+Use the same history key as existing GTK/CLI: the selected profile name. Pass a fresh `QueryHistoryStore` to each submission; refresh a history view after other writers publish. Readers retain the latest 100 entries, with bounded saved result snapshots (200 rows/1,000,000 bytes), not the full live capture. Immutable private entry files and rename-based publication support concurrent frontends; do not replace them with a frontend-owned read/modify/write history file.
+
+### Shared output access
+
+`ApplicationContext::outputs` owns retained history-list revisions and saved-output snapshots. Restore validates the canonical session/document target and publishes draft revision plus output generation atomically. Refreshing the history list invalidates the old list revision without changing an already selected saved sample. A document-generation watcher retires the saved snapshot when that output is replaced or closed; frontend command acknowledgements do not clear it. Session retirement and successful shutdown release the retained history state. History listing returns `HistoryPresentation`; restoration and output reads return `DocumentPresentation`, and workspace reads return `WorkspacePresentation` with the same saved-output metadata. These shared methods do not construct or patch JSON. The foreign transport serializes the typed projections at its boundary.
+
+Use `ApplicationContext::result_reader(ResultScope)` for live and saved data. The reader checks document lifetime and generation before and after asynchronous page access, preserves the original SQL null identity of live cells, and provides bounded viewport previews and Unicode-scalar cell chunks. Execution generation is distinct from displayed output generation: replacing output cannot relabel an older live capture as the newly selected saved result. Saved samples keep their legacy text-only identity.
+
+`ResultReader::export_cell` and `export_markdown` return a pull-based `OutputExport`. Markdown uses authoritative schema names, ordered nonoverlapping row ranges, full values, existing escaping/newline rules and a 32 MiB limit after escaping. Export reads batches of up to 64 rows and returns at most 65,536 UTF-8 bytes per chunk without splitting a scalar. Failures are terminal; every pull validates the retained output, including the final chunk. Dropping the handle stops export without a background producer. Consumers must wait for terminal success and discard all accumulated bytes on error or cancellation before publishing a clipboard/file result.
+
+The Mac bridge retains at most 16 opaque export readers and uses explicit start/read/close requests, rather than coalescing observations as a lossless chunk stream. Native export waits for start admission even when its caller is canceled, then always schedules reader release. Swift assembles bounded shared chunks and retains only native clipboard formats, cancellation and view-scope guards. Its separate full-cell assembly and Markdown formatting/page traversal were removed. Pixel geometry, viewport caching and presentation remain native.
+
+### Logical result selection and restoration
+
+`outputs::view::ResultViewRequest` is a pure shared policy for strict cell selection, clamping after row-count changes, bounded row-preview movement and matching-schema rerun restoration. It distinguishes unknown schema, changed schema, no rows and an applicable saved anchor. A selected row that has not streamed yet remains pending; terminal shorter results clamp it to the last row. An absent saved selection stays absent. Names, types and column order determine schema compatibility, with canonical Unicode equivalence retained from native string comparison. Case and type changes remain incompatible.
+
+Native `ResultViewport` and the table coordinator consume the same decision. Scroll offsets, widths, actual table selection and whether the pixel anchor is fully in view remain AppKit responsibilities. The tile cache remains native because its budget includes native display/schema overhead and its visible row/column tiling differs from sequential consumers; result payload/spool budgets remain in the existing shared result store.
+
+`dzban_result_view` is an additive pure FFI entry point with no application handle, runtime, I/O or database work. It evaluates a bounded JSON input immediately and returns a schema-1 decision in an owned bridge buffer. This permits synchronous responder/selection updates without waiting on an asynchronous application command. Status 7 rejects invalid input or input above 32 MiB; existing panic/buffer-capacity statuses and buffer-token release rules apply. Swift forwards typed requests and applies the returned decision rather than reimplementing restoration or row-boundary rules. Runtime result reads still use the asynchronous reader path and must not run on the UI thread.
+
+### Plan presentation
+
+Use `presentation::PlanPresentation` for readable plans. Live previews and saved history use the same `text` formatter and preserve the backend-defined `document`. Typed plans retain their backend and estimate; legacy saved raw documents have neither field, rather than inferred metadata. A missing saved plan remains absent. This projection does not change the persisted history format.
 
 ## Closing and shutdown
 
@@ -155,28 +140,34 @@ On application exit, call `start_shutdown`, await its handle and inspect the out
 
 ## Configuration and platform work
 
-Existing discovery is explicit `DZBAN_CONFIG`, local `config.toml`, user
-`$XDG_CONFIG_HOME/dzban/config.toml` (fallback `~/.config/dzban/config.toml`), then
-`$XDG_CONFIG_DIRS/dzban/config.toml` (fallback `/etc/xdg/dzban/config.toml`). It does
-not walk parent directories. An explicit missing/invalid file is an error; it does
-not silently fall through. With no file, configuration is empty.
+Existing discovery is explicit `DZBAN_CONFIG`, local `config.toml`, user `$XDG_CONFIG_HOME/dzban/config.toml` (fallback `~/.config/dzban/config.toml`), then `$XDG_CONFIG_DIRS/dzban/config.toml` (fallback `/etc/xdg/dzban/config.toml`). It does not walk parent directories. An explicit missing/invalid file is an error; it does not silently fall through. With no file, configuration is empty.
 
-History uses `$XDG_DATA_HOME/dzban` or `~/.local/share/dzban`. Mac-native directory
-defaults, Finder launch, trust-store behavior, packaging, accessibility and input
-conventions must be verified on the Mac. Preserve shared history/config semantics;
-do not silently copy credentials or introduce a native history format. No native
-toolkit, ABI, supported macOS version/architecture matrix, signing or notarization
-is selected by this extraction.
+History uses `$XDG_DATA_HOME/dzban` or `~/.local/share/dzban`. Mac-native directory defaults, Finder launch, trust-store behavior, packaging, accessibility and input conventions must be verified on the Mac. Preserve shared history/config semantics; do not silently copy credentials or introduce a native history format. The native deployment matrix and local packaging workflow are documented in [macOS development](macos.md).
 
 ## Native tab presentation
 
-The macOS bridge's `connect` command returns both Tab and Session IDs. `open_document` retrieves the connected tab's sole retained document; it does not allocate another query in the same session. The `tabs` command returns the ordered shared inventory and selected Tab ID without connection configuration or credentials. Session/document identities continue to scope execution, reads, preview and cancellation commands. The native UI presents one tab strip with backend artwork, profile name and query title. The native frontend creates an unconnected presentation tab at startup and for New Tab, rendering the same inline connection selector in both cases. Selecting a profile attaches the shared-core session to that existing page identity. Unconnected pages allocate no database session, remain selectable with the other tabs, and can be closed independently. Query actions and progress belong to the selected tab, and the footer follows its health and result metrics. GTK's outer strip presents the same independent session tabs, and its old inner query strip is hidden.
+The macOS bridge's `connect` command returns both Tab and Session IDs. `open_document` retrieves the connected tab's sole retained document; it does not allocate another query in the same session. The `tabs` command returns the ordered shared inventory and selected Tab ID without connection configuration or credentials. Session/document identities continue to scope execution, reads, preview and cancellation commands. The native UI presents one tab strip with backend artwork, profile name and query title. The native frontend requests a shared chooser tab at startup and for New Tab, rendering the same inline connection selector in both cases. Selecting a profile attaches the shared-core session to that canonical tab identity. Unconnected pages allocate no database session, remain selectable with the other tabs, and can be closed independently. Query actions and progress belong to the selected tab, and the footer follows its health and result metrics. GTK's outer strip presents the same independent session tabs, and its old inner query strip is hidden.
 
 ## Native history and TLS gates
 
 Live document snapshots expose the shared query start wall time, monotonic elapsed duration, and a compact execution-plan estimate without the full plan document. Native results render the elapsed timer while active and retain the frozen duration after cleanup. Saved history does not display the active query timing summary.
 
-The native macOS frontend saves its ordered open pages, connection profile names, SQL drafts and selected page to `$XDG_DATA_HOME/dzban/native-workspace.json` (or `~/.local/share/dzban/native-workspace.json`) before shutting down sessions. The file is written atomically with owner-only permissions. On launch it opens independent sessions for saved connected tabs and restores their drafts without submitting SQL. Unconnected pages remain unconnected. An unavailable profile retains its page and draft for reconnection. Live results, active executions and database session state are not restored.
+The native macOS frontend delegates workspace storage and reconnect orchestration to `ApplicationContext::workspace`. `WorkspaceLocation` separates the common version-1 format/repository from the host namespace: macOS retains `$XDG_DATA_HOME/dzban/native-workspace.json` (or `~/.local/share/dzban/native-workspace.json`); reserved GTK and CLI defaults are `gtk-workspace.json` and `cli-workspace.json` in the same data directory. GTK/CLI adoption is later work. An explicit path supports isolated tests and host-owned storage choices. Configuration and profile history remain shared; active workspaces are not implicitly shared between hosts.
+
+`SavedWorkspace` retains version, ordered optional profile names/drafts and selected index. The shared saver takes canonical membership/selection and explicit native editor-draft overrides, so unsent buffer changes survive without changing the current query. It stores no connection credentials, session IDs, live results or execution state. File reads, bounded serialization and atomic publication run on blocking workers. The 32 MiB limit bounds encoded file input/output. Publication creates a unique private file with mode 0600 on Unix, flushes it and renames it into place; failure removes the temporary file and leaves the last saved file intact. Concurrent writers publish complete snapshots; host namespaces prevent separate frontends from sharing a last-open-tabs file accidentally. Workspace-save requests alone allow up to 32 MiB; ordinary bridge commands retain their 1 MiB admission limit.
+
+`start_restore_workspace` retains one operation per application. Multiple waiters/observers join it; dropping an observer does not cancel reconnect work. It reads the legacy version-1 file, atomically claims an empty workspace, opens tabs in saved order and reconnects via existing shared connection/session ownership. Missing profiles or failed connections retain their draft/page for retry; a canceled reconnect does not become an error notification. Unsupported/empty files fall back to a chooser, while malformed/unreadable files also report the storage error. Existing nonempty workspaces are not replaced or appended to. The selected index is clamped and restored after reconnects; SQL is never submitted by restoration.
+
+Shared shutdown stops further restore admission and joins the retained restore before session cleanup. The bridge publishes complete workspace/progress snapshots, so coalescing can skip intermediate deliveries without losing tabs or issues. Native startup attaches editors/observations and native focus to those shared tabs; it owns no workspace decoder, file writer, tab-recreation loop or profile reconnect workflow. Native shutdown joins one save/cleanup task, including concurrent quit requests; a failed save leaves the workspace open for retry. Completion-attention policy is shared as described below.
+
+
+### Completion attention
+
+`attention::AttentionPolicy` owns unseen completions, per-tab completion revisions, exactly-once completion identity, grouping while away and the portable request/cancel intent. `AttentionService` publishes retained typed snapshots. Managed `QueryTab::submit` attaches completion tracking to the existing document query handle; dropping the foreign/native waiter does not cancel tracking, and no frontend document observer is required. Completion identity includes tab, document, output generation, session and query. Replaced/retired output, duplicate completion, cancellation and closing/shutdown suppression cannot create a new unseen notification. Typed native cancellation errors are treated as cancellation even when the transport reports a failed capture. A failed shutdown re-enables attention before the application is reopened for work.
+
+Hosts report visibility, the displayed output scope, and startup/quit presentation suppression. Viewing an older generation cannot clear a newer unseen completion; viewing replacement output acknowledges an older completion that no longer has a separate display. A connection chooser reports no viewed output. Foreground completion on the viewed tab stays quiet, background completion marks its own tab, and completions while away request attention once until the host returns. Startup/quit and core shutdown also cancel active attention intent; resume does not replay suppressed completions. Nothing is persisted and no SQL/preview/probe operation is introduced by attention handling.
+
+`dzban_attention` applies bounded host reports synchronously without I/O, so a visibility change reaches the shared policy before subsequent query completion. The observer publishes complete snapshots; a monotonic request revision preserves pending attention across coalesced delivery. Native code keeps only projection/effect delivery cursors, rejects old snapshots and implements the existing Dock badge/informational attention request. Visibility presentation comes from observation after native rendering, rather than mutating a published model while AppKit attaches the window. Attaching a native effect recipient applies the current projection without replaying an old request. The shutdown response includes the final empty attention snapshot before the application handle is released, so UI cleanup does not depend on an observer surviving shutdown.
 
 The macOS bridge lists at most 100 history summaries with SQL previews bounded to 256 Unicode scalars. Each list has an opaque revision; restore requires that revision and its entry index. Refresh invalidates previous selections. Restored results retain their loaded history snapshot under the document's new output generation, independently of a live query that may still be finishing. A new submission replaces the saved output. Saved plans are fetched separately from document snapshots and remain subject to the bridge record-size limit. The preview response includes `plan.text`, rendered by `QueryPlan::text()` from the captured PostgreSQL or ClickHouse plan document. Native plan inspection displays this text while the structured document remains available for estimates and diagnostics.
 
@@ -196,16 +187,40 @@ bash scripts/check-portable.sh
 bash scripts/check-headless.sh
 ```
 
-`frontend_workflow` injects an adapter and exercises connection, preview, early
-spooled rows, navigation, dropped observers, history, cancellation/restart and
-safe close/shutdown. Other public tests cover failures, capability denial,
-cutoffs, stale responses and concurrent history writers. The dependency gate
-checks all-target/all-feature normal, build and development edges for known
-native/terminal frontend packages. The headless runner disables native package
-discovery and builds/tests core, adapters and CLI; it is also wired into CI.
+`frontend_workflow` injects an adapter and exercises connection, preview, early spooled rows, navigation, dropped observers, history, cancellation/restart and safe close/shutdown. Other public tests cover failures, capability denial, cutoffs, stale responses and concurrent history writers. The dependency gate checks all-target/all-feature normal, build and development edges for known native/terminal frontend packages. The headless runner disables native package discovery and builds/tests core, adapters and CLI; it is also wired into CI.
 
-For GTK changes run `bash scripts/test-gtk.sh` and the maintained Dogtail runner.
-For adapter/runtime changes run the serial database runner documented in
-`skills/dzban-testing`. Workspace tests alone skip service/display cases.
-Add corresponding native interaction tests on the Mac; Linux screenshots and
-successful dependency checks do not replace macOS runtime validation.
+For GTK changes run `bash scripts/test-gtk.sh` and the maintained Dogtail runner. For adapter/runtime changes run the serial database runner documented in `skills/dzban-testing`. Workspace tests alone skip service/display cases. Add corresponding native interaction tests on the Mac; Linux screenshots and successful dependency checks do not replace macOS runtime validation.
+
+### Result feedback and diagnostics
+
+`DocumentPresentation.feedback` is the shared projection for result status precedence, empty-result state, progress phase, row/affected-row counts and visible diagnostics. Capture cleanup, truncation, cancellation, command acknowledgement and saved samples are resolved in core. Hosts format the typed reasons with their local labels and units. Native result views do not infer status from backend error JSON. Saved output replaces the displayed feedback and retains live progress independently, including when history is opened during a background execution.
+
+`DiagnosticPresentation` preserves backend, error kind, message, typed SQLSTATE/ClickHouse code, detail and hint, together with the existing default display text. Query-error/capture-error precedence and cancellation suppression are shared policy. Legacy saved failure strings become message diagnostics. Raw error fields remain in the serialized document for compatibility; native presentation consumes the typed feedback instead. The duplicate Swift diagnostic decoder is removed.
+
+`EstimatePresentation` retains exact unsigned row/part/mark counts and numerical costs, and normalizes its optional diagnostic through the same projection. Execution estimates, live/saved plan previews and input hints use this type. Native code retains number/unit formatting and the existing backend-specific row-estimate label. Plan text continues to come from the shared renderer; no extra estimate line or layout element is introduced. ABI/record schema remain version 1; both sides of the local transport are built together. Unknown typed status or diagnostic-code variants fail decoding instead of being guessed by the view.
+
+### Native feature composition
+
+`ApplicationClient` is the typed native facade entry point for workspace, editor/input, results/history, health and attention. `ConnectionHealthModel` and `QueryAttentionModel` own their respective transport observations, revisions, retirement and native presentation/effect adapters. They do not schedule health workflows or determine completion grouping: those policies remain in the shared application. `ApplicationStore` composes these models, forwards native publication and reports host selection/lifecycle context. Production native features use typed client methods; the only direct generic native request is fixture-only metrics collection.
+
+`ConnectionChooser`, `QueryTabStrip` and `WorkspaceStatusBar` are feature views under the window shell. Focus remains in the native responder/focus-state owner, with the chooser receiving its existing binding and navigation callbacks. Extraction does not introduce a cross-platform widget layer or change layout values. The native production build and hosted runtime suite cover composition; actual app-window visual parity is still a separate gate.
+
+`ApplicationStore` workspace, connection, document, editor, controls, input/preview and shutdown traffic also uses typed `ApplicationClient` methods. `EditorActionRequest` captures the exact draft and scalar selection before asynchronous dispatch. Generic `BridgeCommand`/response pairing no longer appears in the store. Result/history/row adapters use the typed client too. Named lower-level compatibility commands and their shared authorities are documented in [the bridge contract](macos-bridge.md).
+
+`EditorAttachments` owns native buffers, focus-cycle attachment and coalesced draft/context delivery. Core remains authoritative for persisted drafts and document revisions. Retiring an attachment clears native editing/undo/highlighting state and prevents an old delivery from publishing through a replacement attachment. `QueryInteractionModel` owns serialized input delivery and the selected-context observation/preview binding, with a weak native host for current selection/readiness. It does not implement key chords, SQL selection, query admission or preview execution; those decisions remain shared. Retired interaction models cannot recreate editors or publish late state. The store retains application composition, navigation and window-level readiness.
+
+`ResultScope` and `ResultAddress` belong to the transport contract module and carry no AppKit dependencies. Result schema/page/cell reads, bounded shared export-reader transport, history listing/saved plans and row-preview visibility use typed client methods. Native result adapters retain tile caching, pasteboard conversion, selection and widget lifetimes. The export transport preserves uncanceled admission followed by owned reader cleanup, cancellation checks between chunks and no partial clipboard publication.
+
+`WindowActionsModel` owns native action search/highlight/menu state and toolbar configuration; `WindowActionMenu` renders the existing menu. The root view retains window composition and cross-surface focus restoration. Action labels/order/readiness, native toolbar widgets, menu dimensions and existing shortcuts are retained. The row-number accessibility callback uses a separate main-actor action holder: main-thread calls remain synchronous and external background callbacks dispatch the action to the main queue. No unchecked sendability is added to production types.
+
+### Typed output and history facade
+
+`OutputService::document` and `workspace` return typed shared presentations. `ApplicationContext::history_list` returns `HistoryPresentation` with an immutable list revision and typed `HistoryOutcomeKind` entries. `restore_history` returns `DocumentPresentation`; it does not require a frontend decoder or a Mac bridge to inspect saved state. Optional capture counts distinguish a live capture from a saved sample. Saved execution time, total/sample rows, plan availability, termination and normalized feedback have the same meaning in document and workspace projections.
+
+`DocumentError` is a typed compatibility union for structured execution errors and old saved failure strings. It preserves the existing serialized raw-error shape; presentation uses normalized `feedback` diagnostics. History storage/version and backend-defined plan documents are unchanged. Raw JSON in a saved plan remains backend data, not the application output model.
+
+The Mac bridge's engine/document `Workspace` map is removed. Actions, catalog, controls, probes, document access and restored connections resolve canonical core tabs/sessions. The bridge retains only transport observations, bounded reader/export handles, runtime/config composition and fixture resource lifetimes. `open_document` is a read-only compatibility lookup; unused `select_document` and its separate document-selection revisions are removed. Active native navigation uses core `select_tab`/`cycle_tabs`, and legacy `open_document` callers no longer supply a revision.
+
+The public `output_access` tests use typed history revisions, saved document fields, result readers and workspace projections over `ApplicationContext` without a foreign bridge. `application_sessions` separately exercises session-only connection/execution/cleanup without tabs or host visibility. The headless dependency guard checks that shared/application/adapter crates do not import desktop frontend libraries; it does not claim that GTK or CLI adoption has already happened. Their existing UI/process behavior remains in their own adapters until the later migration phases.
+
+For an isolated editor-routing stress check, run `DZBAN_EDITOR_REPETITIONS=20 DZBAN_TRACE_EDITOR_SCENARIO=1 bash scripts/test-macos-bridge.sh`. The standalone runner bounds repetitions to 1-20 and retains its overall watchdog; normal runs use one iteration. Phase/command diagnostics are fixture-only and include intent/outcome or failure kind, not connection credentials. Snapshot waits report a bounded failure rather than hanging indefinitely. This stress check complements the ordinary Rust concurrent-draft regression and does not replace real-window validation.

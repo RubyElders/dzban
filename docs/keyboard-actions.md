@@ -1,7 +1,6 @@
 # Keyboard action system
 
-Shared interaction roles and frontend ownership are documented in
-[Frontend integration](frontend-integration.md). Physical bindings below belong to GTK.
+Shared interaction roles and frontend ownership are documented in [Frontend integration](frontend-integration.md). Physical bindings below belong to GTK.
 
 Dzban has one action catalog in `crates/dzban-gtk/src/ui/shortcuts.rs`. Every user-facing command has an identifier, name, description, group, search keywords, and an optional direct shortcut.
 
