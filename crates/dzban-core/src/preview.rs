@@ -4,12 +4,214 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 use crate::QueryPlan;
-use crate::documents::{DocumentId, DocumentLifecycle, QueryDocument};
+use crate::documents::{DocumentId, DocumentLifecycle, DocumentSnapshot, QueryDocument};
 use crate::error::ExecutionError;
 use crate::execution::{QueryEngine, SessionId};
 
 pub const PREVIEW_DELAY: Duration = Duration::from_millis(250);
 pub const PREVIEW_HOLD: Duration = Duration::from_millis(250);
+
+#[derive(Clone, Copy, Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreviewSurface {
+    Plan,
+    Row,
+}
+
+#[derive(Clone, Copy, Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeekEvent {
+    Show,
+    Open,
+    Pin,
+    Close,
+    Release,
+    Reset,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct PeekVisibility {
+    pub visible: bool,
+    pub pinned: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PreviewError {
+    Application(crate::application::ApplicationError),
+    Invalidated(&'static str),
+    Execution(ExecutionError),
+}
+
+impl std::fmt::Display for PreviewError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Application(error) => error.fmt(formatter),
+            Self::Invalidated(message) => formatter.write_str(message),
+            Self::Execution(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for PreviewError {}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreviewResult {
+    pub target: PreviewTarget,
+    pub plan: QueryPlan,
+}
+
+pub(crate) struct PreviewCommand {
+    pub tab: crate::tabs::TabId,
+    pub document: DocumentId,
+    pub draft_revision: u64,
+    pub sql: String,
+    pub request_revision: Option<u64>,
+}
+
+pub struct PreviewHandle {
+    service: PlanPreviewService,
+    document: QueryDocument,
+    target: PreviewTarget,
+    updates: watch::Receiver<PreviewSnapshot>,
+}
+
+impl PreviewHandle {
+    pub fn target(&self) -> PreviewTarget {
+        self.target
+    }
+    pub async fn wait(mut self) -> Result<PreviewResult, PreviewError> {
+        loop {
+            let snapshot = self.updates.borrow_and_update().clone();
+            if snapshot.target != Some(self.target) || matches!(snapshot.phase, PreviewPhase::Empty)
+            {
+                return Err(PreviewError::Invalidated(
+                    "Preview was dismissed or superseded",
+                ));
+            }
+            match &snapshot.phase {
+                PreviewPhase::Ready(plan) if self.service.accepts(&snapshot, &self.document) => {
+                    return Ok(PreviewResult {
+                        target: self.target,
+                        plan: plan.clone(),
+                    });
+                }
+                PreviewPhase::Ready(_) => {
+                    return Err(PreviewError::Invalidated(
+                        "Preview no longer matches the document",
+                    ));
+                }
+                PreviewPhase::Failed(error) => return Err(PreviewError::Execution(error.clone())),
+                _ => (),
+            }
+            self.updates
+                .changed()
+                .await
+                .map_err(|_| PreviewError::Invalidated("Preview observation ended"))?;
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct TabPreview {
+    service: PlanPreviewService,
+    revision: u64,
+    peeks: [PeekState; 2],
+}
+
+impl TabPreview {
+    pub(crate) fn is_current(&self, target: PreviewTarget) -> bool {
+        self.service.snapshot().is_current(target)
+    }
+    fn accept_revision(&mut self, revision: Option<u64>) -> Result<(), PreviewError> {
+        if let Some(revision) = revision {
+            if revision < self.revision {
+                return Err(PreviewError::Invalidated(
+                    "A newer preview intent is active",
+                ));
+            }
+            self.revision = revision;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn start(
+        &mut self,
+        engine: Arc<QueryEngine>,
+        document: QueryDocument,
+        draft_revision: u64,
+        sql: String,
+        revision: Option<u64>,
+    ) -> Result<PreviewHandle, PreviewError> {
+        self.accept_revision(revision)?;
+        let source = document.snapshot();
+        if source.draft_revision != draft_revision {
+            return Err(PreviewError::Invalidated("Draft revision has changed"));
+        }
+        let updates = self.service.subscribe();
+        let target = self
+            .service
+            .schedule_snapshot(engine, document.clone(), sql, PREVIEW_DELAY, source)
+            .map_err(PreviewError::Execution)?;
+        Ok(PreviewHandle {
+            service: self.service.clone(),
+            document,
+            target,
+            updates,
+        })
+    }
+
+    pub(crate) fn cancel(&mut self, revision: Option<u64>) -> Result<(), PreviewError> {
+        self.accept_revision(revision)?;
+        self.service.cancel();
+        Ok(())
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.service.cancel();
+        self.peeks = Default::default();
+    }
+
+    pub(crate) fn query_started(&mut self) {
+        self.service.cancel();
+        self.peeks[0].close();
+    }
+
+    pub(crate) fn peek(
+        &mut self,
+        surface: PreviewSurface,
+        event: PeekEvent,
+        elapsed: Duration,
+    ) -> PeekVisibility {
+        let state = &mut self.peeks[match surface {
+            PreviewSurface::Plan => 0,
+            PreviewSurface::Row => 1,
+        }];
+        match event {
+            PeekEvent::Show => state.show_transient(),
+            PeekEvent::Open => {
+                state.show_transient();
+                state.pin();
+            }
+            PeekEvent::Pin => {
+                state.pin();
+            }
+            PeekEvent::Close => {
+                state.close();
+            }
+            PeekEvent::Release => match preview_release(elapsed) {
+                PreviewRelease::Pin => {
+                    state.pin();
+                }
+                PreviewRelease::Hide => state.hide_transient(),
+            },
+            PeekEvent::Reset => state.hide_transient(),
+        }
+        PeekVisibility {
+            visible: state.is_visible(),
+            pinned: state.is_pinned(),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PreviewRelease {
@@ -162,6 +364,17 @@ impl PlanPreviewService {
         delay: Duration,
     ) -> Result<PreviewTarget, ExecutionError> {
         let source = document.snapshot();
+        self.schedule_snapshot(engine, document, sql, delay, source)
+    }
+
+    fn schedule_snapshot(
+        &self,
+        engine: Arc<QueryEngine>,
+        document: QueryDocument,
+        sql: String,
+        delay: Duration,
+        source: DocumentSnapshot,
+    ) -> Result<PreviewTarget, ExecutionError> {
         if source.lifecycle != DocumentLifecycle::Open {
             return Err(ExecutionError::Closed);
         }

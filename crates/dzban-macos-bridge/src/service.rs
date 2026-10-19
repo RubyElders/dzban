@@ -1,21 +1,17 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use dzban_core::application::{
-    ApplicationContext, ApplicationError, ApplicationPhase, ConnectionSelection,
-};
-use dzban_core::documents::{
-    CloseDocument, DocumentExecution, DocumentId, QueryDocument, QueryDocuments,
-};
+use dzban_core::application::{ApplicationContext, ApplicationError, ApplicationPhase};
+use dzban_core::commands::{CommandError, EditorCommand, HistoryLocation};
+use dzban_core::documents::{DocumentId, QueryDocument};
 use dzban_core::error::ExecutionError;
 use dzban_core::execution::{QueryEngine, SessionId};
 use dzban_core::history::QueryHistoryStore;
-use dzban_core::interaction::{
-    AppCommand, AppEvent, AppState, InputRole, PrimaryAction, SessionInteraction,
-};
-use dzban_core::preview::{PREVIEW_DELAY, PlanPreviewService, PreviewPhase};
-use dzban_core::result_store::{MAX_PAGE_ROWS, ResultLimits};
-use dzban_core::result_stream::{ResultPhase, ResultTermination};
+use dzban_core::outputs::{OutputError, OutputExport, ResultScope, RowRange};
+use dzban_core::presentation::PlanPresentation;
+use dzban_core::preview::PreviewError;
+use dzban_core::result_store::ResultLimits;
+use dzban_core::workspace::WorkspaceLocation;
 use dzban_core::{Config, ConnectionProfileId};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -31,6 +27,36 @@ use crate::transport::Stream;
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
     Tabs {},
+    OpenTab {
+        profile: Option<String>,
+        draft: Option<String>,
+        revision: Option<u64>,
+    },
+    RestoreWorkspace {
+        location: WorkspaceLocation,
+    },
+    SaveWorkspace {
+        location: WorkspaceLocation,
+        drafts: Vec<WorkspaceDraft>,
+    },
+    CycleTabs {
+        direction: i64,
+        revision: Option<u64>,
+    },
+    SelectTab {
+        tab: Uuid,
+        revision: Option<u64>,
+    },
+    CloseTab {
+        tab: Uuid,
+    },
+    CancelTabConnection {
+        tab: Uuid,
+    },
+    SetTabDraft {
+        tab: Uuid,
+        draft: String,
+    },
     #[cfg(feature = "test-fixtures")]
     TestPanic {},
     #[cfg(feature = "test-fixtures")]
@@ -77,6 +103,22 @@ pub enum Command {
         revision: u64,
         input: native_controls::Input,
     },
+    Interact {
+        session: Uuid,
+        document: Uuid,
+        revision: u64,
+        draft: String,
+        start: usize,
+        end: usize,
+        input: native_controls::Input,
+    },
+    ObserveInteraction {
+        session: Uuid,
+    },
+    AwaitPlan {
+        session: Uuid,
+        revision: u64,
+    },
     AwaitIdle {
         session: Uuid,
     },
@@ -87,6 +129,15 @@ pub enum Command {
     ProbeProfile {
         profile: String,
     },
+    ObserveHealth {},
+    ObserveAttention {},
+    CheckHealth {
+        session: Uuid,
+    },
+    CheckProfileHealth {
+        profile: String,
+    },
+    CheckProfilesHealth {},
     Profiles {},
     Connections {},
     SelectSession {
@@ -112,22 +163,17 @@ pub enum Command {
         end: usize,
         intent: EditorIntent,
     },
-    SelectDocument {
-        session: Uuid,
-        document: Uuid,
-        revision: Option<u64>,
-    },
     CloseDocument {
         session: Uuid,
         document: Uuid,
     },
     Connect {
+        tab: Option<Uuid>,
         profile: String,
         revision: Option<u64>,
     },
     OpenDocument {
         session: Uuid,
-        revision: Option<u64>,
     },
     ContextChanged {
         session: Uuid,
@@ -181,45 +227,36 @@ pub enum Command {
         offset: usize,
         count: usize,
     },
+    StartExport {
+        export: Uuid,
+        session: Uuid,
+        document: Uuid,
+        generation: u64,
+        row: Option<usize>,
+        column: Option<usize>,
+        ranges: Option<Vec<RowRange>>,
+    },
+    ReadExport {
+        export: Uuid,
+    },
+    CloseExport {
+        export: Uuid,
+    },
     CloseSession {
         session: Uuid,
     },
     Shutdown {},
 }
 
+#[derive(Deserialize)]
+pub struct WorkspaceDraft {
+    tab: Uuid,
+    draft: String,
+}
+
 pub struct App {
     runtime: Option<Runtime>,
     state: Arc<State>,
-}
-
-struct Workspace {
-    engine: Arc<QueryEngine>,
-    documents: QueryDocuments,
-    preview: PlanPreviewService,
-    profile: String,
-    selection_revision: u64,
-    peeks: [dzban_core::preview::PeekState; 2],
-    preview_revision: u64,
-    input_document: Option<(DocumentId, u64)>,
-    input_state: AppState,
-}
-
-#[derive(Default)]
-struct NativeSelection {
-    connection: ConnectionSelection,
-    revision: u64,
-}
-
-impl NativeSelection {
-    fn accept_revision(&mut self, revision: Option<u64>) -> bool {
-        if let Some(revision) = revision {
-            if revision < self.revision {
-                return false;
-            }
-            self.revision = revision;
-        }
-        true
-    }
 }
 
 struct HistoryDirectory(std::path::PathBuf);
@@ -234,14 +271,10 @@ struct State {
     context: Arc<ApplicationContext>,
     config: Mutex<Option<Config>>,
     injected_config: bool,
-    workspaces: Mutex<HashMap<SessionId, Workspace>>,
     observers: Mutex<Vec<Observer>>,
     history_directory: Mutex<Option<HistoryDirectory>>,
-    selection: Mutex<NativeSelection>,
-    interaction: Mutex<AppState>,
     readers: tokio::sync::Semaphore,
-    history_views: Mutex<HashMap<SessionId, crate::history::HistoryView>>,
-    saved_outputs: Mutex<HashMap<DocumentId, crate::history::SavedOutput>>,
+    exports: Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<OutputExport>>>>,
 }
 
 struct Observer {
@@ -257,7 +290,54 @@ fn execution_error(error: ExecutionError) -> Value {
     json!({"failure": {"kind": "execution", "message": error.to_string(), "diagnostic": error}})
 }
 
+fn output_error(error: OutputError) -> Value {
+    let kind = match &error {
+        OutputError::Application(ApplicationError::UnknownSession(_)) => {
+            return failure("unknown_session", "Session is not open");
+        }
+        OutputError::Application(error) => return application_error("output", error.clone()),
+        OutputError::UnknownDocument => "unknown_document",
+        OutputError::StaleOutput => "stale_output",
+        OutputError::Unavailable => "result_unavailable",
+        OutputError::StaleHistory => "stale_history",
+        OutputError::HistoryEntryMissing | OutputError::SavedOutputMissing => "history_entry",
+        OutputError::InvalidCell => "invalid_cell",
+        OutputError::InvalidPage(_) => "invalid_page",
+        OutputError::InvalidChunk(_) => "invalid_chunk",
+        OutputError::CellTooLarge => "cell_too_large",
+        OutputError::ExportTooLarge => "export_too_large",
+        OutputError::InvalidSelection => "invalid_selection",
+        OutputError::Execution(error) => return execution_error(error.clone()),
+        OutputError::History(error) => return command_error(error.clone()),
+    };
+    failure(kind, error)
+}
+
+fn command_error(error: CommandError) -> Value {
+    match error {
+        CommandError::Application(error) => application_error("command", error),
+        CommandError::Execution(error) => execution_error(error),
+        CommandError::Preview(error) => preview_error(error),
+        CommandError::Selection(message) => failure("selection", message),
+        CommandError::History(message) => failure("history", message),
+        CommandError::Worker(message) => failure("worker_failed", message),
+    }
+}
+
+fn preview_error(error: PreviewError) -> Value {
+    match error {
+        PreviewError::Invalidated(message) => failure("preview_invalidated", message),
+        PreviewError::Execution(error) => execution_error(error),
+        PreviewError::Application(error) => application_error("preview", error),
+    }
+}
+
 fn application_error(kind: &str, error: ApplicationError) -> Value {
+    let kind = if error == ApplicationError::SelectionSuperseded {
+        "selection_superseded"
+    } else {
+        kind
+    };
     let diagnostic = match &error {
         ApplicationError::Operation(error)
         | ApplicationError::Adapter(dzban_core::adapter::AdapterError::Connect { error, .. }) => {
@@ -285,14 +365,10 @@ impl App {
                 context: Arc::new(ApplicationContext::new(registry)),
                 config: Mutex::new(config),
                 injected_config,
-                workspaces: Mutex::new(HashMap::new()),
                 observers: Mutex::new(Vec::new()),
                 history_directory: Mutex::new(None),
-                selection: Mutex::new(NativeSelection::default()),
-                interaction: Mutex::new(AppState::default()),
                 readers: tokio::sync::Semaphore::new(16),
-                history_views: Mutex::new(HashMap::new()),
-                saved_outputs: Mutex::new(HashMap::new()),
+                exports: Mutex::default(),
             }),
         })
     }
@@ -309,6 +385,19 @@ impl App {
         let runtime = self.runtime.as_ref().expect("live app has a runtime");
         let state = self.state.clone();
         let lifetime = self.clone();
+        if let Command::RestoreWorkspace { location } = command {
+            let mut observers = self.state.observers.lock().unwrap();
+            if *self.state.context.subscribe_phase().borrow() != ApplicationPhase::Running {
+                output.publish(failure("closed", "Application is closing"));
+                return;
+            }
+            observers.retain(|observer| !observer.task.is_finished());
+            let stream = Arc::downgrade(&output);
+            let task =
+                runtime.spawn(async move { state.restore_workspace(location, output).await });
+            observers.push(Observer { stream, task });
+            return;
+        }
         if let Command::ObserveControls { session } = command {
             let mut observers = self.state.observers.lock().unwrap();
             if *self.state.context.subscribe_phase().borrow() != ApplicationPhase::Running {
@@ -334,6 +423,43 @@ impl App {
             observers.push(Observer { stream, task });
             return;
         }
+        if let Command::ObserveInteraction { session } = command {
+            let mut observers = self.state.observers.lock().unwrap();
+            if *self.state.context.subscribe_phase().borrow() != ApplicationPhase::Running {
+                output.publish(failure("closed", "Application is closing"));
+                return;
+            }
+            observers.retain(|observer| !observer.task.is_finished());
+            let stream = Arc::downgrade(&output);
+            let task =
+                runtime.spawn(async move { state.observe_interaction(session, output).await });
+            observers.push(Observer { stream, task });
+            return;
+        }
+        if let Command::ObserveAttention {} = command {
+            let mut observers = self.state.observers.lock().unwrap();
+            if *self.state.context.subscribe_phase().borrow() != ApplicationPhase::Running {
+                output.publish(failure("closed", "Application is closing"));
+                return;
+            }
+            observers.retain(|observer| !observer.task.is_finished());
+            let stream = Arc::downgrade(&output);
+            let task = runtime.spawn(async move { state.observe_attention(output).await });
+            observers.push(Observer { stream, task });
+            return;
+        }
+        if let Command::ObserveHealth {} = command {
+            let mut observers = self.state.observers.lock().unwrap();
+            if *self.state.context.subscribe_phase().borrow() != ApplicationPhase::Running {
+                output.publish(failure("closed", "Application is closing"));
+                return;
+            }
+            observers.retain(|observer| !observer.task.is_finished());
+            let stream = Arc::downgrade(&output);
+            let task = runtime.spawn(async move { state.observe_health(output).await });
+            observers.push(Observer { stream, task });
+            return;
+        }
         let task = runtime.spawn(async move { state.command(command).await });
         runtime.spawn(async move {
             let result = match task.await {
@@ -343,6 +469,13 @@ impl App {
             output.publish(result);
             drop(lifetime);
         });
+    }
+
+    pub fn attention_input(
+        &self,
+        input: dzban_core::attention::AttentionInput,
+    ) -> dzban_core::attention::AttentionSnapshot {
+        self.state.context.attention().input(input)
     }
 
     pub fn is_closed(&self) -> bool {
@@ -365,8 +498,56 @@ impl Drop for App {
 }
 
 impl State {
+    fn tab_inventory(&self) -> Value {
+        json!(
+            self.context
+                .outputs
+                .workspace(&self.context.tabs.snapshot())
+        )
+    }
+
+    async fn observe_attention(&self, output: Arc<Stream>) {
+        let mut snapshots = self.context.attention().subscribe();
+        loop {
+            output.publish(json!(snapshots.borrow_and_update().clone()));
+            tokio::select! {
+                _ = output.closed() => return,
+                changed = snapshots.changed() => if changed.is_err() { return; },
+            }
+        }
+    }
+
+    fn track_restored_health(&self) {
+        for tab in self.context.tabs.snapshot().tabs {
+            if tab.phase == dzban_core::tabs::TabPhase::Ready {
+                let _ = self.context.health.track_tab(&self.context, tab.id);
+            }
+        }
+    }
+
+    async fn restore_workspace(&self, location: WorkspaceLocation, output: Arc<Stream>) {
+        let config = self.config.lock().unwrap().clone();
+        let restore = self.context.start_restore_workspace(location, config);
+        let mut progress = restore.subscribe();
+        let mut tabs = self.context.tabs.subscribe();
+        loop {
+            let current = progress.borrow_and_update().clone();
+            tabs.borrow_and_update();
+            self.track_restored_health();
+            output.publish(json!({"workspace":self.tab_inventory(),"progress":current}));
+            if current.finished {
+                return;
+            }
+            tokio::select! {
+                _ = output.closed() => return,
+                changed = progress.changed() => if changed.is_err() { return; },
+                changed = tabs.changed() => if changed.is_err() { return; },
+            }
+        }
+    }
+
     async fn submit(&self, session: Uuid, document: Uuid, sql: String) -> Result<Value, Value> {
-        let (engine, document) = self.document(session, document)?;
+        let (engine, _) = self.document(session, document)?;
         let history = self.history(session).await?;
         let tab = self
             .context
@@ -376,7 +557,6 @@ impl State {
         let query = tab
             .submit(sql, ResultLimits::default(), Some(history))
             .map_err(execution_error)?;
-        self.saved_outputs.lock().unwrap().remove(&document.id());
         let result = json!({"query": query.query.0, "document": query.document.0, "session": query.session.0, "generation": query.generation});
         tokio::spawn(async move {
             let _ = query.wait().await;
@@ -393,250 +573,113 @@ impl State {
         end: usize,
         intent: EditorIntent,
     ) -> Result<Value, Value> {
-        let (commands, active) = {
-            let selection = self.selection.lock().unwrap();
-            if selection.connection != ConnectionSelection::Ready(SessionId(session)) {
-                return Err(failure(
+        let tab = self
+            .context
+            .tabs
+            .session(SessionId(session))
+            .ok_or_else(|| {
+                failure(
                     "selection_superseded",
                     "The workspace is no longer selected",
-                ));
-            }
-            let workspaces = self.workspaces.lock().unwrap();
-            let workspace = workspaces
-                .get(&SessionId(session))
-                .ok_or_else(|| failure("unknown_session", "Session is not open"))?;
-            if workspace.documents.selected().map(|value| value.id()) != Some(DocumentId(document))
-            {
-                return Err(failure(
-                    "selection_superseded",
-                    "The query is no longer selected",
-                ));
-            }
-            let active = workspace
-                .documents
-                .documents()
-                .iter()
-                .find(|document| document.is_active())
-                .cloned();
-            let mut interaction = self.interaction.lock().unwrap();
-            interaction.transition(AppEvent::SessionSelected(Some(
-                SessionInteraction::from_engine(&workspace.engine),
-            )));
-            let commands = match intent {
-                EditorIntent::Submit => {
-                    interaction.transition(AppEvent::KeyPressed {
-                        key: InputRole::PrimaryModifier,
-                        at_ms: 0,
-                    });
-                    let commands = interaction.transition(AppEvent::KeyPressed {
-                        key: InputRole::Submit,
-                        at_ms: 0,
-                    });
-                    interaction.transition(AppEvent::KeyReleased {
-                        key: InputRole::Submit,
-                        at_ms: 0,
-                    });
-                    interaction.transition(AppEvent::KeyReleased {
-                        key: InputRole::PrimaryModifier,
-                        at_ms: 0,
-                    });
-                    commands
-                }
-                EditorIntent::Primary => interaction.transition(AppEvent::PrimaryActionRequested),
-                EditorIntent::Cancel => interaction.transition(AppEvent::CancelRequested),
-                EditorIntent::Reset => interaction.transition(AppEvent::KeyboardReset),
-            };
-            (commands, active)
-        };
-        let mut submission = None;
-        let mut canceled = false;
-        for command in commands {
-            match command {
-                AppCommand::RunQuery => {
-                    let sql = selected_sql(&draft, start, end)
-                        .map_err(|message| failure("selection", message))?;
-                    submission = Some(self.submit(session, document, sql).await?);
-                }
-                AppCommand::CancelQuery => {
-                    if let Some(active) = &active {
-                        let (engine, _) = self.document(session, active.id().0)?;
-                        active
-                            .request_cancel(engine)
-                            .map_err(execution_error)?
-                            .wait()
-                            .await
-                            .map_err(execution_error)?;
-                        canceled = true;
-                    }
-                }
-                AppCommand::CancelPreview => {
-                    if let Some(workspace) =
-                        self.workspaces.lock().unwrap().get(&SessionId(session))
-                    {
-                        workspace.preview.cancel();
-                    }
-                }
-                _ => {}
-            }
-        }
-        Ok(json!({"submission":submission, "cancellation_requested":canceled}))
+                )
+            })?;
+        let history = self.history_location()?;
+        let result = self
+            .context
+            .start_editor_command(
+                EditorCommand {
+                    tab: tab.id,
+                    document: DocumentId(document),
+                    draft,
+                    selection: start..end,
+                    intent,
+                },
+                history,
+            )
+            .wait()
+            .await
+            .map_err(command_error)?;
+        Ok(json!(result))
     }
     async fn close_session(&self, session: Uuid) -> Result<(), Value> {
-        self.selection
-            .lock()
-            .unwrap()
-            .connection
-            .begin_close(SessionId(session));
-        let already_closed = self
-            .workspaces
-            .lock()
-            .unwrap()
-            .get(&SessionId(session))
-            .is_some_and(|workspace| {
-                *workspace.engine.subscribe_session().borrow()
-                    == dzban_core::execution::SessionPhase::Closed
-            });
-        let outcome = if already_closed {
-            Ok(())
-        } else {
-            self.context.close(SessionId(session)).await
-        };
-        let cleanup = outcome.as_ref().map(|_| ()).map_err(|error| match error {
-            ApplicationError::Operation(error) => error.clone(),
-            _ => ExecutionError::Message(error.to_string()),
-        });
-        self.selection
-            .lock()
-            .unwrap()
-            .connection
-            .finish_close(SessionId(session), &cleanup);
-        outcome.map_err(|error| application_error("close", error))?;
+        self.context
+            .close(SessionId(session))
+            .await
+            .map_err(|error| application_error("close", error))?;
         let _readers = self.readers.acquire_many(16).await.unwrap();
-        let mut workspaces = self.workspaces.lock().unwrap();
-        if let Some(workspace) = workspaces.get_mut(&SessionId(session)) {
-            let documents: Vec<_> = workspace
-                .documents
-                .documents()
-                .iter()
-                .map(QueryDocument::id)
-                .collect();
-            workspace
-                .documents
-                .retire_closed_session(&workspace.engine)
-                .map_err(execution_error)?;
-            let mut saved = self.saved_outputs.lock().unwrap();
-            for document in documents {
-                saved.remove(&document);
-            }
-        }
-        workspaces.remove(&SessionId(session));
-        self.history_views
-            .lock()
-            .unwrap()
-            .remove(&SessionId(session));
         Ok(())
     }
     fn controls(&self) -> Value {
-        let snapshot = self.context.tabs.snapshot();
-        let selected = snapshot
-            .tabs
-            .iter()
-            .find(|tab| Some(tab.id) == snapshot.selected)
-            .and_then(|tab| tab.engine.as_ref())
-            .map(|engine| SessionInteraction::from_engine(engine));
-        let mut interaction = self.interaction.lock().unwrap();
-        interaction.transition(AppEvent::SessionSelected(selected));
-        let primary_action = match interaction.primary_action() {
-            PrimaryAction::Run => "run",
-            PrimaryAction::Stop => "stop",
-            PrimaryAction::Stopping => "stopping",
-            PrimaryAction::Unavailable => "unavailable",
-        };
-        json!({"session":interaction.scope.map(|scope|scope.session.0), "query":interaction.scope.and_then(|scope|scope.query.map(|id|id.0)), "primary_action":primary_action})
+        json!(self.context.tabs.controls())
     }
-    async fn history(&self, session: Uuid) -> Result<QueryHistoryStore, Value> {
-        let profile = self
-            .workspaces
-            .lock()
-            .unwrap()
-            .get(&SessionId(session))
-            .map(|workspace| workspace.profile.clone())
-            .ok_or_else(|| failure("unknown_session", "Session is not open"))?;
+
+    fn history_location(&self) -> Result<HistoryLocation, Value> {
         let path = self
             .history_directory
             .lock()
             .unwrap()
             .as_ref()
             .map(|directory| directory.0.join("history.json"));
-        if self.injected_config && path.is_none() {
-            return Err(failure("closed", "Fixture history is closed"));
+        match path {
+            Some(path) => Ok(HistoryLocation::File(path)),
+            None if self.injected_config => Err(failure("closed", "Fixture history is closed")),
+            None => Ok(HistoryLocation::Default),
         }
-        tokio::task::spawn_blocking(move || match path {
-            Some(path) => QueryHistoryStore::load_from_path(path, &profile),
-            None => QueryHistoryStore::load(&profile),
-        })
-        .await
-        .map_err(|_| failure("worker_failed", "History worker failed"))?
-        .map_err(|error| failure("history", error))
+    }
+
+    async fn history(&self, session: Uuid) -> Result<QueryHistoryStore, Value> {
+        let tab = self
+            .context
+            .tabs
+            .session(SessionId(session))
+            .ok_or_else(|| failure("unknown_session", "Session is not open"))?;
+        let profile = tab
+            .profile
+            .ok_or_else(|| failure("unknown_session", "Session is not open"))?;
+        self.history_location()?
+            .load(profile.0)
+            .await
+            .map_err(command_error)
     }
     fn snapshot(&self, document: &QueryDocument) -> Value {
-        let snapshot = document_snapshot(document);
-        let saved = self.saved_outputs.lock().unwrap();
-        match saved
-            .get(&document.id())
-            .filter(|saved| snapshot["generation"] == saved.generation)
-        {
-            Some(saved) => saved.project(snapshot),
-            None => snapshot,
-        }
+        json!(self.context.outputs.document(document))
+    }
+
+    fn output_reader(
+        &self,
+        session: Uuid,
+        document: Uuid,
+        generation: u64,
+    ) -> Result<dzban_core::outputs::ResultReader, Value> {
+        self.context
+            .result_reader(ResultScope {
+                session: SessionId(session),
+                document: DocumentId(document),
+                generation,
+            })
+            .map_err(output_error)
     }
 
     async fn result_page(
         &self,
         session: Uuid,
-        id: Uuid,
+        document: Uuid,
         generation: u64,
         start: usize,
         count: usize,
     ) -> Result<dzban_core::ResultSet, Value> {
-        let (_, document) = self.document(session, id)?;
-        let snapshot = document.snapshot();
-        if snapshot.output_generation != generation {
-            return Err(failure("stale_output", "Output generation has changed"));
-        }
-        let saved = self
-            .saved_outputs
-            .lock()
-            .unwrap()
-            .get(&document.id())
-            .filter(|saved| saved.generation == generation)
-            .cloned();
-        let page = if let Some(saved) = saved {
-            saved.page(start, count)
-        } else {
-            let result = snapshot
-                .operation
-                .and_then(|operation| operation.capture)
-                .and_then(|capture| capture.result)
-                .ok_or_else(|| failure("result_unavailable", "Result is not available"))?;
-            result
-                .read_page(start, count)
-                .await
-                .map_err(execution_error)?
-        };
-        if !document.accepts_output(generation) {
-            return Err(failure("stale_output", "Output generation has changed"));
-        }
-        Ok(page)
+        self.output_reader(session, document, generation)?
+            .page(start, count)
+            .await
+            .map_err(output_error)
     }
 
     async fn observe_controls(&self, session: Uuid, stream: Arc<Stream>) {
         let engine = self
-            .workspaces
-            .lock()
-            .unwrap()
-            .get(&SessionId(session))
-            .map(|workspace| workspace.engine.clone());
+            .context
+            .tabs
+            .session(SessionId(session))
+            .and_then(|tab| tab.engine);
         let Some(engine) = engine else {
             stream.publish(failure("unknown_session", "Session is not open"));
             return;
@@ -679,18 +722,18 @@ impl State {
         session: Uuid,
         document: Uuid,
     ) -> Result<(Arc<QueryEngine>, QueryDocument), Value> {
-        let workspaces = self.workspaces.lock().unwrap();
-        let workspace = workspaces
-            .get(&SessionId(session))
+        let tab = self
+            .context
+            .tabs
+            .session(SessionId(session))
             .ok_or_else(|| failure("unknown_session", "Session is not open"))?;
-        let document = workspace
-            .documents
-            .documents()
-            .iter()
-            .find(|item| item.id() == DocumentId(document))
-            .cloned()
-            .ok_or_else(|| failure("unknown_document", "Document is not open"))?;
-        Ok((workspace.engine.clone(), document))
+        if tab.document.id() != DocumentId(document) {
+            return Err(failure("unknown_document", "Document is not open"));
+        }
+        let engine = tab
+            .engine
+            .ok_or_else(|| failure("unknown_session", "Session is not open"))?;
+        Ok((engine, tab.document))
     }
 
     async fn command(&self, command: Command) -> Value {
@@ -710,6 +753,8 @@ impl State {
                 | Command::ReadViewport { .. }
                 | Command::ReadPage { .. }
                 | Command::ReadCell { .. }
+                | Command::StartExport { .. }
+                | Command::ReadExport { .. }
                 | Command::HistoryList { .. }
                 | Command::RestoreHistory { .. }
                 | Command::SavedPlan { .. }
@@ -729,29 +774,109 @@ impl State {
             Command::TestMetrics {} => {
                 let (record_bytes, peak_record_bytes) = crate::transport::byte_metrics();
                 let (buffer_bytes, peak_buffer_bytes) = crate::handles::byte_metrics();
+                let observers = self
+                    .observers
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|observer| !observer.task.is_finished())
+                    .count();
                 Ok(
-                    json!({"record_bytes":record_bytes,"peak_record_bytes":peak_record_bytes,"buffer_bytes":buffer_bytes,"peak_buffer_bytes":peak_buffer_bytes}),
+                    json!({"record_bytes":record_bytes,"peak_record_bytes":peak_record_bytes,"buffer_bytes":buffer_bytes,"peak_buffer_bytes":peak_buffer_bytes,"observers":observers,"export_readers":self.exports.lock().unwrap().len()}),
                 )
             }
-            Command::Tabs {} => {
-                let snapshot = self.context.tabs.snapshot();
-                let tabs: Vec<_> = snapshot.tabs.iter().map(|tab| json!({
-                    "tab": tab.id.0, "session": tab.engine.as_ref().map(|engine| engine.id().0),
-                    "profile": tab.profile.0, "backend": tab.backend,
-                    "document": tab.document.id().0,
-                    "execution": document_snapshot(&tab.document)["execution"],
-                    "phase": match &tab.phase { dzban_core::tabs::TabPhase::Connecting => "connecting", dzban_core::tabs::TabPhase::Ready => "ready", dzban_core::tabs::TabPhase::Failed(_) => "error" }
-                })).collect();
-                Ok(json!({"tabs": tabs, "selected": snapshot.selected.map(|tab|tab.0)}))
+            Command::Tabs {} => Ok(self.tab_inventory()),
+            Command::RestoreWorkspace { .. } => Err(failure(
+                "invalid_command",
+                "Restoration must use a streaming response",
+            )),
+            Command::SaveWorkspace { location, drafts } => {
+                let drafts = drafts
+                    .into_iter()
+                    .map(|draft| (dzban_core::tabs::TabId(draft.tab), draft.draft))
+                    .collect();
+                self.context
+                    .save_workspace(location, drafts)
+                    .await
+                    .map_err(|error| failure("workspace", error))?;
+                Ok(json!({"saved":true}))
+            }
+
+            Command::OpenTab {
+                profile,
+                draft,
+                revision,
+            } => {
+                let tab = self
+                    .context
+                    .open_tab_at(
+                        profile.map(ConnectionProfileId),
+                        draft.unwrap_or_default(),
+                        revision,
+                    )
+                    .map_err(|error| application_error("tab", error))?;
+                Ok(json!({"tab":tab.0,"workspace":self.tab_inventory()}))
+            }
+            Command::CycleTabs {
+                direction,
+                revision,
+            } => {
+                if !self.context.tabs.cycle(direction, revision) {
+                    return Err(failure(
+                        "selection_superseded",
+                        "A newer navigation request is active",
+                    ));
+                }
+                Ok(self.tab_inventory())
+            }
+            Command::SelectTab { tab, revision } => {
+                if !self
+                    .context
+                    .tabs
+                    .select_at(Some(dzban_core::tabs::TabId(tab)), revision)
+                {
+                    return Err(failure(
+                        "selection_superseded",
+                        "Tab is missing or a newer navigation request is active",
+                    ));
+                }
+                Ok(self.tab_inventory())
+            }
+            Command::CloseTab { tab } | Command::CancelTabConnection { tab } => {
+                let retain = matches!(command, Command::CancelTabConnection { .. });
+                let tab = dzban_core::tabs::TabId(tab);
+                if self.context.tabs.find(tab).is_none() {
+                    return Err(failure("unknown_tab", "Tab is not open"));
+                }
+                let closing = if retain {
+                    self.context.start_cancel_connection(tab)
+                } else {
+                    self.context.start_close_tab(tab)
+                };
+                closing
+                    .map_err(|error| application_error("close", error))?
+                    .wait()
+                    .await
+                    .map_err(|error| application_error("close", error))?;
+                let _readers = self.readers.acquire_many(16).await.unwrap();
+                Ok(self.tab_inventory())
+            }
+            Command::SetTabDraft { tab, draft } => {
+                let tab = self
+                    .context
+                    .tabs
+                    .find(dzban_core::tabs::TabId(tab))
+                    .ok_or_else(|| failure("unknown_tab", "Tab is not open"))?;
+                tab.document.set_draft(draft);
+                Ok(self.tab_inventory())
             }
             Command::Controls {} => Ok(self.controls()),
             Command::Actions { session } => {
                 let engine = self
-                    .workspaces
-                    .lock()
-                    .unwrap()
-                    .get(&SessionId(session))
-                    .map(|workspace| workspace.engine.clone())
+                    .context
+                    .tabs
+                    .session(SessionId(session))
+                    .and_then(|tab| tab.engine)
                     .ok_or_else(|| failure("unknown_session", "Session is not open"))?;
                 let registry = engine
                     .action_registry()
@@ -765,11 +890,10 @@ impl State {
             }
             Command::Catalog { session, request } => {
                 let engine = self
-                    .workspaces
-                    .lock()
-                    .unwrap()
-                    .get(&SessionId(session))
-                    .map(|workspace| workspace.engine.clone())
+                    .context
+                    .tabs
+                    .session(SessionId(session))
+                    .and_then(|tab| tab.engine)
                     .ok_or_else(|| failure("unknown_session", "Session is not open"))?;
                 let entries = engine
                     .catalog(request.core())
@@ -793,92 +917,86 @@ impl State {
                 json!({"connections":self.context.subscribe_pending_connections().borrow().iter().map(|snapshot|json!({"request":snapshot.request.0,"profile":snapshot.profile.0,"connecting":matches!(snapshot.phase,dzban_core::application::ConnectionPhase::Connecting)})).collect::<Vec<_>>()}),
             ),
             Command::SelectSession { session, revision } => {
-                let mut selection = self.selection.lock().unwrap();
-                if !selection.accept_revision(revision) {
+                let tab = match session {
+                    Some(session) => Some(
+                        self.context
+                            .tabs
+                            .session(SessionId(session))
+                            .ok_or_else(|| failure("unknown_session", "Session is not open"))?
+                            .id,
+                    ),
+                    None => None,
+                };
+                if !self.context.tabs.select_at(tab, revision) {
                     return Err(failure(
                         "selection_superseded",
                         "A newer navigation request is active",
                     ));
                 }
-                if let Some(session) = session {
-                    if !self
-                        .workspaces
-                        .lock()
-                        .unwrap()
-                        .contains_key(&SessionId(session))
-                    {
-                        return Err(failure("unknown_session", "Session is not open"));
-                    }
-                    selection.connection = ConnectionSelection::Ready(SessionId(session));
-                } else {
-                    selection.connection.clear();
-                }
-                let tab = session
-                    .and_then(|id| self.context.tabs.session(SessionId(id)))
-                    .map(|tab| tab.id);
-                self.context.tabs.select(tab);
-                for workspace in self.workspaces.lock().unwrap().values_mut() {
-                    workspace.input_document = None;
-                    workspace.input_state = AppState::default();
-                }
-                drop(selection);
                 Ok(self.controls())
             }
-            Command::SelectDocument {
+            Command::CloseDocument { session, document } => {
+                let (_, current) = self.document(session, document)?;
+                if current.is_active() {
+                    return Err(execution_error(ExecutionError::Busy));
+                }
+                self.close_session(session).await?;
+                Ok(json!({"workspace_closed":true, "document":document, "selected":null}))
+            }
+            Command::AwaitPlan { session, revision } => {
+                let tab = self
+                    .context
+                    .tabs
+                    .session(SessionId(session))
+                    .ok_or_else(|| {
+                        failure(
+                            "selection_superseded",
+                            "The workspace is no longer selected",
+                        )
+                    })?;
+                self.context
+                    .tabs
+                    .await_plan(tab.id, revision)
+                    .await
+                    .map(|snapshot| json!(snapshot))
+                    .map_err(|error| application_error("selection_superseded", error))
+            }
+            Command::Interact {
                 session,
                 document,
                 revision,
+                draft,
+                start,
+                end,
+                input,
             } => {
-                let mut workspaces = self.workspaces.lock().unwrap();
-                let workspace = workspaces
-                    .get_mut(&SessionId(session))
-                    .ok_or_else(|| failure("unknown_session", "Session is not open"))?;
-                if revision.is_some_and(|revision| revision < workspace.selection_revision) {
-                    return Err(failure(
-                        "selection_superseded",
-                        "A newer document selection is active",
-                    ));
-                }
-                if !workspace.documents.select(DocumentId(document)) {
-                    return Err(failure("unknown_document", "Document is not open"));
-                }
-                if let Some(revision) = revision {
-                    workspace.selection_revision = revision;
-                }
-                Ok(self.snapshot(&workspace.documents.selected().unwrap()))
-            }
-            Command::CloseDocument { session, document } => {
-                let outcome = {
-                    let _readers = self.readers.acquire_many(16).await.unwrap();
-                    let mut workspaces = self.workspaces.lock().unwrap();
-                    let workspace = workspaces
-                        .get_mut(&SessionId(session))
-                        .ok_or_else(|| failure("unknown_session", "Session is not open"))?;
-                    workspace.documents.close_in_workspace(DocumentId(document))
-                };
-                match outcome {
-                    CloseDocument::Busy => Err(execution_error(ExecutionError::Busy)),
-                    CloseDocument::Missing => {
-                        Err(failure("unknown_document", "Document is not open"))
-                    }
-                    CloseDocument::CloseWorkspace => {
-                        self.close_session(session).await?;
-                        Ok(json!({"workspace_closed":true, "document":document, "selected":null}))
-                    }
-                    CloseDocument::Closed { .. } => {
-                        self.saved_outputs
-                            .lock()
-                            .unwrap()
-                            .remove(&DocumentId(document));
-                        let workspaces = self.workspaces.lock().unwrap();
-                        let selected = workspaces
-                            .get(&SessionId(session))
-                            .and_then(|workspace| workspace.documents.selected());
-                        Ok(
-                            json!({"workspace_closed":false, "document":document, "selected":selected.as_ref().map(|document| self.snapshot(document))}),
+                let tab = self
+                    .context
+                    .tabs
+                    .session(SessionId(session))
+                    .ok_or_else(|| {
+                        failure(
+                            "selection_superseded",
+                            "The workspace is no longer selected",
                         )
-                    }
-                }
+                    })?;
+                let outcome = self
+                    .context
+                    .start_input_command(
+                        dzban_core::commands::InputCommand {
+                            tab: tab.id,
+                            document: DocumentId(document),
+                            revision,
+                            draft,
+                            selection: start..end,
+                            event: input,
+                        },
+                        self.history_location()?,
+                    )
+                    .wait()
+                    .await
+                    .map_err(command_error)?;
+                Ok(json!(outcome))
             }
             Command::Input {
                 session,
@@ -887,6 +1005,39 @@ impl State {
                 input,
             } => self.input(session, document, revision, input),
             Command::AwaitIdle { session } => self.await_idle(session).await,
+            Command::CheckHealth { session } => {
+                if let Some(tab) = self.context.tabs.session(SessionId(session)) {
+                    let _ = self
+                        .context
+                        .health
+                        .check_tab(&self.context, tab.id)
+                        .wait()
+                        .await;
+                }
+                Ok(json!(self.context.health.snapshot()))
+            }
+            Command::CheckProfileHealth { profile } => {
+                let config = self.config.lock().unwrap().clone();
+                self.context
+                    .health
+                    .check_named_profile(
+                        self.context.clone(),
+                        config.as_ref(),
+                        ConnectionProfileId(profile),
+                    )
+                    .await;
+                Ok(json!(self.context.health.snapshot()))
+            }
+            Command::CheckProfilesHealth {} => {
+                let config = self.config.lock().unwrap().clone();
+                if let Some(config) = config {
+                    self.context
+                        .health
+                        .check_all(self.context.clone(), config)
+                        .await;
+                }
+                Ok(json!(self.context.health.snapshot()))
+            }
             Command::ProbeSession {
                 session,
                 include_version,
@@ -912,7 +1063,11 @@ impl State {
                     json!({"profiles": config.databases.iter().map(|profile| json!({"name": profile.name, "backend": profile.backend})).collect::<Vec<_>>()}),
                 )
             }
-            Command::Connect { profile, revision } => {
+            Command::Connect {
+                tab,
+                profile,
+                revision,
+            } => {
                 let config =
                     self.config.lock().unwrap().clone().ok_or_else(|| {
                         failure("configuration", "Load profiles before connecting")
@@ -920,31 +1075,31 @@ impl State {
                 let profile = config
                     .resolve_profile(&ConnectionProfileId(profile), None)
                     .map_err(|error| failure("profile", error))?;
-                let profile_name = profile.name.clone();
-                let (connection, snapshots) = {
-                    let mut selection = self.selection.lock().unwrap();
-                    if !selection.accept_revision(revision) {
-                        return Err(failure(
-                            "selection_superseded",
-                            "A newer navigation request is active",
-                        ));
-                    }
-                    if !selection.connection.accepts_connection_request() {
-                        return Err(execution_error(ExecutionError::Busy));
-                    }
-                    let connection = self.context.start_connect_tab(profile);
-                    selection.connection.begin(connection.id);
-                    let snapshots = connection.subscribe();
-                    (connection, snapshots)
+                let current = self.context.tabs.snapshot();
+                if !self.context.tabs.select_at(current.selected, revision) {
+                    return Err(failure(
+                        "selection_superseded",
+                        "A newer navigation request is active",
+                    ));
+                }
+                if tab.is_none()
+                    && current
+                        .tabs
+                        .iter()
+                        .any(|tab| Some(tab.id) == current.selected && tab.engine.is_some())
+                {
+                    return Err(execution_error(ExecutionError::Busy));
+                }
+                let connection = if let Some(tab) = tab {
+                    self.context
+                        .start_connect_in_tab(dzban_core::tabs::TabId(tab), profile)
+                } else {
+                    self.context.start_connect_tab(profile)
                 };
+                let tab_id = connection.tab;
                 let request = connection.id.0;
                 let outcome = connection.wait().await;
-                let selected = self
-                    .selection
-                    .lock()
-                    .unwrap()
-                    .connection
-                    .apply(&snapshots.borrow());
+                let selected = self.context.tabs.snapshot().selected == tab_id;
                 let engine = outcome.map_err(|error| application_error("connection", error))?;
                 let session = engine.id();
                 let tab = self
@@ -953,42 +1108,33 @@ impl State {
                     .session(session)
                     .ok_or_else(|| failure("closed", "Query tab is closing"))?;
                 let tab_id = tab.id;
-                {
-                    let mut workspaces = self.workspaces.lock().unwrap();
-                    if *self.context.subscribe_phase().borrow() != ApplicationPhase::Running {
-                        return Err(failure("closed", "Application is closing"));
-                    }
-                    workspaces.insert(
-                        session,
-                        Workspace {
-                            engine,
-                            documents: QueryDocuments::from_document(tab.document),
-                            preview: PlanPreviewService::default(),
-                            peeks: Default::default(),
-                            preview_revision: 0,
-                            input_document: None,
-                            input_state: AppState::default(),
-                            profile: profile_name,
-                            selection_revision: 0,
-                        },
-                    );
+                if tab.phase != dzban_core::tabs::TabPhase::Ready {
+                    return Err(failure("closed", "Query tab is closing"));
                 }
+                if *self.context.subscribe_phase().borrow() != ApplicationPhase::Running
+                    || !self
+                        .context
+                        .tabs
+                        .session(session)
+                        .is_some_and(|tab| tab.phase == dzban_core::tabs::TabPhase::Ready)
+                {
+                    return Err(failure("closed", "Application or query tab is closing"));
+                }
+                self.context
+                    .health
+                    .track_tab(&self.context, tab_id)
+                    .map_err(|error| application_error("health", error))?;
                 Ok(
                     json!({"request": request, "session": session.0, "tab": tab_id.0, "selected":selected}),
                 )
             }
-            Command::OpenDocument { session, revision } => {
-                let mut workspaces = self.workspaces.lock().unwrap();
-                let workspace = workspaces
-                    .get_mut(&SessionId(session))
-                    .ok_or_else(|| failure("unknown_session", "Session is not open"))?;
-                let document = workspace
-                    .documents
-                    .selected()
-                    .ok_or_else(|| failure("unknown_document", "Tab has no query document"))?;
-                if let Some(revision) = revision {
-                    workspace.selection_revision = workspace.selection_revision.max(revision);
-                }
+            Command::OpenDocument { session } => {
+                let document = self
+                    .context
+                    .tabs
+                    .session(SessionId(session))
+                    .ok_or_else(|| failure("unknown_session", "Session is not open"))?
+                    .document;
                 Ok(self.snapshot(&document))
             }
             Command::ContextChanged { session, document } => {
@@ -1005,7 +1151,11 @@ impl State {
                 document.set_draft(draft);
                 Ok(self.snapshot(&document))
             }
-            Command::ObserveDocument { .. } | Command::ObserveControls { .. } => Err(failure(
+            Command::ObserveDocument { .. }
+            | Command::ObserveControls { .. }
+            | Command::ObserveInteraction { .. }
+            | Command::ObserveHealth {}
+            | Command::ObserveAttention {} => Err(failure(
                 "invalid_command",
                 "Observation must use a streaming response",
             )),
@@ -1042,31 +1192,12 @@ impl State {
                 count,
                 column_start,
                 column_count,
-            } => {
-                if count > MAX_PAGE_ROWS
-                    || column_count == 0
-                    || column_count > crate::viewport::MAX_VIEW_COLUMNS
-                {
-                    return Err(failure(
-                        "invalid_page",
-                        "Viewport exceeds the row or column limit",
-                    ));
-                }
-                let page = self
-                    .result_page(session, document, generation, start, count)
-                    .await?;
-                if column_start >= page.columns.len()
-                    || column_count > page.columns.len() - column_start
-                {
-                    return Err(failure(
-                        "invalid_page",
-                        "Viewport columns are outside the schema",
-                    ));
-                }
-                Ok(
-                    json!({"document":document,"generation":generation,"start":start,"column_start":column_start,"rows":crate::viewport::cells(page,column_start,column_count)}),
-                )
-            }
+            } => self
+                .output_reader(session, document, generation)?
+                .viewport(start, count, column_start, column_count)
+                .await
+                .map(|page| json!(page))
+                .map_err(output_error),
             Command::ReadPage {
                 session,
                 document,
@@ -1074,9 +1205,6 @@ impl State {
                 start,
                 count,
             } => {
-                if count > MAX_PAGE_ROWS {
-                    return Err(failure("invalid_page", "Page exceeds MAX_PAGE_ROWS"));
-                }
                 let page = self
                     .result_page(session, document, generation, start, count)
                     .await?;
@@ -1099,122 +1227,75 @@ impl State {
                 let history = self.history(session).await?;
                 Ok(json!({"entries": history.entries()}))
             }
-            Command::HistoryList { session } => {
-                let store = Arc::new(self.history(session).await?);
-                let view = crate::history::HistoryView {
-                    revision: Uuid::new_v4(),
-                    store,
-                };
-                let response = crate::history::summaries(&view);
-                self.history_views
-                    .lock()
-                    .unwrap()
-                    .insert(SessionId(session), view);
-                Ok(response)
-            }
+            Command::HistoryList { session } => self
+                .context
+                .history_list(SessionId(session), self.history_location()?)
+                .await
+                .map(|projection| json!(projection))
+                .map_err(output_error),
             Command::RestoreHistory {
                 session,
                 document,
                 history_revision,
                 index,
-            } => {
-                let (_, document) = self.document(session, document)?;
-                let store = {
-                    let views = self.history_views.lock().unwrap();
-                    let view = views
-                        .get(&SessionId(session))
-                        .filter(|view| view.revision == history_revision)
-                        .ok_or_else(|| failure("stale_history", "History has been refreshed"))?;
-                    if index >= view.store.entries().len() {
-                        return Err(failure("history_entry", "History entry is missing"));
-                    }
-                    view.store.clone()
-                };
-                let mut saved = self.saved_outputs.lock().unwrap();
-                document.set_draft(store.entries()[index].sql.clone());
-                let generation = document.replace_output();
-                let output = crate::history::SavedOutput {
-                    generation,
-                    store,
+            } => self
+                .context
+                .restore_history(
+                    SessionId(session),
+                    DocumentId(document),
+                    history_revision,
                     index,
-                };
-                let snapshot = output.project(document_snapshot(&document));
-                saved.insert(document.id(), output);
-                Ok(snapshot)
-            }
+                )
+                .map(|projection| json!(projection))
+                .map_err(output_error),
             Command::SavedPlan {
                 session,
                 document,
                 generation,
-            } => {
-                let (_, document) = self.document(session, document)?;
-                if !document.accepts_output(generation) {
-                    return Err(failure("stale_output", "Output generation has changed"));
-                }
-                let saved = self.saved_outputs.lock().unwrap();
-                let output = saved
-                    .get(&document.id())
-                    .filter(|saved| saved.generation == generation)
-                    .ok_or_else(|| failure("history_entry", "Saved output is not selected"))?;
-                Ok(json!({"plan":output.plan()}))
-            }
+            } => self
+                .context
+                .saved_plan(ResultScope {
+                    session: SessionId(session),
+                    document: DocumentId(document),
+                    generation,
+                })
+                .map(|plan| json!({"plan":plan}))
+                .map_err(output_error),
             Command::Peek {
                 session,
                 surface,
                 event,
                 elapsed_ms,
             } => {
-                let mut workspaces = self.workspaces.lock().unwrap();
-                let workspace = workspaces
-                    .get_mut(&SessionId(session))
+                let tab = self
+                    .context
+                    .tabs
+                    .session(SessionId(session))
                     .ok_or_else(|| failure("unknown_session", "Session is not open"))?;
-                let state = &mut workspace.peeks[match surface {
-                    crate::catalog::Surface::Plan => 0,
-                    crate::catalog::Surface::Row => 1,
-                }];
-                use crate::catalog::PeekEvent;
-                match event {
-                    PeekEvent::Show => state.show_transient(),
-                    PeekEvent::Open => {
-                        state.show_transient();
-                        state.pin();
-                    }
-                    PeekEvent::Pin => {
-                        state.pin();
-                    }
-                    PeekEvent::Close => {
-                        state.close();
-                    }
-                    PeekEvent::Release => match dzban_core::preview::preview_release(
+                self.context
+                    .tabs
+                    .peek(
+                        tab.id,
+                        surface,
+                        event,
                         std::time::Duration::from_millis(elapsed_ms.unwrap_or(0)),
-                    ) {
-                        dzban_core::preview::PreviewRelease::Pin => {
-                            state.pin();
-                        }
-                        dzban_core::preview::PreviewRelease::Hide => state.hide_transient(),
-                    },
-                    PeekEvent::Reset => state.hide_transient(),
-                }
-                Ok(json!({"visible":state.is_visible(), "pinned":state.is_pinned()}))
+                    )
+                    .map(|result| json!(result))
+                    .map_err(|error| application_error("peek", error))
             }
             Command::CancelPreview {
                 session,
                 request_revision,
             } => {
-                let mut workspaces = self.workspaces.lock().unwrap();
-                let workspace = workspaces
-                    .get_mut(&SessionId(session))
+                let tab = self
+                    .context
+                    .tabs
+                    .session(SessionId(session))
                     .ok_or_else(|| failure("unknown_session", "Session is not open"))?;
-                if let Some(revision) = request_revision {
-                    if revision < workspace.preview_revision {
-                        return Err(failure(
-                            "preview_invalidated",
-                            "A newer preview intent is active",
-                        ));
-                    }
-                    workspace.preview_revision = revision;
-                }
-                workspace.preview.cancel();
+                self.context
+                    .tabs
+                    .cancel_preview(tab.id, request_revision)
+                    .map_err(preview_error)?;
                 Ok(json!({"preview_canceled":true}))
             }
             Command::Preview {
@@ -1232,74 +1313,67 @@ impl State {
                     (None, None) => sql,
                     _ => return Err(failure("selection", "Both selection bounds are required")),
                 };
-                let (engine, document) = self.document(session, document)?;
-                if document.snapshot().draft_revision != revision {
-                    return Err(failure("preview_invalidated", "Draft revision has changed"));
+                let tab = self
+                    .context
+                    .tabs
+                    .session(SessionId(session))
+                    .ok_or_else(|| failure("unknown_session", "Session is not open"))?;
+                let result = self
+                    .context
+                    .tabs
+                    .start_preview(
+                        tab.id,
+                        DocumentId(document),
+                        revision,
+                        sql,
+                        request_revision,
+                    )
+                    .map_err(preview_error)?
+                    .wait()
+                    .await
+                    .map_err(preview_error)?;
+                let target = result.target;
+                Ok(
+                    json!({"request":target.request.0, "session":target.session.0, "document":target.document.0, "draft_revision":target.revision, "plan":PlanPresentation::from(&result.plan)}),
+                )
+            }
+            Command::StartExport {
+                export,
+                session,
+                document,
+                generation,
+                row,
+                column,
+                ranges,
+            } => {
+                let reader = self.output_reader(session, document, generation)?;
+                let output = match (row, column, ranges) {
+                    (Some(row), Some(column), None) => reader.export_cell(row, column).await,
+                    (None, None, Some(ranges)) => reader.export_markdown(ranges).await,
+                    _ => return Err(failure("invalid_selection", "Specify a cell or row ranges")),
                 }
-                let (service, target, mut updates) = {
-                    let selection = self.selection.lock().unwrap();
-                    if request_revision.is_some()
-                        && selection.connection != ConnectionSelection::Ready(SessionId(session))
-                    {
-                        return Err(failure(
-                            "preview_invalidated",
-                            "Workspace is no longer selected",
-                        ));
-                    }
-                    let mut workspaces = self.workspaces.lock().unwrap();
-                    let workspace = workspaces
-                        .get_mut(&SessionId(session))
-                        .ok_or_else(|| failure("unknown_session", "Session is not open"))?;
-                    if let Some(revision) = request_revision {
-                        if revision < workspace.preview_revision
-                            || workspace.documents.selected().map(|document| document.id())
-                                != Some(document.id())
-                        {
-                            return Err(failure(
-                                "preview_invalidated",
-                                "A newer preview context is active",
-                            ));
-                        }
-                        workspace.preview_revision = revision;
-                    }
-                    let service = workspace.preview.clone();
-                    let updates = service.subscribe();
-                    let target = service
-                        .schedule(engine, document.clone(), sql, PREVIEW_DELAY)
-                        .map_err(execution_error)?;
-                    (service, target, updates)
-                };
-                loop {
-                    let snapshot = updates.borrow_and_update().clone();
-                    if snapshot.target != Some(target)
-                        || matches!(snapshot.phase, PreviewPhase::Empty)
-                    {
-                        return Err(failure(
-                            "preview_invalidated",
-                            "Preview was dismissed or superseded",
-                        ));
-                    }
-                    match &snapshot.phase {
-                        PreviewPhase::Ready(plan) if service.accepts(&snapshot, &document) => {
-                            let plan = json!({"backend":plan.backend, "document":plan.document, "estimate":plan.estimate, "text":plan.text()});
-                            return Ok(
-                                json!({"request":target.request.0, "session":target.session.0, "document":target.document.0, "draft_revision":target.revision, "plan":plan}),
-                            );
-                        }
-                        PreviewPhase::Ready(_) => {
-                            return Err(failure(
-                                "preview_invalidated",
-                                "Preview no longer matches the document",
-                            ));
-                        }
-                        PreviewPhase::Failed(error) => return Err(execution_error(error.clone())),
-                        _ => (),
-                    }
-                    updates
-                        .changed()
-                        .await
-                        .map_err(|_| failure("preview_invalidated", "Preview observation ended"))?;
+                .map_err(output_error)?;
+                let mut exports = self.exports.lock().unwrap();
+                if exports.len() >= 16 || exports.contains_key(&export) {
+                    return Err(failure("admission", "Export reader limit reached"));
                 }
+                exports.insert(export, Arc::new(tokio::sync::Mutex::new(output)));
+                Ok(json!({"opened": true}))
+            }
+            Command::ReadExport { export } => {
+                let output = self
+                    .exports
+                    .lock()
+                    .unwrap()
+                    .get(&export)
+                    .cloned()
+                    .ok_or_else(|| failure("stale_output", "Export is closed"))?;
+                let result = output.lock().await.next_chunk().await;
+                result.map(|chunk| json!(chunk)).map_err(output_error)
+            }
+            Command::CloseExport { export } => {
+                self.exports.lock().unwrap().remove(&export);
+                Ok(json!({"closed": true}))
             }
             Command::ReadCell {
                 session,
@@ -1309,35 +1383,12 @@ impl State {
                 column,
                 offset,
                 count,
-            } => {
-                if count > 65_536 {
-                    return Err(failure(
-                        "invalid_chunk",
-                        "Cell chunks are limited to 65536 Unicode scalars",
-                    ));
-                }
-                let page = self
-                    .result_page(session, document, generation, row, 1)
-                    .await?;
-                let cell = page
-                    .rows
-                    .first()
-                    .and_then(|row| row.get(column))
-                    .ok_or_else(|| failure("invalid_cell", "Cell is outside the result"))?;
-                let (text, total) = match cell {
-                    dzban_core::ResultCell::Null => (None, 0),
-                    dzban_core::ResultCell::Text(text) => (
-                        Some(text.chars().skip(offset).take(count).collect::<String>()),
-                        text.chars().count(),
-                    ),
-                };
-                if offset > total {
-                    return Err(failure("invalid_chunk", "Cell offset is outside the value"));
-                }
-                Ok(
-                    json!({"document":document, "generation":generation, "row":row, "column":column, "offset":offset, "total":total, "text":text}),
-                )
-            }
+            } => self
+                .output_reader(session, document, generation)?
+                .cell(row, column, offset, count)
+                .await
+                .map(|chunk| json!(chunk))
+                .map_err(output_error),
             Command::Shutdown {} => {
                 self.context
                     .start_shutdown()
@@ -1346,18 +1397,7 @@ impl State {
                     .await
                     .map_err(|error| application_error("shutdown", error))?;
                 let _readers = self.readers.acquire_many(16).await.unwrap();
-                {
-                    let mut workspaces = self.workspaces.lock().unwrap();
-                    for workspace in workspaces.values_mut() {
-                        workspace
-                            .documents
-                            .retire_closed_session(&workspace.engine)
-                            .map_err(execution_error)?;
-                    }
-                    workspaces.clear();
-                    self.saved_outputs.lock().unwrap().clear();
-                    self.history_views.lock().unwrap().clear();
-                }
+                self.exports.lock().unwrap().clear();
                 let observers = std::mem::take(&mut *self.observers.lock().unwrap());
                 for observer in observers {
                     if let Some(stream) = observer.stream.upgrade() {
@@ -1367,81 +1407,10 @@ impl State {
                     let _ = observer.task.await;
                 }
                 self.history_directory.lock().unwrap().take();
-                Ok(json!({"shutdown": true}))
+                Ok(json!({"shutdown": true, "attention":self.context.attention().snapshot()}))
             }
         }
     }
-}
-
-fn document_snapshot(document: &QueryDocument) -> Value {
-    let snapshot = document.snapshot();
-    let execution = match snapshot.execution {
-        DocumentExecution::Idle => "idle",
-        DocumentExecution::Planning(_) => "planning",
-        DocumentExecution::Running(_) => "running",
-        DocumentExecution::Canceling(_) => "canceling",
-        DocumentExecution::Finished(_) => "finished",
-    };
-    let capture = snapshot
-        .operation
-        .as_ref()
-        .and_then(|operation| operation.capture.as_ref());
-    let result_phase = capture.map(|capture| match capture.phase {
-        ResultPhase::WaitingForSchema => "waiting_for_schema",
-        ResultPhase::Receiving => "receiving",
-        ResultPhase::Draining(_) => "draining",
-        ResultPhase::FailedAwaitingCleanup(_) => "failed_awaiting_cleanup",
-        ResultPhase::Finished(_) => "finished",
-    });
-    let error = snapshot
-        .completion
-        .as_ref()
-        .and_then(|completion| match completion {
-            Err(error) => Some(error.clone()),
-            Ok(completion) => completion.result.as_ref().err().cloned(),
-        });
-    let termination = capture.and_then(|capture| match &capture.phase {
-        ResultPhase::Finished(ResultTermination::Complete) => Some("complete"),
-        ResultPhase::Finished(ResultTermination::Limited(_)) => Some("limited"),
-        ResultPhase::Finished(ResultTermination::Canceled) => Some("canceled"),
-        ResultPhase::Finished(ResultTermination::Failed(_)) => Some("failed"),
-        _ => None,
-    });
-    let capture_error = capture.and_then(|capture| match &capture.phase {
-        ResultPhase::FailedAwaitingCleanup(error)
-        | ResultPhase::Finished(ResultTermination::Failed(error)) => Some(error),
-        _ => None,
-    });
-    let command = snapshot
-        .completion
-        .as_ref()
-        .and_then(|completion| completion.as_ref().ok())
-        .and_then(|completion| completion.result.as_ref().ok())
-        .and_then(|result| result.command.as_ref());
-    json!({
-        "document": snapshot.id.0,
-        "session": snapshot.session.map(|session| session.0),
-        "query": snapshot.execution.query().map(|query| query.0),
-        "generation": snapshot.output_generation,
-        "draft_revision": snapshot.draft_revision,
-        "title": snapshot.title,
-        "draft": snapshot.draft,
-        "execution": execution,
-        "result_phase": result_phase,
-        "result_available": capture.is_some_and(|capture| capture.result.is_some()),
-        "rows": capture.map_or(0, |capture| capture.rows),
-        "received_rows": capture.map_or(0, |capture| capture.received_rows),
-        "capture_bytes": capture.map_or(0, |capture| capture.bytes),
-        "termination": termination,
-        "capture_error": capture_error,
-        "command_result": command,
-        "started_at_seconds": snapshot.operation.as_ref().and_then(|operation| operation.started_wall_time).and_then(|start| start.duration_since(std::time::UNIX_EPOCH).ok()).map(|duration| duration.as_secs_f64()),
-        "elapsed_seconds": snapshot.operation.as_ref().map(|operation| operation.elapsed().as_secs_f64()),
-        "execution_plan": snapshot.plan.as_ref().map(|plan| json!({"backend": plan.backend, "estimate": plan.estimate})),
-        "execution_seconds": snapshot.completion.as_ref().and_then(|completion|completion.as_ref().ok()).and_then(|completion|completion.result.as_ref().ok()).map(|result|result.duration.as_secs_f64()),
-        "cutoff": capture.and_then(|capture| capture.cutoff),
-        "error": error,
-    })
 }
 
 #[cfg(all(test, feature = "test-fixtures"))]
@@ -1458,7 +1427,7 @@ mod tests {
             .unwrap();
         assert_eq!(result["state"], "connected");
         assert!(runtime.block_on(app.state.context.session_ids()).is_empty());
-        assert!(app.state.workspaces.lock().unwrap().is_empty());
+        assert!(app.state.context.tabs.snapshot().tabs.is_empty());
         runtime
             .block_on(async { app.state.context.start_shutdown().unwrap().wait().await })
             .unwrap();
@@ -1485,7 +1454,7 @@ mod tests {
             .unwrap()
             .0
             .join("history.json");
-        let legacy = json!({"version":1,"database":"fixture","entries":[QueryHistoryEntry::failure("legacy CLI query".into(),"legacy failure".into(),None,None)]});
+        let legacy = json!({"version":1,"database":"fixture","entries":[QueryHistoryEntry::failure("legacy CLI query".into(),"legacy failure".into(),Some(json!([{"Plan":{"Node Type":"Result","Plan Rows":1}}])),None)]});
         let original_bytes = serde_json::to_vec(&legacy).unwrap();
         std::fs::write(&path, &original_bytes).unwrap();
         let before = request(json!({"command":"history_list","session":session}));
@@ -1505,6 +1474,12 @@ mod tests {
         assert_eq!(restored["draft"], "legacy CLI query");
         assert_eq!(restored["termination"], "failed");
         assert_eq!(restored["rows"], 0);
+        let plan = request(
+            json!({"command":"saved_plan","session":session,"document":document,"generation":restored["generation"]}),
+        );
+        assert_eq!(plan["plan"]["text"], "Result  (rows=1)");
+        assert!(plan["plan"].get("backend").is_none());
+        assert!(plan["plan"].get("estimate").is_none());
         let refreshed = request(json!({"command":"history_list","session":session}));
         assert_eq!(refreshed["entries"].as_array().unwrap().len(), 2);
         assert_eq!(refreshed["entries"][0]["sql_preview"], "external CLI query");

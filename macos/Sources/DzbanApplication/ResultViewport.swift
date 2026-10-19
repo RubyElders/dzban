@@ -3,48 +3,33 @@ import Combine
 import DzbanBridge
 import Foundation
 
-public struct ResultScope: Hashable, Sendable {
-    public let session: UUID
-    public let document: UUID
-    public let generation: UInt64
-
-    public init(session: UUID, document: UUID, generation: UInt64) {
-        self.session = session
-        self.document = document
-        self.generation = generation
-    }
-}
-
-public struct ResultAddress: Hashable, Identifiable, Sendable {
-    public let scope: ResultScope
-    public let row: Int
-    public let column: Int
-    public var id: Self { self }
-    public init(scope: ResultScope, row: Int, column: Int) {
-        self.scope = scope
-        self.row = row
-        self.column = column
-    }
-}
-
 public protocol ResultSource: Sendable {
     func schema(_ scope: ResultScope) async throws -> ResultSchema
     func page(_ scope: ResultScope, start: Int, count: Int, columnStart: Int, columnCount: Int) async throws -> ViewportPage
     func cell(_ address: ResultAddress, offset: Int, count: Int) async throws -> CellChunk
+    func originalCell(_ address: ResultAddress) async throws -> OriginalCell
+    func markdown(_ scope: ResultScope, rows: IndexSet) async throws -> String
 }
 
 public struct BridgeResultSource: ResultSource {
-    let bridge: Bridge
-    public init(bridge: Bridge) { self.bridge = bridge }
+    private let application: ApplicationClient
+    public init(application: ApplicationClient) { self.application = application }
+    public init(bridge: Bridge) { self.init(application: ApplicationClient(bridge: bridge)) }
     public func schema(_ scope: ResultScope) async throws -> ResultSchema {
-        try await bridge.request(.resultSchema(session: scope.session, document: scope.document, generation: scope.generation), as: ResultSchema.self)
+        try await application.resultSchema(scope)
     }
     public func page(_ scope: ResultScope, start: Int, count: Int, columnStart: Int, columnCount: Int) async throws -> ViewportPage {
-        try await bridge.request(.readViewport(session: scope.session, document: scope.document, generation: scope.generation, start: start, count: count, columnStart: columnStart, columnCount: columnCount), as: ViewportPage.self)
+        try await application.resultPage(scope, start: start, count: count, columnStart: columnStart, columnCount: columnCount)
+    }
+    public func originalCell(_ address: ResultAddress) async throws -> OriginalCell {
+        let result = try await application.export(address.scope, row: address.row, column: address.column)
+        return OriginalCell(text: result.isNull ? nil : result.text)
+    }
+    public func markdown(_ scope: ResultScope, rows: IndexSet) async throws -> String {
+        try await application.export(scope, ranges: rows.rangeView.map { ExportRowRange(start: $0.lowerBound, end: $0.upperBound) }).text
     }
     public func cell(_ address: ResultAddress, offset: Int, count: Int) async throws -> CellChunk {
-        let scope = address.scope
-        return try await bridge.request(.readCell(session: scope.session, document: scope.document, generation: scope.generation, row: address.row, column: address.column, offset: offset, count: count), as: CellChunk.self)
+        try await application.resultCell(address, offset: offset, count: count)
     }
 }
 
@@ -175,10 +160,13 @@ public final class ResultViewport: ObservableObject {
             availableRows = max(0, document.rows)
             cache.trim(rows: availableRows)
             if let selected, selected.row >= availableRows {
-                self.selected = availableRows == 0 ? nil : ResultAddress(scope: next, row: availableRows - 1, column: selected.column)
+                do {
+                    let position = try ResultViewPolicy.clamp(ResultPosition(row: selected.row, column: selected.column), rows: availableRows, columns: columns.count)
+                    self.selected = position.map { ResultAddress(scope: next, row: $0.row, column: $0.column) }
+                } catch { loadError = error.localizedDescription }
             }
         }
-        terminal = document.execution == "finished"
+        terminal = document.execution == .finished
         canRead = document.generation > 0 && document.resultAvailable
         restoreTableSelection()
         revision &+= 1
@@ -187,9 +175,14 @@ public final class ResultViewport: ObservableObject {
 
     private func restoreTableSelection() {
         guard selected == nil, let scope, let position = tablePositions[scope.document],
-              !columns.isEmpty, position.headers == columns, availableRows > 0,
-              let row = position.row, row < availableRows || terminal else { return }
-        selected = ResultAddress(scope: scope, row: min(row, availableRows - 1), column: min(position.column, columns.count - 1))
+              let restored = restoration(for: position)?.selection else { return }
+        selected = ResultAddress(scope: scope, row: restored.row, column: restored.column)
+    }
+
+    func restoration(for position: ResultTablePosition) -> ResultViewDecision? {
+        do {
+            return try ResultViewPolicy.restore(previous: position.headers, current: columns, row: position.row, column: position.column, rows: availableRows, terminal: terminal)
+        } catch { loadError = error.localizedDescription; return nil }
     }
 
     public func retire() {
@@ -212,11 +205,10 @@ public final class ResultViewport: ObservableObject {
         guard let scope, !columns.isEmpty, !rows.isEmpty else { return }
         copyTask?.cancel()
         copyError = nil
-        let columns = columns
         let rows = rows.intersection(IndexSet(integersIn: 0..<availableRows))
         copyTask = Task { [weak self, source] in
             do {
-                let markdown = try await ResultMarkdown.read(source: source, scope: scope, columns: columns.map(\.name), rows: rows)
+                let markdown = try await ResultMarkdown.read(source: source, scope: scope, rows: rows)
                 try Task.checkCancellation()
                 guard self?.scope == scope else { return }
                 pasteboard.declareTypes([.string, NSPasteboard.PasteboardType("net.daringfireball.markdown")], owner: nil)
@@ -244,13 +236,14 @@ public final class ResultViewport: ObservableObject {
     func requestFocus() { focusRequest &+= 1 }
 
     public func select(row: Int, column: Int) {
-        guard let scope, row >= 0, row < availableRows, columns.indices.contains(column) else {
-            if selected != nil { selected = nil }
-            return
-        }
-        let next = ResultAddress(scope: scope, row: row, column: column)
-        if selected != next { selected = next }
+        guard let scope else { return }
+        do {
+            let position = try ResultViewPolicy.select(row: row, column: column, rows: availableRows, columns: columns.count)
+            let next = position.map { ResultAddress(scope: scope, row: $0.row, column: $0.column) }
+            if selected != next { selected = next }
+        } catch { loadError = error.localizedDescription }
     }
+
     #if DZBAN_TEST_FIXTURES
     public func resetMetrics() {
         peakCacheBytes = cacheBytes

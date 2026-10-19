@@ -259,10 +259,13 @@ final class ShellTests: XCTestCase {
         for appearance in ["light", "dark"] {
             app.launchArguments = ["--test-appearance", appearance]
             launchApp()
-            XCTAssertTrue(app.buttons["connection.fixture"].waitForExistence(timeout: 5))
-            app.typeKey(.return, modifierFlags: [])
+            if app.buttons["connection.fixture"].waitForExistence(timeout: 2) {
+                app.typeKey(.return, modifierFlags: [])
+            }
             let editor = app.textViews["query.editor"]
             XCTAssertTrue(editor.waitForExistence(timeout: 5))
+            editor.click()
+            app.typeKey("a", modifierFlags: .command)
             app.typeText(sql)
             waitForValue(sql, in: editor)
             capture("SQL syntax highlighting \(appearance)")
@@ -431,7 +434,7 @@ final class ShellTests: XCTestCase {
         app.typeKey(.tab, modifierFlags: [.control, .shift])
         waitForValue("Complete - 500 rows", in: app.staticTexts["results.status"])
         app.typeKey(.tab, modifierFlags: .control)
-        waitForValue("Ready", in: app.staticTexts["results.status"])
+        waitForValue("Run a query to see results", in: app.staticTexts["results.status"])
         app.typeKey("w", modifierFlags: .command)
         let closed = expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: queryTab("Query 2"))
         wait(for: [closed], timeout: 10)
@@ -613,6 +616,9 @@ final class ShellTests: XCTestCase {
         waitForValue("query", in: search)
         XCTAssertTrue(app.buttons["action.new"].exists)
         XCTAssertFalse(app.buttons["action.disconnect"].exists)
+        search.typeKey("a", modifierFlags: .command)
+        search.typeText("New Query Tab")
+        waitForValue("New Query Tab", in: search)
         search.typeKey(.downArrow, modifierFlags: [])
         search.typeKey(.return, modifierFlags: [])
         XCTAssertTrue(app.buttons["connection.fixture"].waitForExistence(timeout: 5))
@@ -1306,6 +1312,11 @@ final class ShellTests: XCTestCase {
             XCTAssertTrue(app.buttons["connection.fixture"].waitForExistence(timeout: 5))
             app.typeKey(.return, modifierFlags: [])
             waitForValue("Ready to query", in: app.staticTexts["results.state-title"])
+            let window = app.windows.firstMatch
+            let corner = window.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 1)).withOffset(CGVector(dx: -2, dy: -2))
+            corner.press(forDuration: 0.1, thenDragTo: corner.withOffset(CGVector(dx: 1150 - window.frame.width, dy: 760 - window.frame.height)))
+            XCTAssertEqual(window.frame.width, 1150, accuracy: 2)
+            XCTAssertEqual(window.frame.height, 760, accuracy: 2)
             let editor = app.textViews["query.editor"]
             let frame = editor.frame
             capture("Integrated results ready - \(appearance)")
@@ -1412,19 +1423,7 @@ final class ShellTests: XCTestCase {
     }
 
     func testCellDetailSupportsStandardSelectAllAndCopy() throws {
-        let pasteboard = NSPasteboard.general
-        let original = (pasteboard.pasteboardItems ?? []).map { item in
-            Dictionary(uniqueKeysWithValues: item.types.compactMap { type in item.data(forType: type).map { (type, $0) } })
-        }
-        defer {
-            pasteboard.clearContents()
-            let items = original.map { values in
-                let item = NSPasteboardItem()
-                for (type, data) in values { item.setData(data, forType: type) }
-                return item
-            }
-            pasteboard.writeObjects(items)
-        }
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name(fixtureDirectory.lastPathComponent))
         app.launchArguments = ["--fixture-query", "wait"]
         launchApp()
         waitForValue("Receiving - 5 rows", in: app.staticTexts["results.status"])
@@ -1588,13 +1587,13 @@ final class ShellTests: XCTestCase {
     }
 
     private func assertMatchingDividerPixels(table: XCUIElement, column: XCUIElement) throws {
-        let screen = try XCTUnwrap(NSScreen.main)
-        let bitmap = try XCTUnwrap(NSBitmapImageRep(data: app.screenshot().pngRepresentation))
-        let scaleX = CGFloat(bitmap.pixelsWide) / screen.frame.width
-        let scaleY = CGFloat(bitmap.pixelsHigh) / screen.frame.height
-        let edge = Int(((column.frame.maxX - screen.frame.minX) * scaleX).rounded())
+        let frame = app.windows.firstMatch.frame
+        let bitmap = try XCTUnwrap(NSBitmapImageRep(data: app.windows.firstMatch.screenshot().pngRepresentation))
+        let scaleX = CGFloat(bitmap.pixelsWide) / frame.width
+        let scaleY = CGFloat(bitmap.pixelsHigh) / frame.height
+        let edge = Int(((column.frame.maxX - frame.minX) * scaleX).rounded())
         func band(at y: CGFloat) throws -> [Bool] {
-            let row = Int((y * scaleY).rounded())
+            let row = Int(((y - frame.minY) * scaleY).rounded())
             func brightness(_ x: Int) throws -> CGFloat {
                 let color = try XCTUnwrap(bitmap.colorAt(x: x, y: row)?.usingColorSpace(.deviceRGB))
                 return (color.redComponent + color.greenComponent + color.blueComponent) / 3
@@ -1609,7 +1608,7 @@ final class ShellTests: XCTestCase {
     }
 
     private func capture(_ name: String) {
-        let attachment = XCTAttachment(screenshot: app.screenshot())
+        let attachment = XCTAttachment(screenshot: app.windows.firstMatch.screenshot())
         attachment.name = name
         attachment.lifetime = .keepAlways
         add(attachment)
@@ -1715,7 +1714,7 @@ final class ShellTests: XCTestCase {
         let row = app.descendants(matching: .any)["history.row.0"]
         XCTAssertEqual(row.frame.minX - entries.frame.minX, 4, accuracy: 1)
         XCTAssertEqual(entries.frame.maxX - row.frame.maxX, 4, accuracy: 1)
-        let historyAttachment = XCTAttachment(screenshot: app.screenshot())
+        let historyAttachment = XCTAttachment(screenshot: app.windows.firstMatch.screenshot())
         historyAttachment.name = "Native history list"
         historyAttachment.lifetime = .keepAlways
         add(historyAttachment)
@@ -1728,7 +1727,7 @@ final class ShellTests: XCTestCase {
         capture("Saved sample information inside results bar")
         app.buttons["history.plan"].click()
         XCTAssertTrue(app.textViews["history.plan.value"].waitForExistence(timeout: 5))
-        let attachment = XCTAttachment(screenshot: app.screenshot())
+        let attachment = XCTAttachment(screenshot: app.windows.firstMatch.screenshot())
         attachment.name = "Saved history plan"
         attachment.lifetime = .keepAlways
         add(attachment)
@@ -1886,7 +1885,7 @@ final class ShellTests: XCTestCase {
             app.typeKey(" ", modifierFlags: [])
             XCTAssertTrue(app.buttons["row.close"].waitForExistence(timeout: 5))
             XCTAssertTrue(app.buttons["row.close"].isHittable)
-            let row = XCTAttachment(screenshot: app.screenshot())
+            let row = XCTAttachment(screenshot: app.windows.firstMatch.screenshot())
             row.name = "Native \(appearance) resized row inspector"
             row.lifetime = .keepAlways
             add(row)

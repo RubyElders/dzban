@@ -19,7 +19,7 @@ extension LifecycleScenarios {
         func cancel() async throws { let _: Ack = try await bridge.request(.cancel(session: session, document: document), as: Ack.self) }
 
         try await submit("wait")
-        let early = try await resultState(bridge, session: session, document: document) { $0.rows == 5 && $0.execution != "finished" }
+        let early = try await resultState(bridge, session: session, document: document) { $0.rows == 5 && $0.execution != .finished }
         model.update(session: session, document: early)
         model.show(rows: 0..<5, columns: 0..<2)
         try await resultReady { model.value(row: 4, column: 1) != nil }
@@ -28,10 +28,10 @@ extension LifecycleScenarios {
         let original = try await FullCellReader.read(source: source, address: ResultAddress(scope: model.scope!, row: 0, column: 1))
         try expect(original.text == "žluť\nNULL😀")
         try await cancel()
-        _ = try await resultState(bridge, session: session, document: document) { $0.execution == "finished" }
+        _ = try await resultState(bridge, session: session, document: document) { $0.execution == .finished }
 
         try await submit("huge")
-        let huge = try await resultState(bridge, session: session, document: document) { $0.generation == 2 && $0.execution == "finished" }
+        let huge = try await resultState(bridge, session: session, document: document) { $0.generation == 2 && $0.execution == .finished }
         model.update(session: session, document: huge)
         model.show(rows: 0..<3, columns: 0..<2)
         try await resultReady { model.value(row: 2, column: 1) != nil }
@@ -46,7 +46,7 @@ extension LifecycleScenarios {
         } catch let error as BridgeFailure { try expect(error.kind == "page_too_large") }
 
         try await submit("wide")
-        let wide = try await resultState(bridge, session: session, document: document) { $0.generation == 3 && $0.execution == "finished" }
+        let wide = try await resultState(bridge, session: session, document: document) { $0.generation == 3 && $0.execution == .finished }
         model.update(session: session, document: wide)
         model.show(rows: 480..<500, columns: 120..<128)
         try await resultReady { model.value(row: 499, column: 127) != nil }
@@ -55,39 +55,39 @@ extension LifecycleScenarios {
         try expect(model.value(row: 0, column: 1) == nil)
 
         try await submit("limit")
-        let limited = try await resultState(bridge, session: session, document: document) { $0.generation == 4 && $0.resultPhase == "draining" }
+        let limited = try await resultState(bridge, session: session, document: document) { $0.generation == 4 && $0.resultPhase == .draining }
         model.update(session: session, document: limited)
         model.show(rows: 9980..<10000, columns: 0..<2)
         try await resultReady { model.value(row: 9999, column: 0) != nil }
         try expect(limited.rows == 10000 && limited.cutoff != nil)
         try expect(ResultStatus.describe(limited).contains("waiting for cleanup"))
         try await cancel()
-        _ = try await resultState(bridge, session: session, document: document) { $0.generation == 4 && $0.execution == "finished" }
+        _ = try await resultState(bridge, session: session, document: document) { $0.generation == 4 && $0.execution == .finished }
 
         try await submit("cleanup_failure")
-        let failing = try await resultState(bridge, session: session, document: document) { $0.generation == 5 && $0.resultPhase == "failed_awaiting_cleanup" }
+        let failing = try await resultState(bridge, session: session, document: document) { $0.generation == 5 && $0.resultPhase == .failedAwaitingCleanup }
         model.update(session: session, document: failing)
         model.show(rows: 0..<5, columns: 0..<2)
         try await resultReady { model.value(row: 4, column: 1) != nil }
         try expect(failing.captureError != nil)
         try await cancel()
-        _ = try await resultState(bridge, session: session, document: document) { $0.generation == 5 && $0.execution == "finished" }
+        _ = try await resultState(bridge, session: session, document: document) { $0.generation == 5 && $0.execution == .finished }
 
         try await submit("waiting")
-        let waiting = try await resultState(bridge, session: session, document: document) { $0.generation == 6 && $0.resultPhase == "waiting_for_schema" }
+        let waiting = try await resultState(bridge, session: session, document: document) { $0.generation == 6 && $0.resultPhase == .waitingForSchema }
         model.update(session: session, document: waiting)
         try expect(model.availableRows == 0 && model.value(row: 0, column: 0) == nil)
         try await cancel()
-        _ = try await resultState(bridge, session: session, document: document) { $0.generation == 6 && $0.execution == "finished" }
+        _ = try await resultState(bridge, session: session, document: document) { $0.generation == 6 && $0.execution == .finished }
 
         try await submit("command")
-        let command = try await resultState(bridge, session: session, document: document) { $0.generation == 7 && $0.execution == "finished" }
+        let command = try await resultState(bridge, session: session, document: document) { $0.generation == 7 && $0.execution == .finished }
         model.update(session: session, document: command)
         try expect(command.commandResult?.affectedRows == 7)
         try expect(ResultStatus.describe(command) == "7 rows affected")
         try expect(model.columns.isEmpty)
         try await submit("empty")
-        let empty = try await resultState(bridge, session: session, document: document) { $0.generation == 8 && $0.execution == "finished" }
+        let empty = try await resultState(bridge, session: session, document: document) { $0.generation == 8 && $0.execution == .finished }
         model.update(session: session, document: empty)
         try await resultReady { model.columns.count == 2 }
         try expect(model.availableRows == 0 && model.loadError == nil)

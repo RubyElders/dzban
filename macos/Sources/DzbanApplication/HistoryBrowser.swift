@@ -8,26 +8,37 @@ public final class HistoryBrowserModel: ObservableObject {
     @Published public private(set) var list: HistoryList?
     @Published public private(set) var loading = false
     @Published public private(set) var failure: String?
-    private let bridge: Bridge
+    private let application: ApplicationClient
     private var epoch: UInt64 = 0
     private var work: Task<Void, Never>?
-    public init(bridge: Bridge) { self.bridge = bridge }
+    public init(application: ApplicationClient) { self.application = application }
     public func refresh(session: UUID) {
         epoch &+= 1
         let epoch = epoch
         work?.cancel()
         loading = true
         failure = nil
-        work = Task { [weak self, bridge] in
+        work = Task { [weak self, application] in
             defer { if self?.epoch == epoch { self?.loading = false } }
             do {
-                let response = try await bridge.request(.historyList(session: session), as: HistoryList.self)
+                let response = try await application.history(session: session)
                 guard !Task.isCancelled, let self, self.epoch == epoch else { return }
                 self.list = response
             } catch {
                 guard !Task.isCancelled, let self, self.epoch == epoch else { return }
                 self.failure = (error as? BridgeFailure)?.message ?? error.localizedDescription
             }
+        }
+    }
+    @discardableResult
+    func presentationEnded() -> Task<Void, Never> {
+        epoch &+= 1
+        work?.cancel()
+        work = nil
+        let epoch = epoch
+        return Task { @MainActor [weak self] in
+            guard let self, self.epoch == epoch else { return }
+            self.retire()
         }
     }
     public func retire() { epoch &+= 1; work?.cancel(); work = nil; list = nil; loading = false }
@@ -56,7 +67,7 @@ struct HistoryBrowser: View {
         self.session = session
         self.close = close
         _focusPending = State(initialValue: store.historyFocused)
-        _model = StateObject(wrappedValue: HistoryBrowserModel(bridge: store.bridge))
+        _model = StateObject(wrappedValue: HistoryBrowserModel(application: store.application))
     }
 
     private var entries: [HistoryList.Entry] { model.list?.entries ?? [] }
@@ -87,7 +98,7 @@ struct HistoryBrowser: View {
                                         .frame(maxWidth: .infinity, alignment: .leading)
                                     Text(Date(timeIntervalSince1970: Double(entry.executedAt)).formatted(date: .abbreviated, time: .shortened))
                                         .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
-                                    Text(summary(entry)).font(.caption2).foregroundStyle(entry.status == "success" ? Color.secondary : Color.red).lineLimit(1)
+                                    Text(summary(entry)).font(.caption2).foregroundStyle(entry.status == .success ? Color.secondary : Color.red).lineLimit(1)
                                 }
                                 Button { select(entry.index); restore(entry.index) } label: { Image(systemName: "arrow.uturn.backward").frame(width: 20, height: 20) }
                                     .buttonStyle(.borderless).focusable(false)
@@ -128,7 +139,7 @@ struct HistoryBrowser: View {
         .frame(minWidth: 240, minHeight: 180)
         .background(Color(nsColor: .windowBackgroundColor))
         .focusable(entries.isEmpty).focusEffectDisabled().focused($emptyFocused)
-        .onKeyPress(.escape) { close(); return .handled }
+        .onKeyPress(.escape) { Task { @MainActor in close() }; return .handled }
         .overlay(alignment: .bottomLeading) {
             if let failure = model.failure {
                 Text(failure).font(.caption).foregroundStyle(.red).textSelection(.enabled).lineLimit(3).padding(8)
@@ -137,13 +148,13 @@ struct HistoryBrowser: View {
         }
         .task(id: session) { model.refresh(session: session) }
         .onChange(of: model.loading) { _, loading in if !loading { reconcileSelection() } }
-        .onChange(of: store.document?.execution) { _, execution in if execution == "finished" { model.refresh(session: session) } }
+        .onChange(of: store.document?.execution) { _, execution in if execution == .finished { model.refresh(session: session) } }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in model.refresh(session: session) }
-        .onDisappear { store.historyFocused = false; model.retire() }
+        .onDisappear { store.historyFocused = false; model.presentationEnded() }
     }
 
     private func summary(_ entry: HistoryList.Entry) -> String {
-        ([entry.status == "success" ? "Succeeded" : "Failed"] + [entry.rows.map { "\($0) rows" }, entry.durationMs.map { "\($0) ms" }].compactMap { $0 }).joined(separator: " - ")
+        ([entry.status == .success ? "Succeeded" : "Failed"] + [entry.rows.map { "\($0) rows" }, entry.durationMs.map { "\($0) ms" }].compactMap { $0 }).joined(separator: " - ")
     }
 
     private func select(_ index: Int, focus: Bool = true) {
@@ -176,24 +187,28 @@ struct HistoryBrowser: View {
     private func restore(_ index: Int) {
         guard !restoring, !model.loading, let revision = model.list?.revision else { return }
         restoring = true
-        Task {
+        Task { [store] in
             let restored = await store.restoreHistory(session: session, revision: revision, index: index)
             restoring = false
             if restored, let document = store.document {
                 focusedEntry = nil
                 emptyFocused = false
                 store.historyFocused = false
-                store.editor(for: document).requestFocus()
+                DispatchQueue.main.async { [weak store] in
+                    guard let store, store.navigationAvailable, store.selectedSession == session,
+                          store.document?.document == document.document, !store.historyFocused else { return }
+                    store.editor(for: document).requestFocus()
+                }
             }
         }
     }
 }
 
 struct SavedPlanButton: View {
-    let bridge: Bridge
+    let application: ApplicationClient
     let scope: ResultScope
     @State private var showing = false
-    @State private var plan: JSONValue?
+    @State private var plan: PlanPresentation?
     @State private var failure: String?
     @State private var loading = false
     var body: some View {
@@ -210,7 +225,7 @@ struct SavedPlanButton: View {
                     failure = nil
                     plan = nil
                     defer { loading = false }
-                    do { plan = try await bridge.request(.savedPlan(session: scope.session, document: scope.document, generation: scope.generation), as: SavedPlan.self).plan }
+                    do { plan = try await application.savedPlan(scope) }
                     catch { failure = (error as? BridgeFailure)?.message ?? error.localizedDescription }
                 }
             }

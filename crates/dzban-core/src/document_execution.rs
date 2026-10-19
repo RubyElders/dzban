@@ -27,6 +27,38 @@ impl DocumentCancellationHandle {
 }
 
 impl DocumentQueryHandle {
+    pub(crate) fn with_attention(
+        self,
+        attention: Arc<crate::attention::AttentionService>,
+        tab: crate::tabs::TabId,
+        document: QueryDocument,
+    ) -> Self {
+        let identity = crate::attention::CompletionIdentity {
+            output: crate::attention::ViewedOutput {
+                tab: tab.0,
+                document: self.document.0,
+                generation: self.generation,
+            },
+            session: self.session.0,
+            query: self.query.0,
+        };
+        attention.started(identity);
+        let (id, query, session, generation) =
+            (self.document, self.query, self.session, self.generation);
+        let task = tokio::spawn(async move {
+            let result = self.wait().await;
+            attention.document_finished(identity, &document.snapshot());
+            result
+        });
+        Self {
+            document: id,
+            query,
+            session,
+            generation,
+            task,
+        }
+    }
+
     pub async fn wait(self) -> Result<StreamedQueryCompletion, ExecutionError> {
         self.task
             .await
@@ -64,6 +96,7 @@ impl QueryDocument {
             state.execution = DocumentExecution::Planning(query.id);
             state.session = Some(query.session);
             state.output_generation = state.output_generation.checked_add(1).unwrap();
+            state.execution_generation = state.output_generation;
             state.plan = None;
             state.operation = None;
             state.completion = None;

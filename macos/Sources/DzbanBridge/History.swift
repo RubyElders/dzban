@@ -1,11 +1,13 @@
 import Foundation
 
+public enum HistoryOutcomeKind: String, Decodable, Sendable { case success, failure }
+
 public struct HistoryList: Decodable, Sendable {
     public struct Entry: Decodable, Sendable, Identifiable {
         public let index: Int
         public let sqlPreview: String
         public let executedAt: UInt64
-        public let status: String
+        public let status: HistoryOutcomeKind
         public let rows: Int?
         public let durationMs: UInt64?
         public var id: Int { index }
@@ -15,7 +17,7 @@ public struct HistoryList: Decodable, Sendable {
 }
 
 public struct SavedPlan: Decodable, Sendable {
-    public let plan: JSONValue?
+    public let plan: PlanPresentation?
 }
 
 extension BridgeCommand {

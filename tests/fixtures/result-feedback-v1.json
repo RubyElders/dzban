@@ -1,0 +1,1195 @@
+{
+  "schema": 1,
+  "cases": [
+    {
+      "name": "ready",
+      "document": {
+        "document": "00000000-0000-0000-0000-000000000001",
+        "session": "00000000-0000-0000-0000-000000000002",
+        "query": null,
+        "generation": 0,
+        "draft_revision": 18446744073709551615,
+        "title": "Query 1",
+        "draft": "SELECT 'žluť 😀';",
+        "execution": "idle",
+        "result_phase": null,
+        "result_available": false,
+        "rows": 0,
+        "received_rows": 0,
+        "capture_bytes": 0,
+        "termination": null,
+        "capture_error": null,
+        "command_result": null,
+        "started_at_seconds": null,
+        "elapsed_seconds": null,
+        "execution_plan": null,
+        "execution_seconds": null,
+        "cutoff": null,
+        "error": null,
+        "feedback": {
+          "status": "ready",
+          "empty": "ready",
+          "progress": null,
+          "rows": 0,
+          "total_rows": null,
+          "affected_rows": null,
+          "query_diagnostic": null,
+          "capture_diagnostic": null
+        }
+      },
+      "text": "Run a query to see results"
+    },
+    {
+      "name": "planning",
+      "document": {
+        "document": "00000000-0000-0000-0000-000000000001",
+        "session": "00000000-0000-0000-0000-000000000002",
+        "query": null,
+        "generation": 1,
+        "draft_revision": 18446744073709551615,
+        "title": "Query 1",
+        "draft": "SELECT 'žluť 😀';",
+        "execution": "planning",
+        "result_phase": null,
+        "result_available": false,
+        "rows": 5,
+        "received_rows": 0,
+        "capture_bytes": 0,
+        "termination": null,
+        "capture_error": null,
+        "command_result": null,
+        "started_at_seconds": null,
+        "elapsed_seconds": null,
+        "execution_plan": null,
+        "execution_seconds": null,
+        "cutoff": null,
+        "error": null,
+        "feedback": {
+          "status": "planning",
+          "empty": "no_rows",
+          "progress": "planning",
+          "rows": 5,
+          "total_rows": null,
+          "affected_rows": null,
+          "query_diagnostic": null,
+          "capture_diagnostic": null
+        }
+      },
+      "text": "Planning query"
+    },
+    {
+      "name": "waiting",
+      "document": {
+        "document": "00000000-0000-0000-0000-000000000001",
+        "session": "00000000-0000-0000-0000-000000000002",
+        "query": null,
+        "generation": 1,
+        "draft_revision": 18446744073709551615,
+        "title": "Query 1",
+        "draft": "SELECT 'žluť 😀';",
+        "execution": "running",
+        "result_phase": null,
+        "result_available": false,
+        "rows": 5,
+        "received_rows": 0,
+        "capture_bytes": 0,
+        "termination": null,
+        "capture_error": null,
+        "command_result": null,
+        "started_at_seconds": null,
+        "elapsed_seconds": null,
+        "execution_plan": null,
+        "execution_seconds": null,
+        "cutoff": null,
+        "error": null,
+        "feedback": {
+          "status": "waiting",
+          "empty": "no_rows",
+          "progress": "running",
+          "rows": 5,
+          "total_rows": null,
+          "affected_rows": null,
+          "query_diagnostic": null,
+          "capture_diagnostic": null
+        }
+      },
+      "text": "Waiting for results"
+    },
+    {
+      "name": "schema",
+      "document": {
+        "document": "00000000-0000-0000-0000-000000000001",
+        "session": "00000000-0000-0000-0000-000000000002",
+        "query": null,
+        "generation": 1,
+        "draft_revision": 18446744073709551615,
+        "title": "Query 1",
+        "draft": "SELECT 'žluť 😀';",
+        "execution": "running",
+        "result_phase": "waiting_for_schema",
+        "result_available": false,
+        "rows": 5,
+        "received_rows": 0,
+        "capture_bytes": 0,
+        "termination": null,
+        "capture_error": null,
+        "command_result": null,
+        "started_at_seconds": null,
+        "elapsed_seconds": null,
+        "execution_plan": null,
+        "execution_seconds": null,
+        "cutoff": null,
+        "error": null,
+        "feedback": {
+          "status": "waiting_for_schema",
+          "empty": "no_rows",
+          "progress": "running",
+          "rows": 5,
+          "total_rows": null,
+          "affected_rows": null,
+          "query_diagnostic": null,
+          "capture_diagnostic": null
+        }
+      },
+      "text": "Waiting for schema"
+    },
+    {
+      "name": "receiving",
+      "document": {
+        "document": "00000000-0000-0000-0000-000000000001",
+        "session": "00000000-0000-0000-0000-000000000002",
+        "query": null,
+        "generation": 1,
+        "draft_revision": 18446744073709551615,
+        "title": "Query 1",
+        "draft": "SELECT 'žluť 😀';",
+        "execution": "running",
+        "result_phase": "receiving",
+        "result_available": false,
+        "rows": 5,
+        "received_rows": 0,
+        "capture_bytes": 0,
+        "termination": null,
+        "capture_error": null,
+        "command_result": null,
+        "started_at_seconds": null,
+        "elapsed_seconds": null,
+        "execution_plan": null,
+        "execution_seconds": null,
+        "cutoff": null,
+        "error": null,
+        "feedback": {
+          "status": "receiving",
+          "empty": "no_rows",
+          "progress": "running",
+          "rows": 5,
+          "total_rows": null,
+          "affected_rows": null,
+          "query_diagnostic": null,
+          "capture_diagnostic": null
+        }
+      },
+      "text": "Receiving - 5 rows"
+    },
+    {
+      "name": "draining",
+      "document": {
+        "document": "00000000-0000-0000-0000-000000000001",
+        "session": "00000000-0000-0000-0000-000000000002",
+        "query": null,
+        "generation": 1,
+        "draft_revision": 18446744073709551615,
+        "title": "Query 1",
+        "draft": "SELECT 'žluť 😀';",
+        "execution": "running",
+        "result_phase": "draining",
+        "result_available": false,
+        "rows": 5,
+        "received_rows": 0,
+        "capture_bytes": 0,
+        "termination": null,
+        "capture_error": null,
+        "command_result": null,
+        "started_at_seconds": null,
+        "elapsed_seconds": null,
+        "execution_plan": null,
+        "execution_seconds": null,
+        "cutoff": "Rows",
+        "error": null,
+        "feedback": {
+          "status": "draining",
+          "empty": "no_rows",
+          "progress": "running",
+          "rows": 5,
+          "total_rows": null,
+          "affected_rows": null,
+          "query_diagnostic": null,
+          "capture_diagnostic": null
+        }
+      },
+      "text": "Truncated - 5 rows; waiting for cleanup"
+    },
+    {
+      "name": "capture_cleanup",
+      "document": {
+        "document": "00000000-0000-0000-0000-000000000001",
+        "session": "00000000-0000-0000-0000-000000000002",
+        "query": null,
+        "generation": 1,
+        "draft_revision": 18446744073709551615,
+        "title": "Query 1",
+        "draft": "SELECT 'žluť 😀';",
+        "execution": "running",
+        "result_phase": "failed_awaiting_cleanup",
+        "result_available": false,
+        "rows": 5,
+        "received_rows": 0,
+        "capture_bytes": 0,
+        "termination": null,
+        "capture_error": null,
+        "command_result": null,
+        "started_at_seconds": null,
+        "elapsed_seconds": null,
+        "execution_plan": null,
+        "execution_seconds": null,
+        "cutoff": null,
+        "error": null,
+        "feedback": {
+          "status": "capture_failed_awaiting_cleanup",
+          "empty": "no_rows",
+          "progress": "running",
+          "rows": 5,
+          "total_rows": null,
+          "affected_rows": null,
+          "query_diagnostic": null,
+          "capture_diagnostic": null
+        }
+      },
+      "text": "Result capture failed; waiting for cleanup"
+    },
+    {
+      "name": "finishing",
+      "document": {
+        "document": "00000000-0000-0000-0000-000000000001",
+        "session": "00000000-0000-0000-0000-000000000002",
+        "query": null,
+        "generation": 1,
+        "draft_revision": 18446744073709551615,
+        "title": "Query 1",
+        "draft": "SELECT 'žluť 😀';",
+        "execution": "running",
+        "result_phase": "finished",
+        "result_available": false,
+        "rows": 5,
+        "received_rows": 0,
+        "capture_bytes": 0,
+        "termination": "complete",
+        "capture_error": null,
+        "command_result": null,
+        "started_at_seconds": null,
+        "elapsed_seconds": null,
+        "execution_plan": null,
+        "execution_seconds": null,
+        "cutoff": null,
+        "error": null,
+        "feedback": {
+          "status": "finishing",
+          "empty": "no_rows",
+          "progress": "running",
+          "rows": 5,
+          "total_rows": null,
+          "affected_rows": null,
+          "query_diagnostic": null,
+          "capture_diagnostic": null
+        }
+      },
+      "text": "Finishing - 5 rows"
+    },
+    {
+      "name": "canceling",
+      "document": {
+        "document": "00000000-0000-0000-0000-000000000001",
+        "session": "00000000-0000-0000-0000-000000000002",
+        "query": null,
+        "generation": 1,
+        "draft_revision": 18446744073709551615,
+        "title": "Query 1",
+        "draft": "SELECT 'žluť 😀';",
+        "execution": "canceling",
+        "result_phase": "receiving",
+        "result_available": false,
+        "rows": 5,
+        "received_rows": 0,
+        "capture_bytes": 0,
+        "termination": null,
+        "capture_error": null,
+        "command_result": null,
+        "started_at_seconds": null,
+        "elapsed_seconds": null,
+        "execution_plan": null,
+        "execution_seconds": null,
+        "cutoff": null,
+        "error": null,
+        "feedback": {
+          "status": "canceling",
+          "empty": "no_rows",
+          "progress": "canceling",
+          "rows": 5,
+          "total_rows": null,
+          "affected_rows": null,
+          "query_diagnostic": null,
+          "capture_diagnostic": null
+        }
+      },
+      "text": "Canceling - 5 rows captured"
+    },
+    {
+      "name": "limited_rows",
+      "document": {
+        "document": "00000000-0000-0000-0000-000000000001",
+        "session": "00000000-0000-0000-0000-000000000002",
+        "query": null,
+        "generation": 1,
+        "draft_revision": 18446744073709551615,
+        "title": "Query 1",
+        "draft": "SELECT 'žluť 😀';",
+        "execution": "finished",
+        "result_phase": "finished",
+        "result_available": false,
+        "rows": 5,
+        "received_rows": 0,
+        "capture_bytes": 0,
+        "termination": "limited",
+        "capture_error": null,
+        "command_result": null,
+        "started_at_seconds": null,
+        "elapsed_seconds": null,
+        "execution_plan": null,
+        "execution_seconds": null,
+        "cutoff": "Rows",
+        "error": null,
+        "feedback": {
+          "status": "limited_by_rows",
+          "empty": "no_rows",
+          "progress": null,
+          "rows": 5,
+          "total_rows": null,
+          "affected_rows": null,
+          "query_diagnostic": null,
+          "capture_diagnostic": null
+        }
+      },
+      "text": "Truncated - 5 rows (row limit)"
+    },
+    {
+      "name": "limited_bytes",
+      "document": {
+        "document": "00000000-0000-0000-0000-000000000001",
+        "session": "00000000-0000-0000-0000-000000000002",
+        "query": null,
+        "generation": 1,
+        "draft_revision": 18446744073709551615,
+        "title": "Query 1",
+        "draft": "SELECT 'žluť 😀';",
+        "execution": "finished",
+        "result_phase": "finished",
+        "result_available": false,
+        "rows": 5,
+        "received_rows": 0,
+        "capture_bytes": 0,
+        "termination": "limited",
+        "capture_error": null,
+        "command_result": null,
+        "started_at_seconds": null,
+        "elapsed_seconds": null,
+        "execution_plan": null,
+        "execution_seconds": null,
+        "cutoff": "Bytes",
+        "error": null,
+        "feedback": {
+          "status": "limited_by_bytes",
+          "empty": "no_rows",
+          "progress": null,
+          "rows": 5,
+          "total_rows": null,
+          "affected_rows": null,
+          "query_diagnostic": null,
+          "capture_diagnostic": null
+        }
+      },
+      "text": "Truncated - 5 rows (byte limit)"
+    },
+    {
+      "name": "cutoff_cancellation_precedence",
+      "document": {
+        "document": "00000000-0000-0000-0000-000000000001",
+        "session": "00000000-0000-0000-0000-000000000002",
+        "query": null,
+        "generation": 1,
+        "draft_revision": 18446744073709551615,
+        "title": "Query 1",
+        "draft": "SELECT 'žluť 😀';",
+        "execution": "finished",
+        "result_phase": "finished",
+        "result_available": false,
+        "rows": 5,
+        "received_rows": 0,
+        "capture_bytes": 0,
+        "termination": "canceled",
+        "capture_error": null,
+        "command_result": null,
+        "started_at_seconds": null,
+        "elapsed_seconds": null,
+        "execution_plan": null,
+        "execution_seconds": null,
+        "cutoff": "Bytes",
+        "error": null,
+        "feedback": {
+          "status": "limited_by_bytes",
+          "empty": "canceled",
+          "progress": null,
+          "rows": 5,
+          "total_rows": null,
+          "affected_rows": null,
+          "query_diagnostic": null,
+          "capture_diagnostic": null
+        }
+      },
+      "text": "Truncated - 5 rows (byte limit)"
+    },
+    {
+      "name": "canceled",
+      "document": {
+        "document": "00000000-0000-0000-0000-000000000001",
+        "session": "00000000-0000-0000-0000-000000000002",
+        "query": null,
+        "generation": 1,
+        "draft_revision": 18446744073709551615,
+        "title": "Query 1",
+        "draft": "SELECT 'žluť 😀';",
+        "execution": "finished",
+        "result_phase": "finished",
+        "result_available": false,
+        "rows": 5,
+        "received_rows": 0,
+        "capture_bytes": 0,
+        "termination": "canceled",
+        "capture_error": null,
+        "command_result": null,
+        "started_at_seconds": null,
+        "elapsed_seconds": null,
+        "execution_plan": null,
+        "execution_seconds": null,
+        "cutoff": null,
+        "error": null,
+        "feedback": {
+          "status": "canceled",
+          "empty": "canceled",
+          "progress": null,
+          "rows": 5,
+          "total_rows": null,
+          "affected_rows": null,
+          "query_diagnostic": null,
+          "capture_diagnostic": null
+        }
+      },
+      "text": "Canceled - 5 rows"
+    },
+    {
+      "name": "failed",
+      "document": {
+        "document": "00000000-0000-0000-0000-000000000001",
+        "session": "00000000-0000-0000-0000-000000000002",
+        "query": null,
+        "generation": 1,
+        "draft_revision": 18446744073709551615,
+        "title": "Query 1",
+        "draft": "SELECT 'žluť 😀';",
+        "execution": "finished",
+        "result_phase": "finished",
+        "result_available": false,
+        "rows": 5,
+        "received_rows": 0,
+        "capture_bytes": 0,
+        "termination": "failed",
+        "capture_error": null,
+        "command_result": null,
+        "started_at_seconds": null,
+        "elapsed_seconds": null,
+        "execution_plan": null,
+        "execution_seconds": null,
+        "cutoff": null,
+        "error": null,
+        "feedback": {
+          "status": "failed",
+          "empty": "no_rows",
+          "progress": null,
+          "rows": 5,
+          "total_rows": null,
+          "affected_rows": null,
+          "query_diagnostic": null,
+          "capture_diagnostic": null
+        }
+      },
+      "text": "Failed - 5 rows"
+    },
+    {
+      "name": "command",
+      "document": {
+        "document": "00000000-0000-0000-0000-000000000001",
+        "session": "00000000-0000-0000-0000-000000000002",
+        "query": null,
+        "generation": 1,
+        "draft_revision": 18446744073709551615,
+        "title": "Query 1",
+        "draft": "SELECT 'žluť 😀';",
+        "execution": "finished",
+        "result_phase": "finished",
+        "result_available": false,
+        "rows": 0,
+        "received_rows": 0,
+        "capture_bytes": 0,
+        "termination": "complete",
+        "capture_error": null,
+        "command_result": {
+          "affected_rows": 7
+        },
+        "started_at_seconds": null,
+        "elapsed_seconds": null,
+        "execution_plan": null,
+        "execution_seconds": null,
+        "cutoff": null,
+        "error": null,
+        "feedback": {
+          "status": "command",
+          "empty": "command",
+          "progress": null,
+          "rows": 0,
+          "total_rows": null,
+          "affected_rows": 7,
+          "query_diagnostic": null,
+          "capture_diagnostic": null
+        }
+      },
+      "text": "7 rows affected"
+    },
+    {
+      "name": "command_unknown_rows",
+      "document": {
+        "document": "00000000-0000-0000-0000-000000000001",
+        "session": "00000000-0000-0000-0000-000000000002",
+        "query": null,
+        "generation": 1,
+        "draft_revision": 18446744073709551615,
+        "title": "Query 1",
+        "draft": "SELECT 'žluť 😀';",
+        "execution": "finished",
+        "result_phase": "finished",
+        "result_available": false,
+        "rows": 0,
+        "received_rows": 0,
+        "capture_bytes": 0,
+        "termination": "complete",
+        "capture_error": null,
+        "command_result": {
+          "affected_rows": null
+        },
+        "started_at_seconds": null,
+        "elapsed_seconds": null,
+        "execution_plan": null,
+        "execution_seconds": null,
+        "cutoff": null,
+        "error": null,
+        "feedback": {
+          "status": "command",
+          "empty": "command",
+          "progress": null,
+          "rows": 0,
+          "total_rows": null,
+          "affected_rows": null,
+          "query_diagnostic": null,
+          "capture_diagnostic": null
+        }
+      },
+      "text": "Command completed"
+    },
+    {
+      "name": "complete",
+      "document": {
+        "document": "00000000-0000-0000-0000-000000000001",
+        "session": "00000000-0000-0000-0000-000000000002",
+        "query": null,
+        "generation": 1,
+        "draft_revision": 18446744073709551615,
+        "title": "Query 1",
+        "draft": "SELECT 'žluť 😀';",
+        "execution": "finished",
+        "result_phase": "finished",
+        "result_available": false,
+        "rows": 5,
+        "received_rows": 0,
+        "capture_bytes": 0,
+        "termination": "complete",
+        "capture_error": null,
+        "command_result": null,
+        "started_at_seconds": null,
+        "elapsed_seconds": null,
+        "execution_plan": null,
+        "execution_seconds": null,
+        "cutoff": null,
+        "error": null,
+        "feedback": {
+          "status": "complete",
+          "empty": "no_rows",
+          "progress": null,
+          "rows": 5,
+          "total_rows": null,
+          "affected_rows": null,
+          "query_diagnostic": null,
+          "capture_diagnostic": null
+        }
+      },
+      "text": "Complete - 5 rows"
+    },
+    {
+      "name": "command_max_rows",
+      "document": {
+        "document": "00000000-0000-0000-0000-000000000001",
+        "session": "00000000-0000-0000-0000-000000000002",
+        "query": null,
+        "generation": 1,
+        "draft_revision": 18446744073709551615,
+        "title": "Query 1",
+        "draft": "SELECT 'žluť 😀';",
+        "execution": "finished",
+        "result_phase": "finished",
+        "result_available": false,
+        "rows": 0,
+        "received_rows": 0,
+        "capture_bytes": 0,
+        "termination": "complete",
+        "capture_error": null,
+        "command_result": {
+          "affected_rows": 18446744073709551615
+        },
+        "started_at_seconds": null,
+        "elapsed_seconds": null,
+        "execution_plan": null,
+        "execution_seconds": null,
+        "cutoff": null,
+        "error": null,
+        "feedback": {
+          "status": "command",
+          "empty": "command",
+          "progress": null,
+          "rows": 0,
+          "total_rows": null,
+          "affected_rows": 18446744073709551615,
+          "query_diagnostic": null,
+          "capture_diagnostic": null
+        }
+      },
+      "text": "18446744073709551615 rows affected"
+    },
+    {
+      "name": "saved",
+      "document": {
+        "document": "00000000-0000-0000-0000-000000000001",
+        "session": "00000000-0000-0000-0000-000000000002",
+        "query": null,
+        "generation": 1,
+        "draft_revision": 18446744073709551615,
+        "title": "Query 1",
+        "draft": "SELECT 'žluť 😀';",
+        "execution": "finished",
+        "result_phase": "finished",
+        "result_available": false,
+        "rows": 5,
+        "received_rows": 0,
+        "capture_bytes": 0,
+        "termination": "complete",
+        "capture_error": null,
+        "command_result": null,
+        "started_at_seconds": null,
+        "elapsed_seconds": null,
+        "execution_plan": null,
+        "execution_seconds": null,
+        "cutoff": null,
+        "error": null,
+        "history": true,
+        "history_total_rows": 500,
+        "feedback": {
+          "status": "saved_rows",
+          "empty": "no_rows",
+          "progress": null,
+          "rows": 5,
+          "total_rows": 500,
+          "affected_rows": null,
+          "query_diagnostic": null,
+          "capture_diagnostic": null
+        }
+      },
+      "text": "Saved - 5 of 500 rows"
+    },
+    {
+      "name": "saved_command",
+      "document": {
+        "document": "00000000-0000-0000-0000-000000000001",
+        "session": "00000000-0000-0000-0000-000000000002",
+        "query": null,
+        "generation": 1,
+        "draft_revision": 18446744073709551615,
+        "title": "Query 1",
+        "draft": "SELECT 'žluť 😀';",
+        "execution": "finished",
+        "result_phase": "finished",
+        "result_available": false,
+        "rows": 5,
+        "received_rows": 0,
+        "capture_bytes": 0,
+        "termination": "complete",
+        "capture_error": null,
+        "command_result": {
+          "affected_rows": 7
+        },
+        "started_at_seconds": null,
+        "elapsed_seconds": null,
+        "execution_plan": null,
+        "execution_seconds": null,
+        "cutoff": null,
+        "error": null,
+        "history": true,
+        "history_total_rows": 0,
+        "feedback": {
+          "status": "saved_command",
+          "empty": "command",
+          "progress": null,
+          "rows": 5,
+          "total_rows": 0,
+          "affected_rows": 7,
+          "query_diagnostic": null,
+          "capture_diagnostic": null
+        }
+      },
+      "text": "Saved command - 7 rows affected"
+    },
+    {
+      "name": "saved_command_unknown",
+      "document": {
+        "document": "00000000-0000-0000-0000-000000000001",
+        "session": "00000000-0000-0000-0000-000000000002",
+        "query": null,
+        "generation": 1,
+        "draft_revision": 18446744073709551615,
+        "title": "Query 1",
+        "draft": "SELECT 'žluť 😀';",
+        "execution": "finished",
+        "result_phase": "finished",
+        "result_available": false,
+        "rows": 5,
+        "received_rows": 0,
+        "capture_bytes": 0,
+        "termination": "complete",
+        "capture_error": null,
+        "command_result": {
+          "affected_rows": null
+        },
+        "started_at_seconds": null,
+        "elapsed_seconds": null,
+        "execution_plan": null,
+        "execution_seconds": null,
+        "cutoff": null,
+        "error": null,
+        "history": true,
+        "history_total_rows": 0,
+        "feedback": {
+          "status": "saved_command",
+          "empty": "command",
+          "progress": null,
+          "rows": 5,
+          "total_rows": 0,
+          "affected_rows": null,
+          "query_diagnostic": null,
+          "capture_diagnostic": null
+        }
+      },
+      "text": "Saved command"
+    },
+    {
+      "name": "saved_failed",
+      "document": {
+        "document": "00000000-0000-0000-0000-000000000001",
+        "session": "00000000-0000-0000-0000-000000000002",
+        "query": null,
+        "generation": 1,
+        "draft_revision": 18446744073709551615,
+        "title": "Query 1",
+        "draft": "SELECT 'žluť 😀';",
+        "execution": "finished",
+        "result_phase": "finished",
+        "result_available": false,
+        "rows": 5,
+        "received_rows": 0,
+        "capture_bytes": 0,
+        "termination": "failed",
+        "capture_error": null,
+        "command_result": null,
+        "started_at_seconds": null,
+        "elapsed_seconds": null,
+        "execution_plan": null,
+        "execution_seconds": null,
+        "cutoff": null,
+        "error": {
+          "Message": "Fixture query failed"
+        },
+        "history": true,
+        "history_total_rows": 0,
+        "feedback": {
+          "status": "saved_failed",
+          "empty": "no_rows",
+          "progress": null,
+          "rows": 5,
+          "total_rows": 0,
+          "affected_rows": null,
+          "query_diagnostic": {
+            "kind": "message",
+            "backend": null,
+            "database_kind": null,
+            "message": "Fixture query failed",
+            "code": null,
+            "detail": null,
+            "hint": null,
+            "text": "Fixture query failed"
+          },
+          "capture_diagnostic": null
+        }
+      },
+      "text": "Saved query failed"
+    },
+    {
+      "name": "query_diagnostic",
+      "document": {
+        "document": "00000000-0000-0000-0000-000000000001",
+        "session": "00000000-0000-0000-0000-000000000002",
+        "query": null,
+        "generation": 1,
+        "draft_revision": 18446744073709551615,
+        "title": "Query 1",
+        "draft": "SELECT 'žluť 😀';",
+        "execution": "finished",
+        "result_phase": "finished",
+        "result_available": false,
+        "rows": 5,
+        "received_rows": 0,
+        "capture_bytes": 0,
+        "termination": "failed",
+        "capture_error": {
+          "Message": "Capture stopped"
+        },
+        "command_result": null,
+        "started_at_seconds": null,
+        "elapsed_seconds": null,
+        "execution_plan": null,
+        "execution_seconds": null,
+        "cutoff": null,
+        "error": {
+          "Database": {
+            "backend": "postgresql",
+            "kind": "Server",
+            "message": "Syntax error",
+            "code": {
+              "SqlState": "42601"
+            },
+            "detail": "At line 2",
+            "hint": "Check the expression"
+          }
+        },
+        "feedback": {
+          "status": "failed",
+          "empty": "no_rows",
+          "progress": null,
+          "rows": 5,
+          "total_rows": null,
+          "affected_rows": null,
+          "query_diagnostic": {
+            "kind": "database",
+            "backend": "postgresql",
+            "database_kind": "Server",
+            "message": "Syntax error",
+            "code": {
+              "kind": "sql_state",
+              "value": "42601"
+            },
+            "detail": "At line 2",
+            "hint": "Check the expression",
+            "text": "Syntax error\n42601\nAt line 2\nCheck the expression"
+          },
+          "capture_diagnostic": null
+        }
+      },
+      "text": "Failed - 5 rows"
+    },
+    {
+      "name": "canceled_diagnostic_hidden",
+      "document": {
+        "document": "00000000-0000-0000-0000-000000000001",
+        "session": "00000000-0000-0000-0000-000000000002",
+        "query": null,
+        "generation": 1,
+        "draft_revision": 18446744073709551615,
+        "title": "Query 1",
+        "draft": "SELECT 'žluť 😀';",
+        "execution": "finished",
+        "result_phase": "finished",
+        "result_available": false,
+        "rows": 5,
+        "received_rows": 0,
+        "capture_bytes": 0,
+        "termination": "canceled",
+        "capture_error": {
+          "Message": "Capture stopped"
+        },
+        "command_result": null,
+        "started_at_seconds": null,
+        "elapsed_seconds": null,
+        "execution_plan": null,
+        "execution_seconds": null,
+        "cutoff": null,
+        "error": {
+          "Database": {
+            "backend": "postgresql",
+            "kind": "Server",
+            "message": "Syntax error",
+            "code": {
+              "SqlState": "42601"
+            },
+            "detail": "At line 2",
+            "hint": "Check the expression"
+          }
+        },
+        "feedback": {
+          "status": "canceled",
+          "empty": "canceled",
+          "progress": null,
+          "rows": 5,
+          "total_rows": null,
+          "affected_rows": null,
+          "query_diagnostic": null,
+          "capture_diagnostic": null
+        }
+      },
+      "text": "Canceled - 5 rows"
+    },
+    {
+      "name": "capture_diagnostic",
+      "document": {
+        "document": "00000000-0000-0000-0000-000000000001",
+        "session": "00000000-0000-0000-0000-000000000002",
+        "query": null,
+        "generation": 1,
+        "draft_revision": 18446744073709551615,
+        "title": "Query 1",
+        "draft": "SELECT 'žluť 😀';",
+        "execution": "running",
+        "result_phase": "failed_awaiting_cleanup",
+        "result_available": false,
+        "rows": 5,
+        "received_rows": 0,
+        "capture_bytes": 0,
+        "termination": null,
+        "capture_error": {
+          "Message": "Fixture query failed"
+        },
+        "command_result": null,
+        "started_at_seconds": null,
+        "elapsed_seconds": null,
+        "execution_plan": null,
+        "execution_seconds": null,
+        "cutoff": null,
+        "error": null,
+        "feedback": {
+          "status": "capture_failed_awaiting_cleanup",
+          "empty": "no_rows",
+          "progress": "running",
+          "rows": 5,
+          "total_rows": null,
+          "affected_rows": null,
+          "query_diagnostic": null,
+          "capture_diagnostic": {
+            "kind": "message",
+            "backend": null,
+            "database_kind": null,
+            "message": "Fixture query failed",
+            "code": null,
+            "detail": null,
+            "hint": null,
+            "text": "Fixture query failed"
+          }
+        }
+      },
+      "text": "Result capture failed; waiting for cleanup"
+    }
+  ],
+  "diagnostics": [
+    {
+      "error": "Busy",
+      "presentation": {
+        "kind": "busy",
+        "backend": null,
+        "database_kind": null,
+        "message": "Busy",
+        "code": null,
+        "detail": null,
+        "hint": null,
+        "text": "Busy"
+      }
+    },
+    {
+      "error": "Canceled",
+      "presentation": {
+        "kind": "canceled",
+        "backend": null,
+        "database_kind": null,
+        "message": "Canceled",
+        "code": null,
+        "detail": null,
+        "hint": null,
+        "text": "Query canceled"
+      }
+    },
+    {
+      "error": "Closed",
+      "presentation": {
+        "kind": "closed",
+        "backend": null,
+        "database_kind": null,
+        "message": "Closed",
+        "code": null,
+        "detail": null,
+        "hint": null,
+        "text": "Closed"
+      }
+    },
+    {
+      "error": {
+        "Message": "Fixture query failed"
+      },
+      "presentation": {
+        "kind": "message",
+        "backend": null,
+        "database_kind": null,
+        "message": "Fixture query failed",
+        "code": null,
+        "detail": null,
+        "hint": null,
+        "text": "Fixture query failed"
+      }
+    },
+    {
+      "error": {
+        "Message": "Canceled"
+      },
+      "presentation": {
+        "kind": "message",
+        "backend": null,
+        "database_kind": null,
+        "message": "Canceled",
+        "code": null,
+        "detail": null,
+        "hint": null,
+        "text": "Query canceled"
+      }
+    },
+    {
+      "error": {
+        "Unsupported": "EXPLAIN"
+      },
+      "presentation": {
+        "kind": "unsupported",
+        "backend": null,
+        "database_kind": null,
+        "message": "EXPLAIN",
+        "code": null,
+        "detail": null,
+        "hint": null,
+        "text": "Unsupported: EXPLAIN"
+      }
+    },
+    {
+      "error": {
+        "Database": {
+          "backend": "postgresql",
+          "kind": "Server",
+          "message": "Syntax error",
+          "code": {
+            "SqlState": "42601"
+          },
+          "detail": "At line 2",
+          "hint": "Check the expression"
+        }
+      },
+      "presentation": {
+        "kind": "database",
+        "backend": "postgresql",
+        "database_kind": "Server",
+        "message": "Syntax error",
+        "code": {
+          "kind": "sql_state",
+          "value": "42601"
+        },
+        "detail": "At line 2",
+        "hint": "Check the expression",
+        "text": "Syntax error\n42601\nAt line 2\nCheck the expression"
+      }
+    },
+    {
+      "error": {
+        "Database": {
+          "backend": "clickhouse",
+          "kind": "Server",
+          "message": "Syntax error",
+          "code": {
+            "ClickHouse": 62
+          },
+          "detail": "At line 2",
+          "hint": "Check the expression"
+        }
+      },
+      "presentation": {
+        "kind": "database",
+        "backend": "clickhouse",
+        "database_kind": "Server",
+        "message": "Syntax error",
+        "code": {
+          "kind": "clickhouse",
+          "value": 62
+        },
+        "detail": "At line 2",
+        "hint": "Check the expression",
+        "text": "Syntax error\n62.0\nAt line 2\nCheck the expression"
+      }
+    },
+    {
+      "error": {
+        "Database": {
+          "backend": "postgresql",
+          "kind": "Transport",
+          "message": "Disconnected",
+          "code": null,
+          "detail": null,
+          "hint": null
+        }
+      },
+      "presentation": {
+        "kind": "database",
+        "backend": "postgresql",
+        "database_kind": "Transport",
+        "message": "Disconnected",
+        "code": null,
+        "detail": null,
+        "hint": null,
+        "text": "Disconnected"
+      }
+    }
+  ]
+}

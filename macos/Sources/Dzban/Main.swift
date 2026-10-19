@@ -13,10 +13,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         do {
             #if DZBAN_TEST_FIXTURES
             let bridge = try ProcessInfo.processInfo.arguments.contains("--empty-config") ? Bridge() : Bridge.fixture()
-            store = ApplicationStore(bridge: bridge, resultSource: fixtureResultSource(bridge), restorationURL: ApplicationStore.defaultRestorationURL)
+            store = ApplicationStore(bridge: bridge, resultSource: fixtureResultSource(bridge), restoreWorkspace: true)
             #else
             let bridge = try Bridge()
-            store = ApplicationStore(bridge: bridge, restorationURL: ApplicationStore.defaultRestorationURL)
+            store = ApplicationStore(bridge: bridge, restoreWorkspace: true)
             #endif
             initializationError = nil
         } catch {

@@ -3,6 +3,286 @@ use dzban_macos_bridge::{
 };
 use serde_json::{Value, json};
 
+#[test]
+fn result_view_policy_is_pure_bounded_and_uses_owned_buffers() {
+    use dzban_macos_bridge::dzban_result_view;
+    assert_eq!(unsafe { dzban_result_view(std::ptr::null(), 0) }.status, 7);
+    for invalid in [
+        b"{}".as_slice(),
+        b"\xff".as_slice(),
+        br#"{"action":"select","row":0,"column":0,"rows":1,"columns":1,"extra":true}"#.as_slice(),
+    ] {
+        assert_eq!(
+            unsafe { dzban_result_view(invalid.as_ptr(), invalid.len()) }.status,
+            7
+        );
+    }
+    let input = serde_json::to_vec(&json!({"action":"clamp", "position":{"row":u64::MAX,"column":u64::MAX}, "rows":3,"columns":2})).unwrap();
+    let buffer = unsafe { dzban_result_view(input.as_ptr(), input.len()) };
+    assert_eq!(buffer.status, 0);
+    let record: Value =
+        serde_json::from_slice(unsafe { std::slice::from_raw_parts(buffer.data, buffer.length) })
+            .unwrap();
+    assert_eq!(record["schema"], 1);
+    assert_eq!(record["payload"]["selection"], json!({"row":2,"column":1}));
+    assert!(dzban_buffer_release(buffer.token));
+    assert!(!dzban_buffer_release(buffer.token));
+}
+
+#[test]
+fn syntax_readers_are_bounded_lossless_revision_scoped_and_independent_of_an_app() {
+    use dzban_macos_bridge::{dzban_syntax_create, dzban_syntax_read};
+    assert_eq!(unsafe { dzban_syntax_create([0xff].as_ptr(), 1, 1) }, 0);
+    let empty = unsafe { dzban_syntax_create(std::ptr::null(), 0, u64::MAX) };
+    assert_ne!(empty, 0);
+    let buffer = dzban_syntax_read(empty);
+    assert_eq!(buffer.status, 0);
+    assert_eq!(buffer.length, 56);
+    let words: Vec<_> = unsafe { std::slice::from_raw_parts(buffer.data, buffer.length) }
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|bytes| u64::from_le_bytes(*bytes))
+        .collect();
+    assert_eq!(words, [1, u64::MAX, 0, 0, 0, 0, 1]);
+    assert!(dzban_buffer_release(buffer.token));
+    assert!(dzban_release(empty));
+    assert_eq!(dzban_syntax_read(empty).status, 4);
+    let source = "SELECT '😀', 1;\n".repeat(1000);
+    let expected: Vec<_> = dzban_core::sql::SqlLexer::new(&source, 1).collect();
+    let reader = unsafe { dzban_syntax_create(source.as_ptr(), source.len(), u64::MAX) };
+    assert_ne!(reader, 0);
+    let mut tokens = Vec::new();
+    loop {
+        let buffer = dzban_syntax_read(reader);
+        assert_eq!(buffer.status, 0);
+        assert!(buffer.length < 256 * 1024);
+        assert_eq!(buffer.length % 8, 0);
+        let words: Vec<_> = unsafe { std::slice::from_raw_parts(buffer.data, buffer.length) }
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|bytes| u64::from_le_bytes(*bytes))
+            .collect();
+        assert_eq!(words[0], 1);
+        assert_eq!(words[1], u64::MAX);
+        assert_eq!(words[2], source.len() as u64);
+        assert!(words[5] <= 512);
+        assert_eq!(words.len(), 7 + words[5] as usize * 7);
+        tokens.extend(
+            words[7..]
+                .as_chunks::<7>()
+                .0
+                .iter()
+                .map(|token| token.to_vec()),
+        );
+        let done = words[6] == 1;
+        assert!(dzban_buffer_release(buffer.token));
+        if done {
+            break;
+        }
+    }
+    let expected: Vec<_> = expected
+        .iter()
+        .map(|token| {
+            vec![
+                token.start.bytes as u64,
+                token.start.scalars as u64,
+                token.start.utf16 as u64,
+                token.end.bytes as u64,
+                token.end.scalars as u64,
+                token.end.utf16 as u64,
+                token.kind as u64,
+            ]
+        })
+        .collect();
+    assert_eq!(tokens, expected);
+    assert!(dzban_release(reader));
+    assert!(!dzban_release(reader));
+    assert_eq!(dzban_syntax_read(reader).status, 4);
+}
+
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn attention_identity_and_visibility_cross_the_ffi_without_document_observers() {
+    fn attention(app: u64, input: Value) -> Value {
+        let bytes = serde_json::to_vec(&input).unwrap();
+        let buffer =
+            unsafe { dzban_macos_bridge::dzban_attention(app, bytes.as_ptr(), bytes.len()) };
+        assert_eq!(buffer.status, 0);
+        let record: Value = serde_json::from_slice(unsafe {
+            std::slice::from_raw_parts(buffer.data, buffer.length)
+        })
+        .unwrap();
+        assert!(dzban_buffer_release(buffer.token));
+        assert!(!dzban_buffer_release(buffer.token));
+        record["payload"].clone()
+    }
+    assert_eq!(
+        unsafe { dzban_macos_bridge::dzban_attention(0, std::ptr::null(), 0) }.status,
+        4
+    );
+    let app = dzban_macos_bridge::dzban_create_fixture();
+    assert_eq!(
+        unsafe { dzban_macos_bridge::dzban_attention(app, std::ptr::null(), 0) }.status,
+        7
+    );
+    let connection = request(app, json!({"command":"connect", "profile":"fixture"}));
+    let tab = &connection["tab"];
+    let session = &connection["session"];
+    let document =
+        request(app, json!({"command":"open_document", "session":session}))["document"].clone();
+    attention(
+        app,
+        json!({"event":"visibility", "visible":false,"viewed":null}),
+    );
+    let query = request(
+        app,
+        json!({"command":"submit","session":session,"document":document,"sql":"few"}),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let finished = loop {
+        assert!(std::time::Instant::now() < deadline);
+        let snapshot = attention(
+            app,
+            json!({"event":"visibility","visible":false,"viewed":null}),
+        );
+        if !snapshot["tabs"][0]["unseen"].is_null() {
+            break snapshot;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    assert_eq!(finished["request_revision"], 1);
+    assert_eq!(
+        finished["tabs"][0]["unseen"]["identity"]["query"],
+        query["query"]
+    );
+    let stale = attention(
+        app,
+        json!({"event":"visibility","visible":true,"viewed":{"tab":tab,"document":document,"generation":0}}),
+    );
+    assert!(!stale["tabs"][0]["unseen"].is_null());
+    let viewed = attention(
+        app,
+        json!({"event":"viewed","output":{"tab":tab,"document":document,"generation":query["generation"]}}),
+    );
+    assert!(viewed["tabs"][0]["unseen"].is_null());
+    assert_eq!(viewed["tabs"][0]["completion_revision"], 1);
+    let repeated = attention(
+        app,
+        json!({"event":"visibility","visible":false,"viewed":null}),
+    );
+    assert!(repeated["tabs"][0]["unseen"].is_null());
+    assert_eq!(repeated["request_revision"], 1);
+    let shutdown = request(app, json!({"command":"shutdown"}));
+    assert!(shutdown["attention"]["tabs"].as_array().unwrap().is_empty());
+    assert_eq!(shutdown["attention"]["cancel_attention"], true);
+    assert!(dzban_release(app));
+}
+
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn foreign_workspace_restore_survives_observer_loss_and_saves_only_logical_state() {
+    let path = std::env::temp_dir().join(format!(
+        "dzban-foreign-workspace-{}.json",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::write(&path, serde_json::to_vec(&json!({"version":1,"tabs":[{"profile":"fixture-slow","draft":"SELECT '😀';"},{"draft":"chooser"},{"profile":"missing","draft":"retry"}],"selected":99})).unwrap()).unwrap();
+    let app = dzban_macos_bridge::dzban_create_fixture();
+    let command = json!({"command":"restore_workspace","location":{"host":"macos","path":path}});
+    let bytes = serde_json::to_vec(&command).unwrap();
+    let first = unsafe { dzban_send(app, bytes.as_ptr(), bytes.len()) };
+    let mut revision = 0;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        assert!(std::time::Instant::now() < deadline);
+        let buffer = dzban_wait(first, revision, 1000);
+        if buffer.status == 1 {
+            continue;
+        }
+        assert_eq!(buffer.status, 0);
+        let record: Value = serde_json::from_slice(unsafe {
+            std::slice::from_raw_parts(buffer.data, buffer.length)
+        })
+        .unwrap();
+        revision = record["revision"].as_u64().unwrap();
+        assert!(dzban_buffer_release(buffer.token));
+        if record["payload"]["workspace"]["tabs"][0]["phase"] == "connecting" {
+            break;
+        }
+    }
+    assert!(dzban_release(first));
+    let second = unsafe { dzban_send(app, bytes.as_ptr(), bytes.len()) };
+    revision = 0;
+    let restored = loop {
+        assert!(std::time::Instant::now() < deadline);
+        let buffer = dzban_wait(second, revision, 1000);
+        if buffer.status == 1 {
+            continue;
+        }
+        assert_eq!(buffer.status, 0);
+        let record: Value = serde_json::from_slice(unsafe {
+            std::slice::from_raw_parts(buffer.data, buffer.length)
+        })
+        .unwrap();
+        revision = record["revision"].as_u64().unwrap();
+        assert!(dzban_buffer_release(buffer.token));
+        if record["payload"]["progress"]["finished"] == true {
+            break record["payload"].clone();
+        }
+    };
+    assert!(dzban_release(second));
+    let tabs = restored["workspace"]["tabs"].as_array().unwrap();
+    assert_eq!(tabs.len(), 3);
+    assert_eq!(restored["progress"]["issues"].as_array().unwrap().len(), 1);
+    assert_eq!(restored["workspace"]["selected"], tabs[2]["tab"]);
+    assert_eq!(tabs[0]["snapshot"]["draft"], "SELECT '😀';");
+    assert_eq!(tabs[0]["snapshot"]["generation"], 0);
+    assert_eq!(tabs[0]["phase"], "ready");
+    assert_eq!(
+        request(
+            app,
+            json!({"command":"actions","session":tabs[0]["session"]})
+        )["session"],
+        tabs[0]["session"]
+    );
+    assert_eq!(
+        request(
+            app,
+            json!({"command":"save_workspace","location":{"host":"macos","path":path},"drafts":[{"tab":tabs[0]["tab"],"draft":"not yet sent"}]})
+        )["saved"],
+        true
+    );
+    let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(saved["tabs"][0]["draft"], "not yet sent");
+    assert_eq!(saved["selected"], 2);
+    assert_eq!(saved.as_object().unwrap().len(), 3);
+    assert_eq!(saved["tabs"][0].as_object().unwrap().len(), 2);
+    let large = "😀".repeat(300_000);
+    assert_eq!(
+        request(
+            app,
+            json!({"command":"set_tab_draft","tab":tabs[0]["tab"],"draft":large})
+        )["failure"]["kind"],
+        "invalid_input"
+    );
+    assert_eq!(
+        request(
+            app,
+            json!({"command":"save_workspace","location":{"host":"macos","path":path},"drafts":[{"tab":tabs[0]["tab"],"draft":large}]})
+        )["saved"],
+        true
+    );
+    let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(saved["tabs"][0]["draft"], large);
+    assert_eq!(
+        request(app, json!({"command":"shutdown"}))["shutdown"],
+        true
+    );
+    assert!(dzban_release(app));
+    std::fs::remove_file(path).unwrap();
+}
+
 fn request(app: u64, command: Value) -> Value {
     let bytes = serde_json::to_vec(&command).unwrap();
     let operation = unsafe { dzban_send(app, bytes.as_ptr(), bytes.len()) };
@@ -235,6 +515,43 @@ fn viewport_previews_bound_huge_cells_and_close_drains_admitted_reads() {
         json!({"command":"read_cell", "session":session,"document":document,"generation":1,"row":0,"column":1,"offset":2_499_998,"count":8}),
     );
     assert_eq!(tail["text"], "😀😀");
+    let export = uuid::Uuid::new_v4();
+    assert_eq!(
+        request(
+            app,
+            json!({"command":"start_export", "export":export, "session":session, "document":document, "generation":1, "row":0, "column":1})
+        )["opened"],
+        true
+    );
+    let chunk = request(app, json!({"command":"read_export", "export":export}));
+    assert_eq!(chunk["text"].as_str().unwrap().len(), 65_536);
+    assert_eq!(chunk["done"], false);
+    assert_eq!(
+        request(app, json!({"command":"close_export", "export":export}))["closed"],
+        true
+    );
+    assert_eq!(
+        request(app, json!({"command":"read_export", "export":export}))["failure"]["kind"],
+        "stale_output"
+    );
+    assert_eq!(
+        request(
+            app,
+            json!({"command":"start_export", "export":export, "session":session, "document":document, "generation":1, "row":1, "column":1})
+        )["opened"],
+        true
+    );
+    let null = request(app, json!({"command":"read_export", "export":export}));
+    assert_eq!(null["text"], "");
+    assert_eq!(null["is_null"], true);
+    assert_eq!(null["done"], true);
+    let chooser = request(app, json!({"command":"open_tab"}));
+    let closed_chooser = request(app, json!({"command":"close_tab", "tab":chooser["tab"]}));
+    assert!(closed_chooser.get("failure").is_none());
+    assert_eq!(
+        request(app, json!({"command":"read_export", "export":export}))["done"],
+        true
+    );
     let bytes = serde_json::to_vec(&viewport).unwrap();
     let operations: Vec<_> = (0..8)
         .map(|_| unsafe { dzban_send(app, bytes.as_ptr(), bytes.len()) })
@@ -244,6 +561,14 @@ fn viewport_previews_bound_huge_cells_and_close_drains_admitted_reads() {
         json!({"command":"close_document", "session":session, "document":document}),
     );
     assert_eq!(closed["workspace_closed"], true);
+    assert_eq!(
+        request(app, json!({"command":"read_export", "export":export}))["failure"]["kind"],
+        "stale_output"
+    );
+    assert_eq!(
+        request(app, json!({"command":"close_export", "export":export}))["closed"],
+        true
+    );
     for operation in operations {
         let buffer = dzban_wait(operation, 0, 10_000);
         assert_eq!(buffer.status, 0);
@@ -423,6 +748,7 @@ fn saved_history_replacement_keeps_background_execution_and_rejects_stale_pages(
     let started = running["started_at_seconds"].as_f64().unwrap();
     assert!(started > 1_700_000_000.0);
     assert_eq!(running["execution_plan"]["estimate"]["rows"], 500);
+    assert_eq!(running["feedback"]["progress"], "running");
     assert_eq!(running["execution_plan"]["estimate"]["total_cost"], 12.5);
     std::thread::sleep(std::time::Duration::from_millis(20));
     let later = snapshot();
@@ -438,6 +764,10 @@ fn saved_history_replacement_keeps_background_execution_and_rejects_stale_pages(
     assert_eq!(restored["execution"], "running");
     assert_eq!(restored["rows"], 200);
     assert_eq!(restored["history_total_rows"], 500);
+    assert_eq!(restored["feedback"]["status"], "saved_rows");
+    assert_eq!(restored["feedback"]["progress"], "running");
+    assert_eq!(restored["feedback"]["rows"], 200);
+    assert_eq!(restored["feedback"]["total_rows"], 500);
     assert_eq!(restored["draft"], sql);
     let generation = &restored["generation"];
     let page = request(
@@ -466,6 +796,7 @@ fn saved_history_replacement_keeps_background_execution_and_rejects_stale_pages(
         json!({"command":"saved_plan","session":session,"document":document,"generation":generation}),
     );
     assert_eq!(plan["plan"]["document"]["sql"], sql);
+    assert_eq!(plan["plan"]["text"], format!("fixture: true\nsql: {sql}"));
     request(app, json!({"command":"history_list","session":session}));
     let old = request(
         app,
@@ -557,6 +888,11 @@ fn probes_and_shared_input_preserve_query_and_selection_boundaries() {
     );
     assert_eq!(
         input(json!({"kind":"reset"}))["failure"]["kind"],
+        "selection_superseded"
+    );
+    request(app, json!({"command":"close_session","session":session}));
+    assert_eq!(
+        input(json!({"kind":"context_changed"}))["failure"]["kind"],
         "selection_superseded"
     );
     assert_eq!(
@@ -664,5 +1000,52 @@ fn shutdown_rejects_a_pending_tab_completion_without_losing_cleanup() {
     assert_eq!(record["payload"]["failure"]["kind"], "closed");
     assert!(dzban_buffer_release(buffer.token));
     assert!(dzban_release(operation));
+    assert!(dzban_release(app));
+}
+
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn shared_health_snapshots_track_sessions_and_bulk_profile_checks_without_extra_tabs() {
+    let app = dzban_macos_bridge::dzban_create_fixture();
+    request(app, json!({"command":"profiles"}));
+    let initial = request(app, json!({"command":"observe_health"}));
+    assert_eq!(initial["sessions"], json!([]));
+    let profile = request(
+        app,
+        json!({"command":"check_profile_health","profile":"fixture"}),
+    );
+    assert_eq!(profile["profiles"][0]["status"]["state"], "connected");
+    assert_eq!(profile["profiles"][0]["status"]["latency_micros"], 1);
+    assert_eq!(profile["sessions"], json!([]));
+    let connection = request(app, json!({"command":"connect","profile":"fixture"}));
+    let checked = request(
+        app,
+        json!({"command":"check_health","session":connection["session"]}),
+    );
+    assert_eq!(checked["sessions"][0]["session"], connection["session"]);
+    assert_eq!(checked["sessions"][0]["status"]["version"], "fixture");
+    assert_eq!(checked["sessions"][0]["status"]["probing"], false);
+    let bulk = request(app, json!({"command":"check_profiles_health"}));
+    assert_eq!(bulk["profiles"].as_array().unwrap().len(), 3);
+    assert_eq!(bulk["profiles"][1]["profile"], "fixture-failure");
+    assert_eq!(bulk["profiles"][1]["status"]["state"], "error");
+    assert_eq!(
+        request(app, json!({"command":"tabs"}))["tabs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    request(
+        app,
+        json!({"command":"close_session","session":connection["session"]}),
+    );
+    let retired = request(app, json!({"command":"observe_health"}));
+    assert_eq!(retired["sessions"], json!([]));
+    assert!(retired["revision"].as_u64().unwrap() > checked["revision"].as_u64().unwrap());
+    assert_eq!(
+        request(app, json!({"command":"shutdown"}))["shutdown"],
+        true
+    );
     assert!(dzban_release(app));
 }

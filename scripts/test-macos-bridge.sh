@@ -23,7 +23,11 @@ swift_arguments=(--package-path macos --scratch-path target/macos-swift
     -Xlinker -liconv -Xlinker -lSystem -Xlinker -lc -Xlinker -lm)
 swift run "${swift_arguments[@]}" DzbanBridgeCheck
 if xcrun --find xctest >/dev/null 2>&1; then
-    swift test "${swift_arguments[@]}"
+    filter_arguments=()
+    if [[ -n ${DZBAN_SWIFT_TEST_FILTER:-} ]]; then
+        filter_arguments=(--filter "$DZBAN_SWIFT_TEST_FILTER")
+    fi
+    swift test "${swift_arguments[@]}" "${filter_arguments[@]}"
 else
     echo 'Skipped XCTest: full Xcode is required. Standalone Swift lifecycle scenarios ran.'
 fi

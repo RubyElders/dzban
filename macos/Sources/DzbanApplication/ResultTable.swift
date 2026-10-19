@@ -16,6 +16,10 @@ struct ResultTable: NSViewRepresentable {
         return CGSize(width: width, height: height)
     }
     func makeNSView(context: Context) -> NSScrollView {
+        #if DZBAN_TEST_FIXTURES
+        ViewUpdateDiagnostics.frames.append("ResultTable.swift")
+        defer { ViewUpdateDiagnostics.frames.removeLast() }
+        #endif
         let table = NativeResultTable()
         let scroll = ResultScrollView(frame: .zero)
         scroll.hasVerticalScroller = true
@@ -50,6 +54,10 @@ struct ResultTable: NSViewRepresentable {
         return scroll
     }
     func updateNSView(_ scroll: NSScrollView, context: Context) {
+        #if DZBAN_TEST_FIXTURES
+        ViewUpdateDiagnostics.frames.append("ResultTable.swift")
+        defer { ViewUpdateDiagnostics.frames.removeLast() }
+        #endif
         guard let table = scroll.documentView as? NativeResultTable else { return }
         let coordinator = context.coordinator
         coordinator.inspect = inspect
@@ -233,12 +241,15 @@ struct ResultTable: NSViewRepresentable {
         func restorePosition() {
             guard let position = pendingPosition, !columns.isEmpty,
                   let table, let scroll = table.enclosingScrollView else { return }
-            guard columns == position.headers else {
+            guard let decision = model.restoration(for: position) else { return }
+            switch decision.restoration {
+            case .schemaChanged:
                 pendingPosition = nil
                 if let scope { model.tablePositions.removeValue(forKey: scope.document) }
                 return
+            case .apply: break
+            default: return
             }
-            guard model.availableRows > 0 else { return }
             let wasApplying = applying
             applying = true
             defer { applying = wasApplying }
@@ -249,17 +260,16 @@ struct ResultTable: NSViewRepresentable {
             let maximumX = max(0, table.bounds.width - clip.bounds.width)
             clip.scroll(to: NSPoint(x: min(position.origin.x, maximumX), y: min(position.origin.y, maximumY)))
             scroll.reflectScrolledClipView(clip)
-            if let row = position.row, row < model.availableRows || model.isFinished {
-                let row = min(row, model.availableRows - 1)
-                let column = min(position.column, columns.count - 1)
-                table.focusedColumn = column
+            if let selected = decision.selection {
+                table.focusedColumn = selected.column
                 table.rowNumberSelected = position.rowNumberSelected
-                table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+                table.selectRowIndexes(IndexSet(integer: selected.row), byExtendingSelection: false)
             }
-            if model.isFinished || position.origin.y <= maximumY && (position.row ?? 0) < model.availableRows {
+            if model.isFinished || position.origin.y <= maximumY && !decision.selectionPending {
                 pendingPosition = nil
             }
         }
+
         func scheduleVisible() {
             guard !scheduled else { return }
             scheduled = true
@@ -594,9 +604,24 @@ private final class ResultRowNumbers: NSRulerView {
 }
 
 @MainActor
-private final class RowNumberElement: NSAccessibilityElement {
+private final class RowNumberAction {
     var press: (() -> Void)?
-    override func accessibilityPerformPress() -> Bool { press?(); return true }
+    nonisolated init() {}
+}
+
+@MainActor
+final class RowNumberElement: NSAccessibilityElement {
+    private nonisolated let action = RowNumberAction()
+    var press: (() -> Void)? {
+        get { action.press }
+        set { action.press = newValue }
+    }
+    nonisolated override func accessibilityPerformPress() -> Bool {
+        let action = action
+        if Thread.isMainThread { MainActor.assumeIsolated { action.press?() } }
+        else { DispatchQueue.main.async { action.press?() } }
+        return true
+    }
 }
 
 @MainActor

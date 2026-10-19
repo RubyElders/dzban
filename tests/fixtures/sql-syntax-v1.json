@@ -1,0 +1,1795 @@
+{
+  "cases" : [
+    {
+      "name" : "quoted",
+      "source" : "SELECT 'it''s FROM 😀', \"select\", `order`, 12.5e-2, .25 FROM žluť WHERE n = 3 -- SELECT 9\n/* outer /* nested */ FROM */",
+      "tokens" : [
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 0
+        },
+        {
+          "kind" : "string",
+          "length" : 15,
+          "start" : 7
+        },
+        {
+          "kind" : "identifier",
+          "length" : 8,
+          "start" : 24
+        },
+        {
+          "kind" : "identifier",
+          "length" : 7,
+          "start" : 34
+        },
+        {
+          "kind" : "number",
+          "length" : 7,
+          "start" : 43
+        },
+        {
+          "kind" : "number",
+          "length" : 3,
+          "start" : 52
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 56
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 66
+        },
+        {
+          "kind" : "number",
+          "length" : 1,
+          "start" : 76
+        },
+        {
+          "kind" : "comment",
+          "length" : 11,
+          "start" : 78
+        },
+        {
+          "kind" : "comment",
+          "length" : 29,
+          "start" : 90
+        }
+      ]
+    },
+    {
+      "name" : "dollar",
+      "source" : "$tag$SELECT 'text' 😀$tag$ SELECT $$FROM$$",
+      "tokens" : [
+        {
+          "kind" : "string",
+          "length" : 26,
+          "start" : 0
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 27
+        },
+        {
+          "kind" : "string",
+          "length" : 8,
+          "start" : 34
+        }
+      ]
+    },
+    {
+      "name" : "unfinished",
+      "source" : "SELECT 'unfinished",
+      "tokens" : [
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 0
+        },
+        {
+          "kind" : "string",
+          "length" : 11,
+          "start" : 7
+        }
+      ]
+    },
+    {
+      "name" : "comments",
+      "source" : "-- a\rSELECT/*outer/*nested*/end*/FROM\n/* open",
+      "tokens" : [
+        {
+          "kind" : "comment",
+          "length" : 4,
+          "start" : 0
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 5
+        },
+        {
+          "kind" : "comment",
+          "length" : 22,
+          "start" : 11
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 33
+        },
+        {
+          "kind" : "comment",
+          "length" : 7,
+          "start" : 38
+        }
+      ]
+    },
+    {
+      "name" : "strings",
+      "source" : "E'hello\\'world' \"a\"\"b\" `c``d` 'x\\\\y'",
+      "tokens" : [
+        {
+          "kind" : "string",
+          "length" : 14,
+          "start" : 1
+        },
+        {
+          "kind" : "identifier",
+          "length" : 6,
+          "start" : 16
+        },
+        {
+          "kind" : "identifier",
+          "length" : 6,
+          "start" : 23
+        },
+        {
+          "kind" : "string",
+          "length" : 6,
+          "start" : 30
+        }
+      ]
+    },
+    {
+      "name" : "numbers",
+      "source" : "0 1. .25 12.5e-2 1e+2 1e- 1e 0xFF -2 +3 1.2.3",
+      "tokens" : [
+        {
+          "kind" : "number",
+          "length" : 1,
+          "start" : 0
+        },
+        {
+          "kind" : "number",
+          "length" : 2,
+          "start" : 2
+        },
+        {
+          "kind" : "number",
+          "length" : 3,
+          "start" : 5
+        },
+        {
+          "kind" : "number",
+          "length" : 7,
+          "start" : 9
+        },
+        {
+          "kind" : "number",
+          "length" : 4,
+          "start" : 17
+        },
+        {
+          "kind" : "number",
+          "length" : 1,
+          "start" : 22
+        },
+        {
+          "kind" : "number",
+          "length" : 1,
+          "start" : 26
+        },
+        {
+          "kind" : "number",
+          "length" : 1,
+          "start" : 29
+        },
+        {
+          "kind" : "number",
+          "length" : 1,
+          "start" : 35
+        },
+        {
+          "kind" : "number",
+          "length" : 1,
+          "start" : 38
+        },
+        {
+          "kind" : "number",
+          "length" : 3,
+          "start" : 40
+        },
+        {
+          "kind" : "number",
+          "length" : 2,
+          "start" : 43
+        }
+      ]
+    },
+    {
+      "name" : "functions",
+      "source" : "count (x), foo\t\r\n(bar), max(x), my_fn$2(z), abs (x)",
+      "tokens" : [
+        {
+          "kind" : "function",
+          "length" : 5,
+          "start" : 0
+        },
+        {
+          "kind" : "function",
+          "length" : 3,
+          "start" : 11
+        },
+        {
+          "kind" : "function",
+          "length" : 3,
+          "start" : 24
+        },
+        {
+          "kind" : "function",
+          "length" : 7,
+          "start" : 32
+        },
+        {
+          "kind" : "function",
+          "length" : 4,
+          "start" : 44
+        }
+      ]
+    },
+    {
+      "name" : "tags",
+      "source" : "$a1$x$a1$ $_x$body$_x$ $1$ SELECT $foo $tag$open",
+      "tokens" : [
+        {
+          "kind" : "string",
+          "length" : 9,
+          "start" : 0
+        },
+        {
+          "kind" : "string",
+          "length" : 12,
+          "start" : 10
+        },
+        {
+          "kind" : "number",
+          "length" : 1,
+          "start" : 24
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 27
+        },
+        {
+          "kind" : "string",
+          "length" : 9,
+          "start" : 39
+        }
+      ]
+    },
+    {
+      "name" : "unicode",
+      "source" : "ſelect Oﬀset café(é), 😀(x), \"😀\" -- é\r\nSELECT",
+      "tokens" : [
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 0
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 7
+        },
+        {
+          "kind" : "function",
+          "length" : 4,
+          "start" : 13
+        },
+        {
+          "kind" : "function",
+          "length" : 2,
+          "start" : 23
+        },
+        {
+          "kind" : "identifier",
+          "length" : 4,
+          "start" : 30
+        },
+        {
+          "kind" : "comment",
+          "length" : 4,
+          "start" : 35
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 41
+        }
+      ]
+    },
+    {
+      "name" : "keywords",
+      "source" : "select SELECT SeLeCt null true as bigint prewhere FINAL settings explain analyze jsonb",
+      "tokens" : [
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 0
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 7
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 14
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 21
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 26
+        },
+        {
+          "kind" : "keyword",
+          "length" : 2,
+          "start" : 31
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 34
+        },
+        {
+          "kind" : "keyword",
+          "length" : 8,
+          "start" : 41
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 50
+        },
+        {
+          "kind" : "keyword",
+          "length" : 8,
+          "start" : 56
+        },
+        {
+          "kind" : "keyword",
+          "length" : 7,
+          "start" : 65
+        },
+        {
+          "kind" : "keyword",
+          "length" : 7,
+          "start" : 73
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 81
+        }
+      ]
+    },
+    {
+      "name" : "boundaries",
+      "source" : "/*/ */ / --\n;()[]{}:$ '' \"\" `` $$",
+      "tokens" : [
+        {
+          "kind" : "comment",
+          "length" : 6,
+          "start" : 0
+        },
+        {
+          "kind" : "comment",
+          "length" : 2,
+          "start" : 9
+        },
+        {
+          "kind" : "string",
+          "length" : 2,
+          "start" : 22
+        },
+        {
+          "kind" : "identifier",
+          "length" : 2,
+          "start" : 25
+        },
+        {
+          "kind" : "identifier",
+          "length" : 2,
+          "start" : 28
+        },
+        {
+          "kind" : "string",
+          "length" : 2,
+          "start" : 31
+        }
+      ]
+    },
+    {
+      "name" : "empty",
+      "source" : "",
+      "tokens" : [
+
+      ]
+    },
+    {
+      "name" : "all_keywords",
+      "source" : "ALL ALTER ANALYZE AND ARRAY AS ASC BEGIN BETWEEN BIGINT BOOL BOOLEAN BY CASE CAST CHAR CHECK COMMIT CONSTRAINT CREATE CROSS CURRENT DATABASE DATE DECIMAL DEFAULT DELETE DESC DESCRIBE DISTINCT DOUBLE DROP ELSE END ENGINE EXCEPT EXISTS EXPLAIN FALSE FETCH FILTER FINAL FIRST FLOAT FOLLOWING FOREIGN FORMAT FROM FULL GRANT GROUP HAVING IF ILIKE IN INDEX INNER INSERT INT INTEGER INTERSECT INTERVAL INTO IS JOIN JSON JSONB KEY LAST LATERAL LEFT LIKE LIMIT MATERIALIZED NEXT NOT NULL NULLS NUMERIC OFFSET ON ONLY OR ORDER OUTER OVER PARTITION PRECEDING PREWHERE PRIMARY RANGE RECURSIVE REFERENCES RELEASE RETURNING REVOKE RIGHT ROLLBACK ROW ROWS SAMPLE SAVEPOINT SCHEMA SELECT SET SETTINGS SHOW SMALLINT TABLE TEXT THEN TIME TIMESTAMP TRANSACTION TRUE TRUNCATE UNBOUNDED UNION UNIQUE UPDATE USE USING UUID VALUES VARCHAR VERBOSE VIEW WHEN WHERE WINDOW WITH WITHIN all alter analyze and array as asc begin between bigint bool boolean by case cast char check commit constraint create cross current database date decimal default delete desc describe distinct double drop else end engine except exists explain false fetch filter final first float following foreign format from full grant group having if ilike in index inner insert int integer intersect interval into is join json jsonb key last lateral left like limit materialized next not null nulls numeric offset on only or order outer over partition preceding prewhere primary range recursive references release returning revoke right rollback row rows sample savepoint schema select set settings show smallint table text then time timestamp transaction true truncate unbounded union unique update use using uuid values varchar verbose view when where window with within",
+      "tokens" : [
+        {
+          "kind" : "keyword",
+          "length" : 3,
+          "start" : 0
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 4
+        },
+        {
+          "kind" : "keyword",
+          "length" : 7,
+          "start" : 10
+        },
+        {
+          "kind" : "keyword",
+          "length" : 3,
+          "start" : 18
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 22
+        },
+        {
+          "kind" : "keyword",
+          "length" : 2,
+          "start" : 28
+        },
+        {
+          "kind" : "keyword",
+          "length" : 3,
+          "start" : 31
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 35
+        },
+        {
+          "kind" : "keyword",
+          "length" : 7,
+          "start" : 41
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 49
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 56
+        },
+        {
+          "kind" : "keyword",
+          "length" : 7,
+          "start" : 61
+        },
+        {
+          "kind" : "keyword",
+          "length" : 2,
+          "start" : 69
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 72
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 77
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 82
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 87
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 93
+        },
+        {
+          "kind" : "keyword",
+          "length" : 10,
+          "start" : 100
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 111
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 118
+        },
+        {
+          "kind" : "keyword",
+          "length" : 7,
+          "start" : 124
+        },
+        {
+          "kind" : "keyword",
+          "length" : 8,
+          "start" : 132
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 141
+        },
+        {
+          "kind" : "keyword",
+          "length" : 7,
+          "start" : 146
+        },
+        {
+          "kind" : "keyword",
+          "length" : 7,
+          "start" : 154
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 162
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 169
+        },
+        {
+          "kind" : "keyword",
+          "length" : 8,
+          "start" : 174
+        },
+        {
+          "kind" : "keyword",
+          "length" : 8,
+          "start" : 183
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 192
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 199
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 204
+        },
+        {
+          "kind" : "keyword",
+          "length" : 3,
+          "start" : 209
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 213
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 220
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 227
+        },
+        {
+          "kind" : "keyword",
+          "length" : 7,
+          "start" : 234
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 242
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 248
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 254
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 261
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 267
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 273
+        },
+        {
+          "kind" : "keyword",
+          "length" : 9,
+          "start" : 279
+        },
+        {
+          "kind" : "keyword",
+          "length" : 7,
+          "start" : 289
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 297
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 304
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 309
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 314
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 320
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 326
+        },
+        {
+          "kind" : "keyword",
+          "length" : 2,
+          "start" : 333
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 336
+        },
+        {
+          "kind" : "keyword",
+          "length" : 2,
+          "start" : 342
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 345
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 351
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 357
+        },
+        {
+          "kind" : "keyword",
+          "length" : 3,
+          "start" : 364
+        },
+        {
+          "kind" : "keyword",
+          "length" : 7,
+          "start" : 368
+        },
+        {
+          "kind" : "keyword",
+          "length" : 9,
+          "start" : 376
+        },
+        {
+          "kind" : "keyword",
+          "length" : 8,
+          "start" : 386
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 395
+        },
+        {
+          "kind" : "keyword",
+          "length" : 2,
+          "start" : 400
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 403
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 408
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 413
+        },
+        {
+          "kind" : "keyword",
+          "length" : 3,
+          "start" : 419
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 423
+        },
+        {
+          "kind" : "keyword",
+          "length" : 7,
+          "start" : 428
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 436
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 441
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 446
+        },
+        {
+          "kind" : "keyword",
+          "length" : 12,
+          "start" : 452
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 465
+        },
+        {
+          "kind" : "keyword",
+          "length" : 3,
+          "start" : 470
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 474
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 479
+        },
+        {
+          "kind" : "keyword",
+          "length" : 7,
+          "start" : 485
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 493
+        },
+        {
+          "kind" : "keyword",
+          "length" : 2,
+          "start" : 500
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 503
+        },
+        {
+          "kind" : "keyword",
+          "length" : 2,
+          "start" : 508
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 511
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 517
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 523
+        },
+        {
+          "kind" : "keyword",
+          "length" : 9,
+          "start" : 528
+        },
+        {
+          "kind" : "keyword",
+          "length" : 9,
+          "start" : 538
+        },
+        {
+          "kind" : "keyword",
+          "length" : 8,
+          "start" : 548
+        },
+        {
+          "kind" : "keyword",
+          "length" : 7,
+          "start" : 557
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 565
+        },
+        {
+          "kind" : "keyword",
+          "length" : 9,
+          "start" : 571
+        },
+        {
+          "kind" : "keyword",
+          "length" : 10,
+          "start" : 581
+        },
+        {
+          "kind" : "keyword",
+          "length" : 7,
+          "start" : 592
+        },
+        {
+          "kind" : "keyword",
+          "length" : 9,
+          "start" : 600
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 610
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 617
+        },
+        {
+          "kind" : "keyword",
+          "length" : 8,
+          "start" : 623
+        },
+        {
+          "kind" : "keyword",
+          "length" : 3,
+          "start" : 632
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 636
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 641
+        },
+        {
+          "kind" : "keyword",
+          "length" : 9,
+          "start" : 648
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 658
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 665
+        },
+        {
+          "kind" : "keyword",
+          "length" : 3,
+          "start" : 672
+        },
+        {
+          "kind" : "keyword",
+          "length" : 8,
+          "start" : 676
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 685
+        },
+        {
+          "kind" : "keyword",
+          "length" : 8,
+          "start" : 690
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 699
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 705
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 710
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 715
+        },
+        {
+          "kind" : "keyword",
+          "length" : 9,
+          "start" : 720
+        },
+        {
+          "kind" : "keyword",
+          "length" : 11,
+          "start" : 730
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 742
+        },
+        {
+          "kind" : "keyword",
+          "length" : 8,
+          "start" : 747
+        },
+        {
+          "kind" : "keyword",
+          "length" : 9,
+          "start" : 756
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 766
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 772
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 779
+        },
+        {
+          "kind" : "keyword",
+          "length" : 3,
+          "start" : 786
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 790
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 796
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 801
+        },
+        {
+          "kind" : "keyword",
+          "length" : 7,
+          "start" : 808
+        },
+        {
+          "kind" : "keyword",
+          "length" : 7,
+          "start" : 816
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 824
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 829
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 834
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 840
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 847
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 852
+        },
+        {
+          "kind" : "keyword",
+          "length" : 3,
+          "start" : 859
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 863
+        },
+        {
+          "kind" : "keyword",
+          "length" : 7,
+          "start" : 869
+        },
+        {
+          "kind" : "keyword",
+          "length" : 3,
+          "start" : 877
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 881
+        },
+        {
+          "kind" : "keyword",
+          "length" : 2,
+          "start" : 887
+        },
+        {
+          "kind" : "keyword",
+          "length" : 3,
+          "start" : 890
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 894
+        },
+        {
+          "kind" : "keyword",
+          "length" : 7,
+          "start" : 900
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 908
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 915
+        },
+        {
+          "kind" : "keyword",
+          "length" : 7,
+          "start" : 920
+        },
+        {
+          "kind" : "keyword",
+          "length" : 2,
+          "start" : 928
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 931
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 936
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 941
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 946
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 952
+        },
+        {
+          "kind" : "keyword",
+          "length" : 10,
+          "start" : 959
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 970
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 977
+        },
+        {
+          "kind" : "keyword",
+          "length" : 7,
+          "start" : 983
+        },
+        {
+          "kind" : "keyword",
+          "length" : 8,
+          "start" : 991
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 1000
+        },
+        {
+          "kind" : "keyword",
+          "length" : 7,
+          "start" : 1005
+        },
+        {
+          "kind" : "keyword",
+          "length" : 7,
+          "start" : 1013
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 1021
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 1028
+        },
+        {
+          "kind" : "keyword",
+          "length" : 8,
+          "start" : 1033
+        },
+        {
+          "kind" : "keyword",
+          "length" : 8,
+          "start" : 1042
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 1051
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 1058
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 1063
+        },
+        {
+          "kind" : "keyword",
+          "length" : 3,
+          "start" : 1068
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 1072
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 1079
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 1086
+        },
+        {
+          "kind" : "keyword",
+          "length" : 7,
+          "start" : 1093
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 1101
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 1107
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 1113
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 1120
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 1126
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 1132
+        },
+        {
+          "kind" : "keyword",
+          "length" : 9,
+          "start" : 1138
+        },
+        {
+          "kind" : "keyword",
+          "length" : 7,
+          "start" : 1148
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 1156
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 1163
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 1168
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 1173
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 1179
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 1185
+        },
+        {
+          "kind" : "keyword",
+          "length" : 2,
+          "start" : 1192
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 1195
+        },
+        {
+          "kind" : "keyword",
+          "length" : 2,
+          "start" : 1201
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 1204
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 1210
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 1216
+        },
+        {
+          "kind" : "keyword",
+          "length" : 3,
+          "start" : 1223
+        },
+        {
+          "kind" : "keyword",
+          "length" : 7,
+          "start" : 1227
+        },
+        {
+          "kind" : "keyword",
+          "length" : 9,
+          "start" : 1235
+        },
+        {
+          "kind" : "keyword",
+          "length" : 8,
+          "start" : 1245
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 1254
+        },
+        {
+          "kind" : "keyword",
+          "length" : 2,
+          "start" : 1259
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 1262
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 1267
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 1272
+        },
+        {
+          "kind" : "keyword",
+          "length" : 3,
+          "start" : 1278
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 1282
+        },
+        {
+          "kind" : "keyword",
+          "length" : 7,
+          "start" : 1287
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 1295
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 1300
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 1305
+        },
+        {
+          "kind" : "keyword",
+          "length" : 12,
+          "start" : 1311
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 1324
+        },
+        {
+          "kind" : "keyword",
+          "length" : 3,
+          "start" : 1329
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 1333
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 1338
+        },
+        {
+          "kind" : "keyword",
+          "length" : 7,
+          "start" : 1344
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 1352
+        },
+        {
+          "kind" : "keyword",
+          "length" : 2,
+          "start" : 1359
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 1362
+        },
+        {
+          "kind" : "keyword",
+          "length" : 2,
+          "start" : 1367
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 1370
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 1376
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 1382
+        },
+        {
+          "kind" : "keyword",
+          "length" : 9,
+          "start" : 1387
+        },
+        {
+          "kind" : "keyword",
+          "length" : 9,
+          "start" : 1397
+        },
+        {
+          "kind" : "keyword",
+          "length" : 8,
+          "start" : 1407
+        },
+        {
+          "kind" : "keyword",
+          "length" : 7,
+          "start" : 1416
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 1424
+        },
+        {
+          "kind" : "keyword",
+          "length" : 9,
+          "start" : 1430
+        },
+        {
+          "kind" : "keyword",
+          "length" : 10,
+          "start" : 1440
+        },
+        {
+          "kind" : "keyword",
+          "length" : 7,
+          "start" : 1451
+        },
+        {
+          "kind" : "keyword",
+          "length" : 9,
+          "start" : 1459
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 1469
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 1476
+        },
+        {
+          "kind" : "keyword",
+          "length" : 8,
+          "start" : 1482
+        },
+        {
+          "kind" : "keyword",
+          "length" : 3,
+          "start" : 1491
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 1495
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 1500
+        },
+        {
+          "kind" : "keyword",
+          "length" : 9,
+          "start" : 1507
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 1517
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 1524
+        },
+        {
+          "kind" : "keyword",
+          "length" : 3,
+          "start" : 1531
+        },
+        {
+          "kind" : "keyword",
+          "length" : 8,
+          "start" : 1535
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 1544
+        },
+        {
+          "kind" : "keyword",
+          "length" : 8,
+          "start" : 1549
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 1558
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 1564
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 1569
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 1574
+        },
+        {
+          "kind" : "keyword",
+          "length" : 9,
+          "start" : 1579
+        },
+        {
+          "kind" : "keyword",
+          "length" : 11,
+          "start" : 1589
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 1601
+        },
+        {
+          "kind" : "keyword",
+          "length" : 8,
+          "start" : 1606
+        },
+        {
+          "kind" : "keyword",
+          "length" : 9,
+          "start" : 1615
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 1625
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 1631
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 1638
+        },
+        {
+          "kind" : "keyword",
+          "length" : 3,
+          "start" : 1645
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 1649
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 1655
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 1660
+        },
+        {
+          "kind" : "keyword",
+          "length" : 7,
+          "start" : 1667
+        },
+        {
+          "kind" : "keyword",
+          "length" : 7,
+          "start" : 1675
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 1683
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 1688
+        },
+        {
+          "kind" : "keyword",
+          "length" : 5,
+          "start" : 1693
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 1699
+        },
+        {
+          "kind" : "keyword",
+          "length" : 4,
+          "start" : 1706
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 1711
+        }
+      ]
+    },
+    {
+      "name" : "unicode_dollar_tag",
+      "source" : "$😀$body; SELECT$😀$ abs (x) ſelect 𝔽(x)",
+      "tokens" : [
+        {
+          "kind" : "string",
+          "length" : 20,
+          "start" : 0
+        },
+        {
+          "kind" : "function",
+          "length" : 4,
+          "start" : 21
+        },
+        {
+          "kind" : "keyword",
+          "length" : 6,
+          "start" : 29
+        },
+        {
+          "kind" : "function",
+          "length" : 2,
+          "start" : 36
+        }
+      ]
+    }
+  ],
+  "schema" : 1
+}

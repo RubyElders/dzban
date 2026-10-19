@@ -76,11 +76,19 @@ struct WindowPolicy: NSViewRepresentable {
 
     func makeCoordinator() -> Coordinator { Coordinator(store: store, toolbar: toolbar) }
     func makeNSView(context: Context) -> AttachmentView {
+        #if DZBAN_TEST_FIXTURES
+        ViewUpdateDiagnostics.frames.append("WindowPolicy.swift")
+        defer { ViewUpdateDiagnostics.frames.removeLast() }
+        #endif
         let view = AttachmentView()
         view.coordinator = context.coordinator
         return view
     }
     func updateNSView(_ view: AttachmentView, context: Context) {
+        #if DZBAN_TEST_FIXTURES
+        ViewUpdateDiagnostics.frames.append("WindowPolicy.swift")
+        defer { ViewUpdateDiagnostics.frames.removeLast() }
+        #endif
         view.window?.delegate = context.coordinator
         context.coordinator.toolbar.update(toolbar)
     }
@@ -89,7 +97,15 @@ struct WindowPolicy: NSViewRepresentable {
 
     final class AttachmentView: NSView {
         weak var coordinator: Coordinator?
-        override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); window?.delegate = coordinator; coordinator?.attach(window) }
+        override func viewDidMoveToWindow() {
+            #if DZBAN_TEST_FIXTURES
+            ViewUpdateDiagnostics.frames.append("window attachment")
+            defer { ViewUpdateDiagnostics.frames.removeLast() }
+            #endif
+            super.viewDidMoveToWindow()
+            window?.delegate = coordinator
+            coordinator?.attach(window)
+        }
     }
 
     @MainActor
@@ -109,6 +125,7 @@ struct WindowPolicy: NSViewRepresentable {
 
         func attach(_ window: NSWindow?) {
             if let monitor { NSEvent.removeMonitor(monitor) }
+            monitor = nil
             self.window = window
             toolbar.attach(window)
             NotificationCenter.default.removeObserver(self)
@@ -174,12 +191,12 @@ struct WindowPolicy: NSViewRepresentable {
                 if event.keyCode == 53 && modifiers.isEmpty {
                     if store.rowInspector.address != nil { store.rowInspector.backOrClose(); return nil }
                     if store.historyVisible && store.historyFocused { return event }
-                    if store.controls?.primaryAction == "stop" {
+                    if store.controls?.primaryAction == .stop {
                         store.sendSharedKey(.cancel, pressed: true, at: at)
                         store.sendSharedKey(.cancel, pressed: false, at: at)
                         return nil
                     }
-                    if store.plan.loading || store.plan.visible || store.sharedInput?.hint.kind == "estimating" {
+                    if store.plan.loading || store.plan.visible || store.sharedInput?.hint.kind == .estimating {
                         store.plan.close()
                         return nil
                     }

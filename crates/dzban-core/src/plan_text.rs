@@ -4,13 +4,17 @@ use std::fmt::Write;
 
 impl QueryPlan {
     pub fn text(&self) -> String {
-        let mut output = String::new();
-        document(&self.document, 0, &mut output);
-        if output.is_empty() {
-            return "No plan details available".into();
-        }
-        output.trim_end().to_string()
+        plan_text(&self.document)
     }
+}
+
+pub fn plan_text(value: &Value) -> String {
+    let mut output = String::new();
+    document(value, 0, &mut output);
+    if output.is_empty() {
+        return "No plan details available".into();
+    }
+    output.trim_end().to_string()
 }
 
 fn document(value: &Value, depth: usize, output: &mut String) {

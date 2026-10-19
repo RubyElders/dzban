@@ -1,0 +1,384 @@
+{
+  "schema": 1,
+  "execution_phases": [
+    "idle",
+    "planning",
+    "running",
+    "canceling",
+    "finished"
+  ],
+  "capture_phases": [
+    "waiting_for_schema",
+    "receiving",
+    "draining",
+    "failed_awaiting_cleanup",
+    "finished"
+  ],
+  "capture_terminations": [
+    "complete",
+    "limited",
+    "canceled",
+    "failed"
+  ],
+  "primary_actions": [
+    "unavailable",
+    "run",
+    "stop",
+    "stopping"
+  ],
+  "input_effects": [
+    "begin_preview",
+    "cancel_preview",
+    "show_plan",
+    "hide_plan",
+    "pin_plan",
+    "run_query",
+    "cancel_query"
+  ],
+  "input_hints": [
+    {
+      "kind": "default"
+    },
+    {
+      "kind": "primary_guide"
+    },
+    {
+      "kind": "estimating"
+    },
+    {
+      "kind": "planning"
+    },
+    {
+      "kind": "estimate_ready",
+      "plan": {
+        "backend": "postgresql",
+        "document": [
+          {
+            "Plan": {
+              "Node Type": "Result",
+              "Plan Rows": 1
+            }
+          }
+        ],
+        "estimate": {
+          "rows": 18446744073709551614,
+          "startup_cost": 0.0,
+          "total_cost": 12.5,
+          "parts": null,
+          "marks": null
+        },
+        "text": "Result  (rows=1)"
+      }
+    },
+    {
+      "kind": "estimate_error",
+      "error": "Fixture estimate failed"
+    },
+    {
+      "kind": "running",
+      "plan": null
+    },
+    {
+      "kind": "canceling",
+      "plan": {
+        "backend": "postgresql",
+        "document": [
+          {
+            "Plan": {
+              "Node Type": "Result",
+              "Plan Rows": 1
+            }
+          }
+        ],
+        "estimate": {
+          "rows": 18446744073709551614,
+          "startup_cost": 0.0,
+          "total_cost": 12.5,
+          "parts": null,
+          "marks": null
+        },
+        "text": "Result  (rows=1)"
+      }
+    }
+  ],
+  "document_record": {
+    "schema": 1,
+    "revision": 18446744073709551615,
+    "payload": {
+      "document": "00000000-0000-0000-0000-000000000001",
+      "session": "00000000-0000-0000-0000-000000000002",
+      "query": null,
+      "generation": 18446744073709551614,
+      "draft_revision": 18446744073709551615,
+      "title": "Query 1",
+      "draft": "SELECT 'žluť 😀';",
+      "execution": "idle",
+      "result_phase": null,
+      "result_available": false,
+      "rows": 0,
+      "received_rows": 0,
+      "capture_bytes": 0,
+      "termination": null,
+      "capture_error": null,
+      "command_result": {
+        "affected_rows": 18446744073709551614
+      },
+      "started_at_seconds": null,
+      "elapsed_seconds": null,
+      "execution_plan": {
+        "backend": "postgresql",
+        "estimate": {
+          "rows": 18446744073709551614,
+          "startup_cost": 0.0,
+          "total_cost": 12.5,
+          "parts": null,
+          "marks": null
+        }
+      },
+      "execution_seconds": null,
+      "cutoff": null,
+      "error": null,
+      "feedback": {
+        "status": "waiting",
+        "empty": "command",
+        "progress": null,
+        "rows": 0,
+        "total_rows": null,
+        "affected_rows": 18446744073709551614,
+        "query_diagnostic": null,
+        "capture_diagnostic": null
+      }
+    }
+  },
+  "plan": {
+    "backend": "postgresql",
+    "document": [
+      {
+        "Plan": {
+          "Node Type": "Result",
+          "Plan Rows": 1
+        }
+      }
+    ],
+    "estimate": {
+      "rows": 18446744073709551614,
+      "startup_cost": 0.0,
+      "total_cost": 12.5,
+      "parts": null,
+      "marks": null
+    },
+    "text": "Result  (rows=1)"
+  },
+  "legacy_plan": {
+    "document": [
+      {
+        "Plan": {
+          "Node Type": "Result",
+          "Plan Rows": 1
+        }
+      }
+    ],
+    "text": "Result  (rows=1)"
+  },
+  "input": {
+    "session": "00000000-0000-0000-0000-000000000002",
+    "document": "00000000-0000-0000-0000-000000000001",
+    "commands": [
+      "begin_preview",
+      "cancel_preview",
+      "show_plan",
+      "hide_plan",
+      "pin_plan",
+      "run_query",
+      "cancel_query"
+    ],
+    "hint": {
+      "kind": "estimate_ready",
+      "plan": {
+        "backend": "postgresql",
+        "document": [
+          {
+            "Plan": {
+              "Node Type": "Result",
+              "Plan Rows": 1
+            }
+          }
+        ],
+        "estimate": {
+          "rows": 18446744073709551614,
+          "startup_cost": 0.0,
+          "total_cost": 12.5,
+          "parts": null,
+          "marks": null
+        },
+        "text": "Result  (rows=1)"
+      }
+    },
+    "pinned": true
+  },
+  "tab_phases": [
+    "choosing",
+    "connecting",
+    "ready",
+    "closing",
+    "error"
+  ],
+  "interaction": {
+    "revision": 18446744073709551614,
+    "draft_revision": 18446744073709551615,
+    "input": {
+      "session": "00000000-0000-0000-0000-000000000002",
+      "document": "00000000-0000-0000-0000-000000000001",
+      "commands": [],
+      "hint": {
+        "kind": "estimate_ready",
+        "plan": {
+          "backend": "postgresql",
+          "document": [
+            {
+              "Plan": {
+                "Node Type": "Result",
+                "Plan Rows": 1
+              }
+            }
+          ],
+          "estimate": {
+            "rows": 18446744073709551614,
+            "startup_cost": 0.0,
+            "total_cost": 12.5,
+            "parts": null,
+            "marks": null
+          },
+          "text": "Result  (rows=1)"
+        }
+      },
+      "pinned": true
+    },
+    "visible": true,
+    "loading": false,
+    "plan": {
+      "backend": "postgresql",
+      "document": [
+        {
+          "Plan": {
+            "Node Type": "Result",
+            "Plan Rows": 1
+          }
+        }
+      ],
+      "estimate": {
+        "rows": 18446744073709551614,
+        "startup_cost": 0.0,
+        "total_cost": 12.5,
+        "parts": null,
+        "marks": null
+      },
+      "text": "Result  (rows=1)"
+    },
+    "error": null,
+    "retired": false
+  },
+  "health": {
+    "revision": 18446744073709551613,
+    "sessions": [
+      {
+        "session": "00000000-0000-0000-0000-000000000002",
+        "status": {
+          "state": "connected",
+          "probing": false,
+          "latency_micros": 18446744073709551614,
+          "version": "fixture",
+          "error": null,
+          "checked_at_millis": 1800000000123
+        }
+      }
+    ],
+    "profiles": [
+      {
+        "profile": "fixture",
+        "status": {
+          "state": "connected",
+          "probing": false,
+          "latency_micros": 18446744073709551614,
+          "version": "fixture",
+          "error": null,
+          "checked_at_millis": 1800000000123
+        }
+      },
+      {
+        "profile": "failed",
+        "status": {
+          "state": "error",
+          "probing": false,
+          "latency_micros": null,
+          "version": null,
+          "error": "Fixture probe failed",
+          "checked_at_millis": 1800000000123
+        }
+      },
+      {
+        "profile": "unprobed",
+        "status": {
+          "state": "unknown",
+          "probing": true,
+          "latency_micros": null,
+          "version": null,
+          "error": null,
+          "checked_at_millis": null
+        }
+      }
+    ]
+  },
+  "controls": {
+    "revision": 18446744073709551612,
+    "session": "00000000-0000-0000-0000-000000000002",
+    "query": null,
+    "primary_action": "run"
+  },
+  "attention": {
+    "revision": 18446744073709551611,
+    "application_visible": false,
+    "request_revision": 18446744073709551610,
+    "cancel_attention": false,
+    "tabs": [
+      {
+        "tab": "00000000-0000-0000-0000-000000000001",
+        "document": "00000000-0000-0000-0000-000000000003",
+        "completion_revision": 18446744073709551614,
+        "unseen": {
+          "identity": {
+            "output": {
+              "tab": "00000000-0000-0000-0000-000000000001",
+              "document": "00000000-0000-0000-0000-000000000003",
+              "generation": 18446744073709551615
+            },
+            "session": "00000000-0000-0000-0000-000000000002",
+            "query": "00000000-0000-0000-0000-000000000004"
+          },
+          "outcome": "failure"
+        }
+      }
+    ]
+  },
+  "history": {
+    "revision": "00000000-0000-0000-0000-000000000030",
+    "entries": [
+      {
+        "index": 0,
+        "sql_preview": "SELECT 'žluť 😀'",
+        "executed_at": 18446744073709551614,
+        "status": "success",
+        "rows": 500,
+        "duration_ms": 18446744073709551615
+      },
+      {
+        "index": 1,
+        "sql_preview": "failed fixture",
+        "executed_at": 1,
+        "status": "failure",
+        "rows": null,
+        "duration_ms": null
+      }
+    ]
+  }
+}

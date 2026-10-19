@@ -10,7 +10,7 @@ private func resultDTO<T: Decodable>(_ value: Any, as type: T.Type) throws -> T 
 }
 
 private func resultSnapshot(document: UUID = UUID(), generation: UInt64 = 1, rows: Int = 500, phase: String = "finished", execution: String = "finished", termination: String = "complete") throws -> DocumentSnapshot {
-    try resultDTO(["document": document.uuidString, "generation": generation, "draft_revision": 0, "title": "Query 1", "draft": "SELECT 1", "execution": execution, "result_phase": phase, "result_available": phase != "waiting_for_schema", "termination": termination, "rows": rows], as: DocumentSnapshot.self)
+    try resultDTO(["document": document.uuidString, "generation": generation, "draft_revision": 0, "title": "Query 1", "draft": "SELECT 1", "execution": execution, "result_phase": phase, "result_available": phase != "waiting_for_schema", "termination": termination, "rows": rows, "feedback": ["status": "complete", "empty": "no_rows", "rows": rows]], as: DocumentSnapshot.self)
 }
 
 private func resultPage(_ scope: ResultScope, start: Int, count: Int, columnStart: Int, columnCount: Int, text: String? = nil) throws -> ViewportPage {
@@ -36,6 +36,8 @@ private actor ViewportSourceFixture: ResultSource {
     var returnedRows = 0
     var inFlight = 0
     var peakInFlight = 0
+    var pendingMarkdown: [CheckedContinuation<String, Error>] = []
+    var markdownCount: Int { pendingMarkdown.count }
 
     func configure(paused: Bool = false, partialRows: Int = 200, failNext: Bool = false, original: String? = "NULL\n😀e\u{301}") {
         self.paused = paused
@@ -59,6 +61,18 @@ private actor ViewportSourceFixture: ResultSource {
         }
         return response
     }
+    func originalCell(_ address: ResultAddress) async throws -> OriginalCell { OriginalCell(text: original) }
+    func markdown(_ scope: ResultScope, rows: IndexSet) async throws -> String {
+        try await withCheckedThrowingContinuation { pendingMarkdown.append($0) }
+    }
+    func releaseMarkdown(_ text: String, failed: Bool = false) {
+        let pending = pendingMarkdown
+        pendingMarkdown = []
+        for continuation in pending {
+            if failed { continuation.resume(throwing: ViewportFailure("Export failed")) }
+            else { continuation.resume(returning: text) }
+        }
+    }
     func cell(_ address: ResultAddress, offset: Int, count: Int) async throws -> CellChunk {
         let part = original.map { String($0.unicodeScalars.dropFirst(offset).prefix(count)) }
         return try resultDTO(["document": address.scope.document.uuidString, "generation": address.scope.generation, "row": address.row, "column": address.column, "offset": offset, "total": original?.unicodeScalars.count ?? 0, "text": part.map { $0 as Any } ?? NSNull()], as: CellChunk.self)
@@ -76,6 +90,62 @@ private actor ViewportSourceFixture: ResultSource {
 
 @MainActor
 final class ResultViewportTests: XCTestCase {
+    func testClipboardPublicationWaitsForCompletionAndDiscardsRetiredCopies() async throws {
+        let source = ViewportSourceFixture()
+        let model = ResultViewport(source: source)
+        func waitForMarkdown() async throws {
+            let deadline = ContinuousClock.now + .seconds(5)
+            while await source.markdownCount == 0 {
+                if ContinuousClock.now >= deadline { throw ViewportFailure("Export test timed out") }
+                try await Task.sleep(for: .milliseconds(1))
+            }
+        }
+        let session = UUID(), document = UUID()
+        let pasteboard = NSPasteboard(name: .init("dzban-test-\(UUID())"))
+        defer {
+            model.retire()
+            pasteboard.releaseGlobally()
+            Task { await source.releaseMarkdown("retired") }
+        }
+        pasteboard.setString("previous", forType: .string)
+        model.update(session: session, document: try resultSnapshot(document: document))
+        try await eventually { !model.columns.isEmpty }
+        model.copyRows(IndexSet(integer: 1), to: pasteboard)
+        try await waitForMarkdown()
+        XCTAssertEqual(pasteboard.string(forType: .string), "previous")
+        model.update(session: session, document: try resultSnapshot(document: document, generation: 2))
+        await source.releaseMarkdown("stale")
+        try await Task.sleep(for: .milliseconds(10))
+        XCTAssertEqual(pasteboard.string(forType: .string), "previous")
+        try await eventually { !model.columns.isEmpty }
+        model.copyRows(IndexSet(integer: 1), to: pasteboard)
+        try await waitForMarkdown()
+        await source.releaseMarkdown("", failed: true)
+        try await eventually { model.copyError != nil }
+        XCTAssertEqual(pasteboard.string(forType: .string), "previous")
+        model.copyRows(IndexSet(integer: 499), to: pasteboard)
+        try await waitForMarkdown()
+        await source.releaseMarkdown("complete Markdown")
+        try await eventually { pasteboard.string(forType: .string) == "complete Markdown" }
+        XCTAssertEqual(pasteboard.string(forType: .init("net.daringfireball.markdown")), "complete Markdown")
+    }
+    func testPureResultPolicyRoundTripsSelectionAndNativeSchemaEquality() throws {
+        XCTAssertNil(try ResultViewPolicy.select(row: -1, column: 0, rows: 3, columns: 2))
+        XCTAssertEqual(try ResultViewPolicy.select(row: 2, column: 1, rows: 3, columns: 2), ResultPosition(row: 2, column: 1))
+        XCTAssertEqual(try ResultViewPolicy.moveRow(ResultPosition(row: 1, column: 1), direction: .max, rows: 3, columns: 2), ResultPosition(row: 2, column: 1))
+        let previous = try resultDTO([["name": "caf\u{e9}", "type_name": "text"]], as: [Column].self)
+        let current = try resultDTO([["name": "cafe\u{301}", "type_name": "text"]], as: [Column].self)
+        XCTAssertEqual(previous, current)
+        let restored = try ResultViewPolicy.restore(previous: previous, current: current, row: 100, column: 7, rows: 20, terminal: false)
+        XCTAssertEqual(restored.restoration, .apply)
+        XCTAssertTrue(restored.selectionPending)
+        XCTAssertNil(restored.selection)
+        let terminal = try ResultViewPolicy.restore(previous: previous, current: current, row: 100, column: 7, rows: 20, terminal: true)
+        XCTAssertEqual(terminal.selection, ResultPosition(row: 19, column: 0))
+        let unselected = try ResultViewPolicy.restore(previous: previous, current: current, row: nil, column: 0, rows: 20, terminal: true)
+        XCTAssertEqual(unselected.restoration, .apply)
+        XCTAssertNil(unselected.selection)
+    }
     func testHeaderTracksHorizontalScrollBeforeReturningToRunLoop() throws {
         XCTAssertFalse(ResultScrollView.isCompatibleWithResponsiveScrolling)
         let table = NSTableView(frame: NSRect(x: 0, y: 0, width: 2400, height: 300))
@@ -339,38 +409,10 @@ final class ResultViewportTests: XCTestCase {
         XCTAssertEqual((try JSONSerialization.jsonObject(with: encoded) as? [String: Any])?["isNull"] as? Bool, true)
         XCTAssertEqual(ResultCellDisplay.preview(ViewportCell(text: "NULL\n😀", length: 6, truncated: true)), "NULL\\n😀...")
     }
-
-    func testResultStatusKeepsTransientCleanupAndTerminalOutcomesDistinct() throws {
-        XCTAssertEqual(ResultStatus.describe(try resultSnapshot(rows: 5, phase: "receiving", execution: "running")), "Receiving - 5 rows")
-        XCTAssertEqual(ResultStatus.describe(try resultSnapshot(rows: 5, phase: "draining", execution: "running")), "Truncated - 5 rows; waiting for cleanup")
-        XCTAssertEqual(ResultStatus.describe(try resultSnapshot(rows: 5, phase: "failed_awaiting_cleanup", execution: "running")), "Result capture failed; waiting for cleanup")
-        XCTAssertEqual(ResultStatus.describe(try resultSnapshot(rows: 5, termination: "canceled")), "Canceled - 5 rows")
-        XCTAssertEqual(ResultStatus.describe(try resultSnapshot(rows: 0, phase: "waiting_for_schema", execution: "running")), "Waiting for schema")
-    }
 }
 
 @MainActor
 final class ResultMarkdownTests: XCTestCase {
-    func testEscapesMarkdownAndKeepsMultilineValuesInOneRow() {
-        XCTAssertEqual(ResultMarkdown.escape("a|b\\c\r\n<d>&*_`[]"), "a\\|b\\\\c<br>&lt;d&gt;&amp;\\*\\_\\`\\[\\]")
-    }
-
-    func testCopiesOnlySelectedRowWithAllColumnHeaders() async throws {
-        let source = ViewportSourceFixture()
-        let scope = ResultScope(session: UUID(), document: UUID(), generation: 1)
-        let result = try await ResultMarkdown.read(source: source, scope: scope, columns: ["First", "Second"], rows: IndexSet(integer: 75))
-        XCTAssertEqual(result, "| First | Second |\n| --- | --- |\n| \(scope.document.uuidString):75:0 | \(scope.document.uuidString):75:1 |\n")
-    }
-
-    func testCopiesAllRowsAndColumnsBeyondVisiblePages() async throws {
-        let source = ViewportSourceFixture()
-        let scope = ResultScope(session: UUID(), document: UUID(), generation: 1)
-        let result = try await ResultMarkdown.read(source: source, scope: scope, columns: (0..<12).map { "column_\($0)" }, rows: IndexSet(integersIn: 0..<130))
-        XCTAssertEqual(result.split(separator: "\n").count, 132)
-        XCTAssertTrue(result.contains("\(scope.document.uuidString):129:11"))
-        XCTAssertTrue(result.contains("\(scope.document.uuidString):0:0"))
-    }
-
     func testSelectAllAndCopyUseNativeTableSelection() {
         final class Rows: NSObject, NSTableViewDataSource {
             func numberOfRows(in tableView: NSTableView) -> Int { 4 }
@@ -389,42 +431,5 @@ final class ResultMarkdownTests: XCTestCase {
         table.selectRowIndexes(IndexSet(integer: 2), byExtendingSelection: false)
         table.copy(nil)
         XCTAssertEqual(copied, IndexSet(integer: 2))
-    }
-}
-
-private actor MarkdownCellSource: ResultSource {
-    let original = String(repeating: "long|value\n", count: 300)
-    let stale: Bool
-    init(stale: Bool = false) { self.stale = stale }
-    func schema(_ scope: ResultScope) async throws -> ResultSchema { fatalError("Schema is supplied by the viewport") }
-    func page(_ scope: ResultScope, start: Int, count: Int, columnStart: Int, columnCount: Int) async throws -> ViewportPage {
-        try resultDTO(["document": scope.document.uuidString, "generation": stale ? scope.generation + 1 : scope.generation,
-                       "start": start, "column_start": columnStart,
-                       "rows": [[ ["text": "long", "length": original.unicodeScalars.count, "truncated": true] ]]], as: ViewportPage.self)
-    }
-    func cell(_ address: ResultAddress, offset: Int, count: Int) async throws -> CellChunk {
-        try resultDTO(["document": address.scope.document.uuidString, "generation": address.scope.generation,
-                       "row": address.row, "column": address.column, "offset": offset, "total": original.unicodeScalars.count,
-                       "text": String(original.unicodeScalars.dropFirst(offset).prefix(count))], as: CellChunk.self)
-    }
-}
-
-extension ResultMarkdownTests {
-    func testReadsFullValuesInsteadOfTruncatedPreviews() async throws {
-        let source = MarkdownCellSource()
-        let scope = ResultScope(session: UUID(), document: UUID(), generation: 1)
-        let result = try await ResultMarkdown.read(source: source, scope: scope, columns: ["Value"], rows: IndexSet(integer: 0))
-        let original = await source.original
-        XCTAssertEqual(result, "| Value |\n| --- |\n| " + ResultMarkdown.escape(original) + " |\n")
-    }
-
-    func testRejectsRetiredOutputInsteadOfCopyingWrongRows() async throws {
-        let scope = ResultScope(session: UUID(), document: UUID(), generation: 1)
-        do {
-            _ = try await ResultMarkdown.read(source: MarkdownCellSource(stale: true), scope: scope, columns: ["Value"], rows: IndexSet(integer: 0))
-            XCTFail("Retired output must not be copied")
-        } catch {
-            XCTAssertEqual(error.localizedDescription, "Results changed during copy")
-        }
     }
 }

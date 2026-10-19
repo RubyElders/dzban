@@ -7,37 +7,9 @@ import XCTest
 final class EditorTests: XCTestCase {
     func testPlanTextUsesSharedPresentationInsteadOfSerializingJSON() {
         let text = "Seq Scan on widgets  (cost=0.00..12.50 rows=500 width=16)\n  Filter: (id > 10)"
-        let plan: JSONValue = .object(["text": .string(text), "document": .object(["Plan": .string("raw JSON")])])
+        let plan = PlanPresentation(document: .object(["Plan": .string("raw JSON")]), text: text)
         XCTAssertEqual(PlanFormatting.text(plan), text)
-        XCTAssertEqual(PlanFormatting.text(.object(["document": .object([:])])), "No text plan available")
-    }
-
-    func testCompletionAttentionGroupsBackgroundRequestsAndClearsOnlyViewedTabs() {
-        var state = QueryAttentionState()
-        let first = UUID(), second = UUID()
-        XCTAssertFalse(state.complete(session: first, outcome: .success, selected: true))
-        XCTAssertTrue(state.unseen.isEmpty)
-        XCTAssertFalse(state.complete(session: first, outcome: .success, selected: false))
-        XCTAssertEqual(state.unseen.count, 1)
-        state.setVisible(false, selected: first)
-        XCTAssertTrue(state.complete(session: second, outcome: .success, selected: true))
-        XCTAssertFalse(state.complete(session: second, outcome: .success, selected: true))
-        XCTAssertFalse(state.complete(session: first, outcome: .failure, selected: false))
-        XCTAssertEqual(state.unseen.count, 2)
-        XCTAssertEqual(state.unseen[first], .failure)
-        state.viewed(second)
-        XCTAssertEqual(state.unseen.count, 2)
-        state.setVisible(true, selected: second)
-        XCTAssertEqual(state.unseen.count, 1)
-        XCTAssertNotNil(state.unseen[first])
-        state.viewed(first)
-        XCTAssertTrue(state.unseen.isEmpty)
-        state.setVisible(false, selected: nil)
-        XCTAssertTrue(state.complete(session: first, outcome: .success, selected: false))
-        state.remove(first)
-        XCTAssertTrue(state.unseen.isEmpty)
-        state.clear()
-        XCTAssertTrue(state.complete(session: second, outcome: .failure, selected: true))
+        XCTAssertEqual(PlanFormatting.text(PlanPresentation(document: .object([:]))), "No text plan available")
     }
 
     func testFocusCycleUsesParticipatingVisibleViewsAndLeavesSingleParticipantAlone() {
@@ -108,12 +80,13 @@ final class EditorTests: XCTestCase {
     }
 
     func testRowEstimateDistinguishesOutputAndScanRows() {
-        let estimate: JSONValue = .object(["rows": .number(500)])
-        XCTAssertEqual(PlanFormatting.rowEstimate(.object(["backend": .string("postgresql"), "estimate": estimate])), "Est. ~500 rows")
-        XCTAssertEqual(PlanFormatting.rowEstimate(.object(["backend": .string("clickhouse"), "estimate": estimate])), "Scan est. ~500 rows")
-        XCTAssertEqual(PlanFormatting.rowEstimate(.object(["estimate": .object(["rows": .number(0)])])), "Est. ~0 rows")
-        XCTAssertNil(PlanFormatting.rowEstimate(.object(["estimate": .object(["rows": .null])])))
-        XCTAssertNil(PlanFormatting.rowEstimate(.object(["estimate": .object(["rows": .number(-1)])])))
+        let estimate = QueryEstimate(rows: 500)
+        XCTAssertEqual(PlanFormatting.summary(PlanPresentation(estimate: estimate)), "Estimated rows: 500.0")
+        XCTAssertEqual(PlanFormatting.rowEstimate(PlanPresentation(backend: .postgresql, estimate: estimate)), "Est. ~500 rows")
+        XCTAssertEqual(PlanFormatting.rowEstimate(PlanPresentation(backend: .clickhouse, estimate: estimate)), "Scan est. ~500 rows")
+        XCTAssertEqual(PlanFormatting.rowEstimate(PlanPresentation(estimate: QueryEstimate(rows: 0))), "Est. ~0 rows")
+        XCTAssertNil(PlanFormatting.rowEstimate(PlanPresentation(estimate: QueryEstimate())))
+        XCTAssertEqual(PlanFormatting.rowEstimate(PlanPresentation(estimate: QueryEstimate(rows: UInt64.max))), "Est. ~18446744073709551615 rows")
     }
 
     func testRowNumberGutterWidthFollowsDigits() {
@@ -126,20 +99,19 @@ final class EditorTests: XCTestCase {
     }
 
     func testPlannerCostFormattingRequiresFiniteNonnegativeCost() {
-        func plan(_ fields: [String: JSONValue]) -> JSONValue { .object(["estimate": .object(fields)]) }
-        XCTAssertEqual(PlanFormatting.costEstimate(plan(["startup_cost": .number(0), "total_cost": .number(12.5)])), "Cost 0.00..12.50")
-        XCTAssertEqual(PlanFormatting.costEstimate(plan(["total_cost": .number(0)])), "Cost 0.00")
-        XCTAssertNil(PlanFormatting.costEstimate(plan(["rows": .number(500), "parts": .number(2)])))
-        XCTAssertNil(PlanFormatting.costEstimate(plan(["total_cost": .null])))
-        XCTAssertNil(PlanFormatting.costEstimate(plan(["total_cost": .number(-1)])))
-        XCTAssertNil(PlanFormatting.costEstimate(plan(["total_cost": .number(.infinity)])))
+        XCTAssertEqual(PlanFormatting.costEstimate(PlanPresentation(estimate: QueryEstimate(startupCost: 0, totalCost: 12.5))), "Cost 0.00..12.50")
+        XCTAssertEqual(PlanFormatting.costEstimate(PlanPresentation(estimate: QueryEstimate(totalCost: 0))), "Cost 0.00")
+        XCTAssertNil(PlanFormatting.costEstimate(PlanPresentation(estimate: QueryEstimate(rows: 500, parts: 2))))
+        XCTAssertNil(PlanFormatting.costEstimate(PlanPresentation(estimate: QueryEstimate())))
+        XCTAssertNil(PlanFormatting.costEstimate(PlanPresentation(estimate: QueryEstimate(totalCost: -1))))
+        XCTAssertNil(PlanFormatting.costEstimate(PlanPresentation(estimate: QueryEstimate(totalCost: .infinity))))
     }
 
-    func testSQLSyntaxKeepsQuotedTextAndCommentsSeparateFromKeywords() {
+    func testSQLSyntaxKeepsQuotedTextAndCommentsSeparateFromKeywords() async throws {
         let sql = "SELECT 'it''s FROM 😀', \"select\", `order`, 12.5e-2, .25 FROM žluť WHERE n = 3 -- SELECT 9\n/* outer /* nested */ FROM */"
-        let tokens = SQLSyntax.tokens(in: sql)
-        func text(_ kind: SQLSyntax.Kind) -> [String] {
-            tokens.filter { $0.kind == kind }.map { (sql as NSString).substring(with: $0.range) }
+        let tokens = try await Task.detached { try SQLTokenizer.tokens(in: sql, revision: 1).tokens }.value
+        func text(_ kind: SQLTokenKind) -> [String] {
+            tokens.filter { $0.kind == kind }.map { (sql as NSString).substring(with: NSRange(location: $0.start.utf16, length: $0.end.utf16 - $0.start.utf16)) }
         }
         XCTAssertEqual(text(.keyword), ["SELECT", "FROM", "WHERE"])
         XCTAssertEqual(text(.string), ["'it''s FROM 😀'"])
@@ -147,15 +119,46 @@ final class EditorTests: XCTestCase {
         XCTAssertEqual(text(.number), ["12.5e-2", ".25", "3"])
         XCTAssertEqual(text(.comment), ["-- SELECT 9", "/* outer /* nested */ FROM */"])
         let dollar = "$tag$SELECT 'text' 😀$tag$ SELECT $$FROM$$"
-        let parts = SQLSyntax.tokens(in: dollar)
+        let parts = try await Task.detached { try SQLTokenizer.tokens(in: dollar, revision: 2).tokens }.value
         XCTAssertEqual(parts.map(\.kind), [.string, .keyword, .string])
-        XCTAssertEqual(parts.map { (dollar as NSString).substring(with: $0.range) }, ["$tag$SELECT 'text' 😀$tag$", "SELECT", "$$FROM$$"])
-        XCTAssertEqual(SQLSyntax.tokens(in: "SELECT 'unfinished").map(\.kind), [.keyword, .string])
+        XCTAssertEqual(parts.map { (dollar as NSString).substring(with: NSRange(location: $0.start.utf16, length: $0.end.utf16 - $0.start.utf16)) }, ["$tag$SELECT 'text' 😀$tag$", "SELECT", "$$FROM$$"])
+        let unfinished = try await Task.detached { try SQLTokenizer.tokens(in: "SELECT 'unfinished", revision: 3).tokens }.value
+        XCTAssertEqual(unfinished.map(\.kind), [.keyword, .string])
     }
 
-    func testSyntaxColorsDoNotChangeTextSelectionOrUndoHistory() throws {
+    private func waitForSyntax(_ view: SQLTextView) async throws {
+        let deadline = ContinuousClock.now + .seconds(3)
+        while view.appliedSyntaxRevision != view.syntaxRevision {
+            if ContinuousClock.now >= deadline { throw ViewportFailure("SQL colors did not arrive") }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+    }
+
+    func testSharedHighlightingWaitsForNativeCompositionToCommit() async throws {
+        let buffer = EditorBuffer(text: "SELECT '😀'")
+        defer { buffer.retire() }
+        let view = buffer.textView
+        try await waitForSyntax(view)
+        let revision = view.appliedSyntaxRevision
+        view.setMarkedText("composing", selectedRange: NSRange(location: 9, length: 0), replacementRange: NSRange(location: 0, length: 0))
+        XCTAssertTrue(view.hasMarkedText())
+        view.highlightSyntax()
+        view.viewDidChangeEffectiveAppearance()
+        try await Task.sleep(for: .milliseconds(40))
+        XCTAssertEqual(view.appliedSyntaxRevision, revision)
+        let text = view.string
+        view.unmarkText()
+        let selection = view.selectedRange()
+        try await waitForSyntax(view)
+        XCTAssertEqual(view.string, text)
+        XCTAssertEqual(view.selectedRange(), selection)
+        XCTAssertFalse(view.hasMarkedText())
+    }
+
+    func testSyntaxColorsDoNotChangeTextSelectionOrUndoHistory() async throws {
         let buffer = EditorBuffer(text: "SELECT '😀'")
         let view = buffer.textView
+        try await waitForSyntax(view)
         let undo = try XCTUnwrap(view.undoManager)
         XCTAssertFalse(undo.canUndo)
         let layout = try XCTUnwrap(view.layoutManager)
@@ -168,12 +171,15 @@ final class EditorTests: XCTestCase {
         undo.endUndoGrouping()
         XCTAssertEqual(view.string, "SELECT '😀' WHERE n = 42")
         XCTAssertEqual(view.selectedRange(), NSRange(location: view.string.utf16.count, length: 0))
+        try await waitForSyntax(view)
         let number = (view.string as NSString).range(of: "42")
         XCTAssertNotNil(layout.temporaryAttribute(.foregroundColor, atCharacterIndex: number.location, effectiveRange: nil))
         undo.undo()
+        try await waitForSyntax(view)
         XCTAssertEqual(view.string, "SELECT '😀'")
         XCTAssertFalse(undo.canUndo)
         undo.redo()
+        try await waitForSyntax(view)
         XCTAssertEqual(view.string, "SELECT '😀' WHERE n = 42")
     }
 
@@ -314,13 +320,5 @@ final class EditorTests: XCTestCase {
         do { finalEditor = store.editor(for: try XCTUnwrap(store.document)) }
         try await store.shutdown()
         XCTAssertNil(finalEditor)
-    }
-
-    func testStructuredDiagnosticsPreserveBackendDetails() {
-        let error = JSONValue.object(["Database": .object([
-            "message": .string("Syntax error"), "code": .object(["SqlState": .string("42601")]),
-            "detail": .string("At line 2"), "hint": .string("Check the expression"),
-        ])])
-        XCTAssertEqual(QueryDiagnostic.describe(error), "Syntax error\n42601\nAt line 2\nCheck the expression")
     }
 }

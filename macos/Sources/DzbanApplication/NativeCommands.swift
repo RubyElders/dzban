@@ -1,4 +1,5 @@
 import AppKit
+import DzbanBridge
 import SwiftUI
 
 public struct NativeCommands: Commands {
@@ -39,13 +40,13 @@ public struct NativeCommands: Commands {
             Button("Toggle Query History") { store.historyVisible.toggle() }
                 .keyboardShortcut("b", modifiers: .command)
             Divider()
-            Button(store.controls?.primaryAction == "stop" ? "Stop Current Query" : "Run Current Query") {
+            Button(store.controls?.primaryAction == .stop ? "Stop Current Query" : "Run Current Query") {
                 if NSApp.currentEvent?.type != .keyDown || NSApp.currentEvent?.isARepeat != true {
                     store.sendEditorIntent(.primary)
                 }
             }
             .keyboardShortcut(.return, modifiers: .command)
-            .disabled(!store.navigationAvailable || store.connectionsVisible || store.shortcutsVisible || !["run", "stop"].contains(store.controls?.primaryAction ?? ""))
+            .disabled(!store.navigationAvailable || store.connectionsVisible || store.shortcutsVisible || ![PrimaryAction.run, .stop].contains(store.controls?.primaryAction ?? .unavailable))
             Button("Preview Query Plan") { Task { await store.openCurrentPlan() } }
                 .keyboardShortcut(.space, modifiers: [.command, .shift])
                 .disabled(!store.canPreview)

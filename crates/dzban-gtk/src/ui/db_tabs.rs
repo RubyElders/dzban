@@ -757,7 +757,7 @@ impl DatabaseTabManager {
             .find(|(tab, _, _, _)| tab == &page)
             .and_then(|(_, _, config, _)| config.connection().session_engine())
             .and_then(|engine| self.runtime_bridge.query_tab(engine.id()))
-            .map(|tab| tab.profile.0);
+            .and_then(|tab| tab.profile.map(|profile| profile.0));
         if let Some(profile) = profile {
             page.set_title(&format!("{profile} - {title}"));
         }

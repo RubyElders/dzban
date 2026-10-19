@@ -32,7 +32,7 @@ extension LifecycleScenarios {
         try expect(store.pages.count == 2)
         try expect(store.workspaces.count == 1)
         await store.selectSession(session)
-        try expect(store.controls?.primaryAction == "run")
+        try expect(store.controls?.primaryAction == .run)
         await store.closeDocument(original)
         try expect(store.workspaces.isEmpty)
         try expect(store.selectedSession == nil)
@@ -74,7 +74,7 @@ extension LifecycleScenarios {
         let retryDocument = store.document!.document
         let _: Submission = try await bridge.request(.submit(session: retrySession, document: retryDocument, sql: "reject_close"), as: Submission.self)
         let rejecting = try await bridge.observeDocument(session: retrySession, document: retryDocument)
-        for try await snapshot in rejecting { if snapshot.execution == "finished" { break } }
+        for try await snapshot in rejecting { if snapshot.execution == .finished { break } }
         do { try await store.shutdown(); throw CheckFailure(message: "Rejected cleanup was lost") }
         catch let error as BridgeFailure { try expect(error.kind == "shutdown") }
         try expect(store.workspaces.count == 1)

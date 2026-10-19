@@ -12,6 +12,8 @@ use crate::execution::{QueryEngine, SessionId};
 pub enum ApplicationError {
     Adapter(AdapterError),
     UnknownSession(SessionId),
+    UnknownTab(crate::tabs::TabId),
+    SelectionSuperseded,
     Operation(ExecutionError),
 }
 
@@ -20,7 +22,11 @@ impl std::fmt::Display for ApplicationError {
         match self {
             Self::Adapter(error) => error.fmt(formatter),
             Self::UnknownSession(id) => write!(formatter, "Unknown session: {}", id.0),
+            Self::UnknownTab(id) => write!(formatter, "Unknown tab: {}", id.0),
             Self::Operation(error) => error.fmt(formatter),
+            Self::SelectionSuperseded => {
+                formatter.write_str("A newer navigation request is active")
+            }
         }
     }
 }
@@ -120,13 +126,24 @@ pub struct ConnectionHandle {
     task: tokio::task::JoinHandle<Result<Arc<QueryEngine>, ApplicationError>>,
 }
 
+type CloseReceiver = watch::Receiver<Option<Result<(), ApplicationError>>>;
+
 pub struct CloseHandle {
-    task: tokio::task::JoinHandle<Result<(), ApplicationError>>,
+    completion: CloseReceiver,
 }
 
 impl CloseHandle {
-    pub async fn wait(self) -> Result<(), ApplicationError> {
-        self.task.await.map_err(worker_error)?
+    pub async fn wait(mut self) -> Result<(), ApplicationError> {
+        loop {
+            if let Some(result) = self.completion.borrow_and_update().clone() {
+                return result;
+            }
+            self.completion.changed().await.map_err(|_| {
+                ApplicationError::Operation(ExecutionError::Message(
+                    "Session cleanup tracking was dropped".into(),
+                ))
+            })?;
+        }
     }
 }
 
@@ -148,9 +165,13 @@ fn worker_error(error: tokio::task::JoinError) -> ApplicationError {
 
 pub struct ApplicationContext {
     pub tabs: crate::tabs::QueryTabs,
+    pub health: crate::health::HealthService,
+    pub outputs: crate::outputs::OutputService,
+    pub workspace: crate::workspace::WorkspaceService,
     adapters: AdapterRegistry,
     sessions: RwLock<HashMap<SessionId, Arc<QueryEngine>>>,
     pending_connections: watch::Sender<Vec<ConnectionSnapshot>>,
+    closing_sessions: std::sync::Mutex<HashMap<SessionId, CloseReceiver>>,
     phase: watch::Sender<ApplicationPhase>,
 }
 
@@ -175,9 +196,13 @@ impl ApplicationContext {
     pub fn new(adapters: AdapterRegistry) -> Self {
         Self {
             tabs: Default::default(),
+            health: Default::default(),
+            outputs: Default::default(),
+            workspace: Default::default(),
             adapters,
             sessions: RwLock::new(HashMap::new()),
             pending_connections: watch::channel(Vec::new()).0,
+            closing_sessions: Default::default(),
             phase: watch::channel(ApplicationPhase::Running).0,
         }
     }
@@ -190,14 +215,54 @@ impl ApplicationContext {
     }
 
     pub fn start_connect(self: &Arc<Self>, profile: DatabaseConfig) -> ConnectionHandle {
-        self.start_connection(profile, false)
+        self.start_connection(profile, None, false)
     }
 
     pub fn start_connect_tab(self: &Arc<Self>, profile: DatabaseConfig) -> ConnectionHandle {
-        self.start_connection(profile, true)
+        self.start_connection(profile, None, true)
     }
 
-    fn start_connection(self: &Arc<Self>, profile: DatabaseConfig, tab: bool) -> ConnectionHandle {
+    pub fn open_tab(
+        &self,
+        profile: Option<crate::ConnectionProfileId>,
+        draft: String,
+    ) -> Result<crate::tabs::TabId, ApplicationError> {
+        self.open_tab_at(profile, draft, None)
+    }
+
+    pub fn open_tab_at(
+        &self,
+        profile: Option<crate::ConnectionProfileId>,
+        draft: String,
+        revision: Option<u64>,
+    ) -> Result<crate::tabs::TabId, ApplicationError> {
+        let phase = self.phase.borrow();
+        if *phase != ApplicationPhase::Running {
+            return Err(ApplicationError::Operation(
+                if *phase == ApplicationPhase::Closed {
+                    ExecutionError::Closed
+                } else {
+                    ExecutionError::Busy
+                },
+            ));
+        }
+        self.tabs.open(profile, draft, revision)
+    }
+
+    pub fn start_connect_in_tab(
+        self: &Arc<Self>,
+        tab: crate::tabs::TabId,
+        profile: DatabaseConfig,
+    ) -> ConnectionHandle {
+        self.start_connection(profile, Some(tab), false)
+    }
+
+    fn start_connection(
+        self: &Arc<Self>,
+        profile: DatabaseConfig,
+        tab: Option<crate::tabs::TabId>,
+        create_tab: bool,
+    ) -> ConnectionHandle {
         let id = ConnectionRequestId(uuid::Uuid::new_v4());
         let initial = ConnectionSnapshot {
             request: id,
@@ -219,12 +284,30 @@ impl ApplicationContext {
             drop(snapshot);
             return ConnectionHandle {
                 id,
-                tab: None,
+                tab,
                 snapshot: receiver,
                 task: tokio::spawn(async move { Err(error) }),
             };
         }
-        let tab = tab.then(|| self.tabs.begin(&profile));
+        let tab = if create_tab {
+            Some(self.tabs.open(None, String::new(), None).unwrap())
+        } else {
+            tab
+        };
+        if let Some(tab_id) = tab
+            && let Err(error) = self.tabs.begin(tab_id, id, &profile)
+        {
+            let (_, receiver) = watch::channel(ConnectionSnapshot {
+                phase: ConnectionPhase::Failed(error.clone()),
+                ..initial
+            });
+            return ConnectionHandle {
+                id,
+                tab,
+                snapshot: receiver,
+                task: tokio::spawn(async move { Err(error) }),
+            };
+        }
         self.pending_connections
             .send_modify(|pending| pending.push(initial.clone()));
         drop(admission);
@@ -245,9 +328,23 @@ impl ApplicationContext {
         });
         let supervisor_context = self.clone();
         let task = tokio::spawn(async move {
-            let result = worker.await.map_err(worker_error).and_then(|result| result);
+            let mut result = worker.await.map_err(worker_error).and_then(|result| result);
             if let Some(tab) = tab {
-                supervisor_context.tabs.complete(tab, &result);
+                match supervisor_context.tabs.complete(tab, id, &result) {
+                    crate::tabs::ConnectionCompletion::Attached => {}
+                    crate::tabs::ConnectionCompletion::Closing => {
+                        result = Err(ApplicationError::Operation(ExecutionError::Closed));
+                    }
+                    crate::tabs::ConnectionCompletion::Superseded => {
+                        result = match result {
+                            Ok(engine) => supervisor_context
+                                .close(engine.id())
+                                .await
+                                .and(Err(ApplicationError::Operation(ExecutionError::Closed))),
+                            Err(error) => Err(error),
+                        };
+                    }
+                }
             }
             snapshot.send_modify(|state| {
                 state.phase = match &result {
@@ -268,8 +365,73 @@ impl ApplicationContext {
         }
     }
 
+    pub fn start_close_tab(
+        self: &Arc<Self>,
+        tab: crate::tabs::TabId,
+    ) -> Result<CloseHandle, ApplicationError> {
+        self.start_tab_cleanup(tab, false)
+    }
+
+    pub fn start_cancel_connection(
+        self: &Arc<Self>,
+        tab: crate::tabs::TabId,
+    ) -> Result<CloseHandle, ApplicationError> {
+        self.start_tab_cleanup(tab, true)
+    }
+
+    fn start_tab_cleanup(
+        self: &Arc<Self>,
+        tab: crate::tabs::TabId,
+        retain: bool,
+    ) -> Result<CloseHandle, ApplicationError> {
+        let mut updates = self.tabs.subscribe();
+        self.tabs.begin_close(tab, retain)?;
+        let context = self.clone();
+        let (completion, receiver) = watch::channel(None);
+        tokio::spawn(async move {
+            let result = async {
+                loop {
+                    let snapshot = updates.borrow_and_update().clone();
+                    let Some(current) = snapshot.tabs.iter().find(|current| current.id == tab)
+                    else {
+                        return Ok(());
+                    };
+                    if let Some(engine) = &current.engine {
+                        return match context.begin_close(engine.clone()) {
+                            Ok(close) => close.wait().await,
+                            Err(error) => {
+                                context.tabs.close_failed(tab);
+                                Err(ApplicationError::Operation(error))
+                            }
+                        };
+                    }
+                    if current.connection_request.is_none() {
+                        let result = context.tabs.finish_unconnected_close(tab);
+                        if result.is_err() {
+                            context.tabs.close_failed(tab);
+                        }
+                        return result;
+                    }
+                    updates
+                        .changed()
+                        .await
+                        .map_err(|_| ApplicationError::Operation(ExecutionError::Closed))?;
+                }
+            }
+            .await;
+            completion.send_replace(Some(result));
+        });
+        Ok(CloseHandle {
+            completion: receiver,
+        })
+    }
+
     pub fn subscribe_pending_connections(&self) -> watch::Receiver<Vec<ConnectionSnapshot>> {
         self.pending_connections.subscribe()
+    }
+
+    pub fn attention(&self) -> &crate::attention::AttentionService {
+        self.tabs.attention()
     }
 
     pub fn subscribe_phase(&self) -> watch::Receiver<ApplicationPhase> {
@@ -292,8 +454,11 @@ impl ApplicationContext {
                 task: tokio::spawn(async { Ok(()) }),
             });
         }
+        self.attention().suspend(true);
         let context = self.clone();
         let worker = tokio::spawn(async move {
+            context.workspace.drain().await;
+            context.health.drain().await;
             let mut pending = context.subscribe_pending_connections();
             loop {
                 if pending.borrow_and_update().is_empty() {
@@ -307,18 +472,29 @@ impl ApplicationContext {
             }
             let mut failure = None;
             for id in context.session_ids().await {
-                if let Err(error) = context.close(id).await {
+                let Ok(engine) = context.session(id).await else {
+                    continue;
+                };
+                let outcome = match context.begin_close(engine) {
+                    Ok(close) => close.wait().await,
+                    Err(error) => Err(ApplicationError::Operation(error)),
+                };
+                if let Err(error) = outcome {
                     failure.get_or_insert(error);
                 }
             }
             if failure.is_none() {
                 context.tabs.finish_shutdown();
+                context.outputs.clear();
             }
             failure.map_or(Ok(()), Err)
         });
         let context = self.clone();
         let task = tokio::spawn(async move {
             let result = worker.await.map_err(worker_error).and_then(|result| result);
+            if result.is_err() {
+                context.attention().suspend(false);
+            }
             context.phase.send_replace(if result.is_ok() {
                 ApplicationPhase::Closed
             } else {
@@ -362,29 +538,64 @@ impl ApplicationContext {
         self: &Arc<Self>,
         engine: Arc<QueryEngine>,
     ) -> Result<CloseHandle, ExecutionError> {
+        let mut tracked = self.closing_sessions.lock().unwrap();
+        if let Some(completion) = tracked.get(&engine.id()) {
+            return Ok(CloseHandle {
+                completion: completion.clone(),
+            });
+        }
         let closing = if self.tabs.session(engine.id()).is_some() {
             engine.start_close_draining()?
         } else {
             engine.start_close()?
         };
-        Ok(self.track_close(closing))
+        Ok(self.track_close_locked(closing, &mut tracked))
     }
 
     pub fn track_close(
         self: &Arc<Self>,
         closing: crate::execution::SessionCloseHandle,
     ) -> CloseHandle {
+        self.track_close_locked(closing, &mut self.closing_sessions.lock().unwrap())
+    }
+
+    fn track_close_locked(
+        self: &Arc<Self>,
+        closing: crate::execution::SessionCloseHandle,
+        tracked: &mut HashMap<SessionId, CloseReceiver>,
+    ) -> CloseHandle {
         let id = closing.session;
+        self.tabs.mark_closing(id);
+        let tab = self.tabs.session(id).map(|tab| tab.id);
+        let (completion, receiver) = watch::channel(None);
+        tracked.insert(id, receiver.clone());
         let context = self.clone();
-        let task = tokio::spawn(async move {
+        let worker = tokio::spawn(async move {
             closing.wait().await.map_err(ApplicationError::Operation)?;
+            let document = context.tabs.session(id).map(|tab| tab.document.id());
             context
                 .tabs
                 .retire(id)
                 .map_err(ApplicationError::Operation)?;
             context.sessions.write().await.remove(&id);
+            context.outputs.retire_session(id, document);
+            context.health.forget_session(id);
             Ok(())
         });
-        CloseHandle { task }
+        let context = self.clone();
+        tokio::spawn(async move {
+            let result = worker.await.map_err(worker_error).and_then(|result| result);
+            if result.is_err()
+                && let Some(tab) = tab
+            {
+                context.tabs.close_failed(tab);
+            }
+            let mut tracked = context.closing_sessions.lock().unwrap();
+            completion.send_replace(Some(result));
+            tracked.remove(&id);
+        });
+        CloseHandle {
+            completion: receiver,
+        }
     }
 }

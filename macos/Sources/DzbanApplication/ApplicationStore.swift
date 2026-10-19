@@ -6,29 +6,55 @@ public struct Workspace: Identifiable {
     public let tab: UUID
     public let id: UUID
     public let profile: String
-    public var documents: [DocumentSnapshot]
-    public var selectedDocument: UUID?
-    public var hasUnseenResult = false
-    public var unseenResultFailed = false
-    public var completionRevision: UInt64 = 0
+    public let snapshot: DocumentSnapshot
+    public var documents: [DocumentSnapshot] { [snapshot] }
+    public var selectedDocument: UUID? { snapshot.document }
+    public let hasUnseenResult: Bool
+    public let unseenResultFailed: Bool
+    public let completionRevision: UInt64
 }
 
-public struct WorkspacePage: Identifiable {
-    public let id: UUID
-    public var session: UUID?
-    public var savedProfile: String?
-    public var savedDraft = ""
+extension TabInventory.Tab {
+    public var savedProfile: String? { backend == nil ? profile : nil }
+    public var savedDraft: String { snapshot.draft }
 }
 
 @MainActor
-public final class ApplicationStore: ObservableObject {
+public final class ApplicationStore: ObservableObject, QueryInteractionHost {
     @Published public private(set) var backendActions: [BackendActions.Action] = []
     @Published public private(set) var profiles: [Profiles.Profile] = []
-    @Published public private(set) var workspaces: [Workspace] = []
-    @Published public private(set) var selectedSession: UUID?
-    @Published public private(set) var pages: [WorkspacePage]
-    @Published public private(set) var selectedPage: UUID
-    @Published public private(set) var pendingProfile: String?
+    @Published public private(set) var inventory: TabInventory?
+    private struct ConnectionAttachment {
+        let profile: String
+        let worker: Task<Connection, Error>
+    }
+    @Published private var connectionAttachments: [UUID: ConnectionAttachment] = [:]
+    private var cancelledConnections: Set<UUID> = []
+    private var cancelingRestoredTabs: Set<UUID> = []
+    private var connectionCancellations: [UUID: Task<Void, Never>] = [:]
+    private var closingTabs: Set<UUID> = []
+    private var workspaceBootstrap: Task<TabInventory, Error>?
+    private var attention: AttentionSnapshot? { queryAttention.snapshot }
+
+    public var pages: [TabInventory.Tab] { inventory?.tabs ?? [] }
+    public var selectedPage: UUID? { inventory?.selected }
+    public var selectedSession: UUID? {
+        guard let page = pages.first(where: { $0.id == selectedPage }), connectionAttachments[page.id] == nil, !cancelingRestoredTabs.contains(page.id) else { return nil }
+        return page.session
+    }
+    public var pendingProfile: String? {
+        guard let page = pages.first(where: { $0.id == selectedPage }) else { return nil }
+        return connectionAttachments[page.id]?.profile ?? (page.phase == .connecting ? page.profile : nil)
+    }
+    public var workspaces: [Workspace] {
+        pages.compactMap { page in
+            guard let session = page.session, let profile = page.profile, connectionAttachments[page.id] == nil else { return nil }
+            return Workspace(tab: page.id, id: session, profile: profile, snapshot: page.snapshot,
+                hasUnseenResult: attention?.tabs.first(where: { $0.tab == page.id })?.unseen != nil,
+                unseenResultFailed: attention?.tabs.first(where: { $0.tab == page.id })?.unseen?.outcome == .failure,
+                completionRevision: attention?.tabs.first(where: { $0.tab == page.id })?.completionRevision ?? 0)
+        }
+    }
     @Published public private(set) var closingSessions: Set<UUID> = []
     @Published public private(set) var controls: Controls?
     @Published public private(set) var isShuttingDown = false
@@ -40,24 +66,20 @@ public final class ApplicationStore: ObservableObject {
     }
     @Published var actionSearchRequest = 0
     @Published public var shortcutsVisible = false
-    @Published public var connectionsVisible = true
-    @Published public private(set) var health: [UUID: ConnectionHealth] = [:]
-    @Published public private(set) var profileHealth: [String: ConnectionHealth] = [:]
-    @Published public private(set) var sharedInput: InputProjection?
-    private var healthTimers: [UUID: Task<Void, Never>] = [:]
-    private var probeWorkers: [UUID: Task<Void, Never>] = [:]
-    private var profileProbeWorkers: [String: Task<Void, Never>] = [:]
-    private var inputWorker: Task<Void, Never>?
-    private var inputPreview: Task<Void, Never>?
-    private var inputContext: UInt64 = 0
-    private var inputPreviewRevision: UInt64 = 0
-    private var sharedInputMode = false
-    private var inputHeld: Set<NativeInput.Key> = []
+    public var connectionsVisible: Bool { !isShuttingDown && selectedSession == nil }
+    public var health: [UUID: ConnectionHealth] { connectionHealth.sessions }
+    public var profileHealth: [String: ConnectionHealth] { connectionHealth.profiles }
+    public var sharedInput: InputProjection? { queryInteraction.input }
 
-    private var queryAttention = QueryAttentionState()
-    var attentionChanged: ((QueryAttentionUpdate) -> Void)?
-    var unseenCompletionCount: Int { queryAttention.unseen.count }
+    var attentionChanged: ((QueryAttentionUpdate) -> Void)? {
+        get { queryAttention.changed }
+        set { queryAttention.changed = newValue }
+    }
+    var unseenCompletionCount: Int { attention?.unseenCount ?? 0 }
 
+    private let connectionHealth: ConnectionHealthModel
+    private let queryAttention: QueryAttentionModel
+    private var featureUpdates: Set<AnyCancellable> = []
     public let bridge: Bridge
     let focusCycle = WorkspaceFocusCycle()
     public let results: ResultViewport
@@ -67,204 +89,193 @@ public final class ApplicationStore: ObservableObject {
     #if DZBAN_TEST_FIXTURES
     let responsiveness = MainThreadProbe()
     #endif
-    private struct SavedWorkspace: Codable {
-        struct Tab: Codable {
-            let profile: String?
-            let draft: String
-        }
-        let version: Int
-        let tabs: [Tab]
-        let selected: Int
-    }
-    private let restorationURL: URL?
+    private let workspaceLocation: WorkspaceLocation?
     private var started = false
     private var restoring = false
-    private var connectionIntent: UUID?
     private var controlRevision: UInt64 = 0
     private var navigationRevision: UInt64 = 0
-    private var documentRevisions: [UUID: UInt64] = [:]
     private var observations: [UUID: Task<Void, Never>] = [:]
     private var controlObservation: Task<Void, Never>?
     private var shutdownTask: Task<Void, Error>?
-    private var editors: [UUID: EditorBuffer] = [:]
-    private var contextWorkers: [UUID: Task<Void, Never>] = [:]
-    private var contextVersions: [UUID: UInt64] = [:]
-    private var draftWorkers: [UUID: Task<Void, Never>] = [:]
+    private let queryInteraction: QueryInteractionModel
+    private let editorAttachments: EditorAttachments
+    let application: ApplicationClient
 
-    public init(bridge: Bridge, resultSource: (any ResultSource)? = nil, restorationURL: URL? = nil) {
-        self.restorationURL = restorationURL
-        let page = WorkspacePage(id: UUID(), session: nil)
-        pages = [page]
-        selectedPage = page.id
+    public init(bridge: Bridge, resultSource: (any ResultSource)? = nil, restorationURL: URL? = nil, restoreWorkspace: Bool = false) {
+        workspaceLocation = restorationURL.map { WorkspaceLocation(host: .macos, path: $0.path) } ?? (restoreWorkspace ? WorkspaceLocation(host: .macos) : nil)
         self.bridge = bridge
-        plan = PlanPreviewModel(bridge: bridge)
-        let source = resultSource ?? BridgeResultSource(bridge: bridge)
+        let application = ApplicationClient(bridge: bridge)
+        self.application = application
+        let attachments = EditorAttachments(application: application, focusCycle: focusCycle)
+        editorAttachments = attachments
+        connectionHealth = ConnectionHealthModel(application: application)
+        queryAttention = QueryAttentionModel(application: application)
+        let preview = PlanPreviewModel()
+        plan = preview
+        queryInteraction = QueryInteractionModel(application: application, editors: attachments, plan: preview)
+        let source = resultSource ?? BridgeResultSource(application: application)
         results = ResultViewport(source: source)
         results.focusCycle = focusCycle
         cellInspector = CellInspectorModel(source: source)
-        rowInspector = RowInspectorModel(bridge: bridge, source: source)
-        plan.userPin = { [weak self] in
-            guard let self, self.sharedInputMode else { return false }
-            self.enqueueInput(.pin)
-            return true
+        rowInspector = RowInspectorModel(application: application, source: source)
+        queryInteraction.host = self
+        editorAttachments.updated = { [weak self] snapshot, session in self?.apply(snapshot, session: session) }
+        editorAttachments.failed = { [weak self] error in self?.show(error) }
+        connectionHealth.failed = { [weak self] error in
+            guard let self, !self.isClosed, !self.isShuttingDown else { return }
+            self.show(error)
         }
-        plan.userClose = { [weak self] in self?.clearSharedInput() }
-    }
-
-    public static var defaultRestorationURL: URL {
-        let environment = ProcessInfo.processInfo.environment
-        let data = environment["XDG_DATA_HOME"].map { URL(fileURLWithPath: $0, isDirectory: true) }
-            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/share", isDirectory: true)
-        return data.appendingPathComponent("dzban/native-workspace.json")
+        queryAttention.failed = { [weak self] error in
+            guard let self, !self.isClosed, !self.isShuttingDown else { return }
+            self.show(error)
+        }
+        queryInteraction.objectWillChange.sink { [weak self] in self?.objectWillChange.send() }.store(in: &featureUpdates)
+        connectionHealth.objectWillChange.sink { [weak self] in self?.objectWillChange.send() }.store(in: &featureUpdates)
+        queryAttention.objectWillChange.sink { [weak self] in self?.objectWillChange.send() }.store(in: &featureUpdates)
+        connectionHealth.start()
+        queryAttention.start()
     }
 
     public func start() async {
         guard !started else { return }
         started = true
         restoring = true
-        defer { restoring = false }
-        await loadProfiles()
-        guard navigationAvailable, let restorationURL, FileManager.default.fileExists(atPath: restorationURL.path) else { return }
+        reportAttentionLifecycle()
+        defer { restoring = false; reportAttentionLifecycle() }
+        await loadProfileData()
         do {
-            let saved = try JSONDecoder().decode(SavedWorkspace.self, from: Data(contentsOf: restorationURL))
-            guard saved.version == 1, !saved.tabs.isEmpty else { return }
-            pages = saved.tabs.map { WorkspacePage(id: UUID(), session: nil, savedProfile: $0.profile, savedDraft: $0.draft) }
-            let selected = pages[min(max(saved.selected, 0), pages.count - 1)].id
-            for page in pages {
-                guard navigationAvailable else { return }
-                await selectPage(page.id)
-                if let profile = page.savedProfile { _ = await connect(profile: profile) }
+            if let workspaceLocation {
+                let stream = try await application.restoreWorkspace(workspaceLocation)
+                var handledIssues = 0
+                for try await restored in stream {
+                    guard navigationAvailable else { return }
+                    let selected = selectedPage
+                    let session = selectedSession
+                    adopt(restored.workspace)
+                    for page in pages {
+                        if let session = page.session, observations[page.document] == nil, !cancelingRestoredTabs.contains(page.id) {
+                            _ = editor(for: page.snapshot)
+                            observe(session: session, document: page.document)
+                            await probe(session: session)
+                        }
+                    }
+                    if selected != selectedPage || session != selectedSession { await activateSelection() }
+                    if restored.progress.issues.count > handledIssues, let issue = restored.progress.issues.last {
+                        handledIssues = restored.progress.issues.count
+                        failure = issue.message
+                        if let profile = issue.profile {
+                            connectionHealth.recordFailure(profile: profile, message: issue.message)
+                        }
+                    }
+                    if let error = restored.progress.error { failure = error }
+                    if restored.progress.finished {
+                        if let document { editor(for: document).requestFocus() }
+                        return
+                    }
+                }
             }
-            await selectPage(selected)
-            if let document { editor(for: document).requestFocus() }
-        } catch { show(error) }
+            try await ensureWorkspace()
+        } catch {
+            show(error)
+            try? await ensureWorkspace()
+        }
     }
 
-    private func saveWorkspace() throws {
-        guard let restorationURL, !restoring else { return }
-        let tabs = pages.map { page -> SavedWorkspace.Tab in
-            let workspace = workspaces.first { $0.id == page.session }
-            let document = workspace?.documents.first
-            let draft = document.map { editors[$0.document]?.text ?? $0.draft } ?? page.savedDraft
-            return SavedWorkspace.Tab(profile: workspace?.profile ?? page.savedProfile, draft: draft)
+    private func ensureWorkspace() async throws {
+        guard navigationAvailable else { return }
+        if !pages.isEmpty { return }
+        if let workspaceBootstrap { adopt(try await workspaceBootstrap.value); return }
+        let worker = Task { [application] in
+            let current = try await application.workspace()
+            if !current.tabs.isEmpty { return current }
+            return try await application.openTab().workspace
         }
-        let saved = SavedWorkspace(version: 1, tabs: tabs, selected: pages.firstIndex { $0.id == selectedPage } ?? 0)
-        let directory = restorationURL.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        try JSONEncoder().encode(saved).write(to: restorationURL, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: restorationURL.path)
+        workspaceBootstrap = worker
+        defer { workspaceBootstrap = nil }
+        adopt(try await worker.value)
     }
+
+    private func saveWorkspace() async throws {
+        guard let workspaceLocation, !restoring else { return }
+        let drafts = pages.map { page in
+            WorkspaceDraft(tab: page.id, draft: editorAttachments.existing(page.document)?.text ?? page.snapshot.draft)
+        }
+        try await application.saveWorkspace(workspaceLocation, drafts: drafts)
+    }
+
+    private func adopt(_ next: TabInventory) {
+        guard !isClosed, next.revision >= (inventory?.revision ?? 0) else { return }
+        var next = next
+        let old = inventory?.tabs ?? []
+        for index in next.tabs.indices {
+            if let retained = old.first(where: { $0.id == next.tabs[index].id }), observations[retained.document] != nil {
+                next.tabs[index].snapshot = retained.snapshot
+            }
+        }
+        for removed in old where !next.tabs.contains(where: { $0.id == removed.id }) { retire(removed) }
+        inventory = next
+    }
+
+    private func refreshInventory() async throws { adopt(try await application.workspace()) }
 
     public var workspace: Workspace? { workspaces.first { $0.id == selectedSession } }
     public var document: DocumentSnapshot? {
         guard let workspace else { return nil }
         return workspace.documents.first { $0.document == workspace.selectedDocument }
     }
-    public var canPreview: Bool { currentTabAvailable && !connectionsVisible && !shortcutsVisible && controls?.primaryAction == "run" && backendActions.contains { $0.id == "query.plan" } }
+    public var canPreview: Bool { currentTabAvailable && !connectionsVisible && !shortcutsVisible && controls?.primaryAction == .run && backendActions.contains { $0.id == "query.plan" } }
     public var navigationAvailable: Bool { !isShuttingDown && !isClosed }
-    public var currentTabAvailable: Bool { navigationAvailable && !(selectedSession.map { closingSessions.contains($0) } ?? false) }
+    public var currentTabAvailable: Bool { navigationAvailable && !(selectedPage.map { closingTabs.contains($0) } ?? false) }
 
-    public func editor(for document: DocumentSnapshot) -> EditorBuffer {
-        if let editor = editors[document.document] { return editor }
-        let editor = EditorBuffer(text: document.draft)
-        editor.focusCycle = focusCycle
-        editors[document.document] = editor
-        return editor
-    }
+    public func editor(for document: DocumentSnapshot) -> EditorBuffer { editorAttachments.editor(for: document) }
 
     public func editorContextChanged(session: UUID, document: UUID) {
-        guard navigationAvailable, editors[document] != nil else { return }
+        guard navigationAvailable, editorAttachments.existing(document) != nil else { return }
         clearSharedInput()
         plan.dismiss()
-        contextVersions[document, default: 0] &+= 1
-        guard contextWorkers[document] == nil else { return }
-        contextWorkers[document] = Task { [weak self, bridge] in
-            defer { self?.contextWorkers[document] = nil }
-            while let self, self.editors[document] != nil {
-                let version = self.contextVersions[document]
-                do {
-                    let snapshot = try await bridge.request(.contextChanged(session: session, document: document), as: DocumentSnapshot.self)
-                    self.apply(snapshot, session: session)
-                } catch { self.show(error); return }
-                if self.contextVersions[document] == version { return }
-            }
-        }
+        editorAttachments.contextChanged(session: session, document: document)
     }
 
     public func editorChanged(session: UUID, document: UUID) {
         clearSharedInput()
         plan.dismiss()
-        guard let editor = editors[document], draftWorkers[document] == nil else { return }
-        draftWorkers[document] = Task { [weak self, editor, bridge] in
-            defer { self?.draftWorkers[document] = nil }
-            while let self, self.editors[document] === editor, editor.savedVersion < editor.version {
-                let version = editor.version
-                let draft = editor.text
-                do {
-                    let snapshot = try await bridge.request(.setDraft(session: session, document: document, draft: draft), as: DocumentSnapshot.self)
-                    editor.acknowledge(version)
-                    self.apply(snapshot, session: session)
-                } catch { self.show(error); return }
-            }
-        }
+        editorAttachments.draftChanged(session: session, document: document)
     }
 
     public func sendEditorIntent(_ intent: EditorIntent, session: UUID? = nil, document: UUID? = nil) {
-        guard let command = editorCommand(intent, session: session, document: document) else { return }
+        guard let command = editorRequest(intent, session: session, document: document) else { return }
         if intent != .reset { clearSharedInput(); plan.dismiss() }
-        Task { await performEditorCommand(command) }
+        Task { await performEditorRequest(command) }
     }
 
     public func performEditorIntent(_ intent: EditorIntent, session: UUID? = nil, document: UUID? = nil) async {
-        guard let command = editorCommand(intent, session: session, document: document) else { return }
+        guard let command = editorRequest(intent, session: session, document: document) else { return }
         if intent != .reset { clearSharedInput(); plan.dismiss() }
-        await performEditorCommand(command)
+        await performEditorRequest(command)
     }
 
-    private func editorCommand(_ intent: EditorIntent, session: UUID?, document: UUID?) -> BridgeCommand? {
+    private func editorRequest(_ intent: EditorIntent, session: UUID?, document: UUID?) -> EditorActionRequest? {
         guard currentTabAvailable, !connectionsVisible, !shortcutsVisible, let session = session ?? selectedSession,
               let workspace = workspaces.first(where: { $0.id == session }),
               let snapshot = workspace.documents.first(where: { $0.document == (document ?? workspace.selectedDocument) }) else { return nil }
         let editor = editor(for: snapshot)
         if editor.textView.hasMarkedText(), intent == .submit || intent == .primary { return nil }
         let selection = editor.scalarSelection
-        return .editorAction(session: session, document: snapshot.document, draft: editor.text, start: selection.lowerBound, end: selection.upperBound, intent: intent)
+        return EditorActionRequest(session: session, document: snapshot.document, draft: editor.text, selection: selection, intent: intent)
     }
 
-    private func performEditorCommand(_ command: BridgeCommand, context: UInt64? = nil) async {
+    private func performEditorRequest(_ command: EditorActionRequest) async {
         do {
-            await plan.waitForCleanup()
-            if let session = selectedSession {
-                await probeWorkers[session]?.value
-                guard selectedSession == session, let workspace = workspaces.first(where: { $0.id == session }) else { return }
-                if !workspace.documents.contains(where: { ["planning", "running", "canceling"].contains($0.execution) }) {
-                    let _: JSONValue = try await bridge.request(.awaitIdle(session: session), as: JSONValue.self)
-                }
-            }
-            if let context, context != inputContext { return }
             guard navigationAvailable else { return }
-            let _: EditorOutcome = try await bridge.request(command, as: EditorOutcome.self)
+            try await application.performEditorAction(command)
             await refreshControls()
         } catch { show(error) }
     }
 
-    public func openCurrentPlan() async {
-        guard canPreview else { return }
-        await prepareLegacyPreview()
-        await previewCurrent(pinned: true)
-    }
+    public func openCurrentPlan() async { await previewCurrent(pinned: true) }
 
     public func previewCurrent(pinned: Bool = false, display: Bool = true) async {
-        guard canPreview, let session = selectedSession, let document else { return }
-        let editor = editor(for: document)
-        guard !editor.textView.hasMarkedText() else { return }
-        let text = editor.text
-        let selection = editor.scalarSelection
-        await draftWorkers[document.document]?.value
-        await contextWorkers[document.document]?.value
-        guard !Task.isCancelled, selectedSession == session, self.document?.document == document.document, editor.text == text,
-              let current = self.document else { return }
-        await plan.show(session: session, document: current, text: text, selection: selection, pinned: pinned, display: display)
+        await queryInteraction.preview(pinned: pinned, display: display)
     }
 
     @discardableResult
@@ -273,12 +284,11 @@ public final class ApplicationStore: ObservableObject {
         let id = document.document
         let editor = editor(for: document)
         guard !editor.textView.hasMarkedText() else { return false }
-        await draftWorkers[id]?.value
-        await contextWorkers[id]?.value
+        await editorAttachments.wait(for: id)
         guard !Task.isCancelled, navigationAvailable, selectedSession == session,
               self.document?.document == id, !editor.textView.hasMarkedText() else { return false }
         do {
-            let snapshot = try await bridge.request(.restoreHistory(session: session, document: id, revision: revision, index: index), as: DocumentSnapshot.self)
+            let snapshot = try await application.restoreHistory(session: session, document: id, revision: revision, index: index)
             guard workspaces.contains(where: { $0.id == session && $0.documents.contains(where: { $0.document == id }) }) else { return false }
             apply(snapshot, session: session)
             editor.restore(text: snapshot.draft)
@@ -288,78 +298,108 @@ public final class ApplicationStore: ObservableObject {
         } catch { show(error); return false }
     }
 
-    public func loadProfiles() async {
-        do { profiles = try await bridge.request(.profiles, as: Profiles.self).profiles }
+    private func loadProfileData() async {
+        do { profiles = try await application.profiles() }
         catch { show(error) }
     }
 
+    public func loadProfiles() async {
+        await loadProfileData()
+        do { try await ensureWorkspace() } catch { show(error) }
+    }
+
     @discardableResult
-    public func connect(profile: String) async -> Bool {
-        guard navigationAvailable, pendingProfile == nil else { return false }
-        let targetPage = pages.first(where: { $0.id == selectedPage })?.session == nil ? selectedPage : UUID()
-        let intent = UUID()
-        navigationRevision += 1
+    public func connect(profile: String, tab requestedTab: UUID? = nil) async -> Bool {
+        guard navigationAvailable else { return false }
+        do { try await ensureWorkspace() } catch { show(error); return false }
+        var target = requestedTab ?? selectedPage
+        if requestedTab == nil, selectedSession != nil {
+            do { target = try await openSharedTab(); await activateSelection() }
+            catch { show(error); return false }
+        }
+        guard let tab = target, pages.contains(where: { $0.id == tab }), connectionAttachments[tab] == nil, !closingTabs.contains(tab) else { return false }
+        navigationRevision &+= 1
         let revision = navigationRevision
-        connectionIntent = intent
-        pendingProfile = profile
-        controlObservation?.cancel()
-        backendActions = []
-        controls = nil
-        defer { pendingProfile = nil }
+        let attachment = ConnectionAttachment(profile: profile, worker: Task { [application] in
+            try await application.connect(profile: profile, tab: tab, revision: revision)
+        })
+        connectionAttachments[tab] = attachment
+        if selectedPage == tab {
+            queryInteraction.detachObservation()
+            controlObservation?.cancel()
+            backendActions = []
+            controls = nil
+        }
+        defer {
+            if connectionAttachments[tab] != nil { connectionAttachments.removeValue(forKey: tab) }
+            cancelledConnections.remove(tab)
+            connectionCancellations.removeValue(forKey: tab)
+        }
         do {
-            let _: Controls = try await bridge.request(.selectSession(nil, revision: revision), as: Controls.self)
-            let connection = try await bridge.request(.connect(profile: profile, revision: revision), as: Connection.self)
-            guard connectionIntent == intent, connection.selected, !isShuttingDown else {
-                struct Closed: Decodable, Sendable { let closed: UUID }
-                do { let _: Closed = try await bridge.request(.closeSession(session: connection.session), as: Closed.self) }
-                catch {
-                    workspaces.append(Workspace(tab: connection.tab, id: connection.session, profile: profile, documents: [], selectedDocument: nil))
-                    pages.append(WorkspacePage(id: UUID(), session: connection.session))
-                    show(error)
+            let connection = try await attachment.worker.value
+            if cancelledConnections.contains(tab) {
+                await connectionCancellations[tab]?.value
+                if let current = try? await application.workspace(),
+                   let page = current.tabs.first(where: { $0.id == tab }), page.phase != .closing,
+                   page.session != nil || page.phase == .connecting {
+                    do { adopt(try await application.cancelConnection(tab)) }
+                    catch { if navigationAvailable { show(error) } }
                 }
+                try? await refreshInventory()
                 return false
             }
-            connectionsVisible = false
-            if let index = pages.firstIndex(where: { $0.id == targetPage }) { pages[index].session = connection.session }
-            else { pages.append(WorkspacePage(id: targetPage, session: connection.session)) }
-            selectedPage = targetPage
-            workspaces.append(Workspace(tab: connection.tab, id: connection.session, profile: profile, documents: [], selectedDocument: nil))
-            selectedSession = connection.session
-            await loadDocument()
-            if let page = pages.first(where: { $0.id == targetPage }), !page.savedDraft.isEmpty,
-               let document {
-                let editor = editor(for: document)
-                editor.restore(text: page.savedDraft)
-                let snapshot = try await bridge.request(.setDraft(session: connection.session, document: document.document, draft: page.savedDraft), as: DocumentSnapshot.self)
-                apply(snapshot, session: connection.session)
-            }
-            observeControls(session: connection.session)
-            await refreshActions(session: connection.session)
-            await refreshControls()
-            var status = ConnectionHealth()
-            status.state = .connected
-            health[connection.session] = status
+            guard !isShuttingDown, !isClosed else { return false }
+            connectionAttachments.removeValue(forKey: tab)
+            try await refreshInventory()
+            guard let page = pages.first(where: { $0.id == tab && $0.session == connection.session }) else { return false }
+            _ = editor(for: page.snapshot)
+            observe(session: connection.session, document: page.document)
+            if selectedPage == tab { await activateSelection() }
             await probe(session: connection.session)
-            startHealth(connection.session)
             return true
         } catch {
-            if connectionIntent == intent {
-                var status = ConnectionHealth()
-                status.state = .error
-                status.failure = (error as? BridgeFailure)?.message ?? error.localizedDescription
-                profileHealth[profile] = status
+            if cancelledConnections.contains(tab) {
+                await connectionCancellations[tab]?.value
+                try? await refreshInventory()
+                return false
+            }
+            connectionAttachments.removeValue(forKey: tab)
+            try? await refreshInventory()
+            if (error as? BridgeFailure)?.kind == "selection_superseded" { return false }
+            if pages.contains(where: { $0.id == tab }), !isShuttingDown, !isClosed {
+                connectionHealth.recordFailure(profile: profile, message: (error as? BridgeFailure)?.message ?? error.localizedDescription)
                 show(error)
             }
-            if let selectedSession { await selectSession(selectedSession) }
             return false
         }
     }
 
     public func cancelConnectionPicker() {
-        connectionIntent = nil
-        let page = selectedPage
-        guard pages.count > 1 else { return }
-        Task { await closePage(page) }
+        guard let tab = selectedPage else { return }
+        if connectionAttachments[tab] == nil, pages.first(where: { $0.id == tab })?.phase == .connecting {
+            guard cancelingRestoredTabs.insert(tab).inserted else { return }
+            Task { [weak self] in
+                guard let self else { return }
+                defer { cancelingRestoredTabs.remove(tab) }
+                if pages.count > 1 { await closePage(tab) }
+                else {
+                    do { adopt(try await application.cancelConnection(tab)) }
+                    catch { if navigationAvailable { show(error) } }
+                }
+            }
+            return
+        }
+        if connectionAttachments[tab] != nil {
+            guard cancelledConnections.insert(tab).inserted else { return }
+            connectionCancellations[tab] = Task { [weak self, application] in
+                guard let self else { return }
+                if self.pages.count > 1 { await self.closePage(tab) }
+                else {
+                    do { self.adopt(try await application.cancelConnection(tab)) }
+                    catch { try? await self.refreshInventory(); if self.navigationAvailable { self.show(error) } }
+                }
+            }
+        } else if pages.count > 1 { Task { await closePage(tab) } }
     }
 
     public func chooseConnections() async {
@@ -368,147 +408,114 @@ public final class ApplicationStore: ObservableObject {
     }
 
     public func selectPage(_ page: UUID) async {
-        guard navigationAvailable, let target = pages.first(where: { $0.id == page }) else { return }
-        if let session = target.session { await selectSession(session); return }
-        connectionIntent = nil
+        guard navigationAvailable, pages.contains(where: { $0.id == page }), !closingTabs.contains(page) else { return }
         clearSharedInput()
         plan.dismiss()
+        navigationRevision &+= 1
+        do {
+            adopt(try await application.selectTab(page, revision: navigationRevision))
+            await activateSelection()
+        } catch { show(error) }
+    }
+
+    private func activateSelection() async {
         controlObservation?.cancel()
         controlObservation = nil
-        navigationRevision += 1
-        selectedPage = page
-        selectedSession = nil
-        connectionsVisible = true
-        controls = nil
         backendActions = []
-        do { let _: Controls = try await bridge.request(.selectSession(nil, revision: navigationRevision), as: Controls.self) }
-        catch { show(error) }
+        controls = nil
+        reportViewedOutput()
+        if let session = selectedSession {
+            observeControls(session: session)
+            await refreshActions(session: session)
+        }
+        await refreshControls()
     }
 
     public func closePage(_ page: UUID) async {
-        guard navigationAvailable, let index = pages.firstIndex(where: { $0.id == page }) else { return }
-        if let session = pages[index].session { await closeSession(session); return }
-        if pages.count == 1 {
-            connectionIntent = nil
+        guard navigationAvailable, let target = pages.first(where: { $0.id == page }), closingTabs.insert(page).inserted else { return }
+        if target.session == nil, pages.count == 1 {
+            defer { closingTabs.remove(page) }
             do { try await shutdown() } catch {}
             return
         }
-        let selected = selectedPage == page
-        if selected { connectionIntent = nil }
-        pages.remove(at: index)
-        if pages.isEmpty { pages.append(WorkspacePage(id: UUID(), session: nil)) }
-        if selected { await selectPage(pages[min(index, pages.count - 1)].id) }
+        if connectionAttachments[page] != nil { cancelledConnections.insert(page) }
+        if let session = target.session { closingSessions.insert(session) }
+        defer {
+            closingTabs.remove(page)
+            if let session = target.session { closingSessions.remove(session) }
+        }
+        if selectedPage == page { clearSharedInput(); plan.dismiss() }
+        do {
+            await editorAttachments.wait(for: target.document)
+            adopt(try await application.closeTab(page))
+            if pages.isEmpty, navigationAvailable { adopt(try await application.openTab().workspace) }
+            await activateSelection()
+        } catch { try? await refreshInventory(); show(error) }
     }
 
-    public func closeCurrentTab() async { await closePage(selectedPage) }
+    public func closeCurrentTab() async {
+        do { try await ensureWorkspace() } catch { show(error); return }
+        if let selectedPage { await closePage(selectedPage) }
+    }
 
     public func selectSession(_ session: UUID) async {
-        clearSharedInput()
-        plan.dismiss()
-        guard navigationAvailable, !closingSessions.contains(session), workspaces.contains(where: { $0.id == session }) else { return }
-        connectionIntent = nil
-        navigationRevision += 1
-        let revision = navigationRevision
-        connectionsVisible = false
-        selectedSession = session
-        if let page = pages.first(where: { $0.session == session }) { selectedPage = page.id }
-        else { let page = WorkspacePage(id: UUID(), session: session); pages.append(page); selectedPage = page.id }
-        queryAttention.viewed(session)
-        synchronizeAttention()
-        backendActions = []
-        controls = nil
-        do {
-            let projection = try await bridge.request(.selectSession(session, revision: revision), as: Controls.self)
-            if navigationRevision == revision, selectedSession == session { controls = projection; observeControls(session: session); await refreshActions(session: session) }
-        } catch { show(error) }
+        guard let page = pages.first(where: { $0.session == session }) else { return }
+        await selectPage(page.id)
     }
 
     public func selectDocument(_ document: UUID) async {
-        if let target = workspaces.first(where: { $0.documents.contains(where: { $0.document == document }) }), target.id != selectedSession {
-            await selectSession(target.id)
-            return
-        }
-        clearSharedInput()
-        plan.dismiss()
-        guard navigationAvailable, let session = selectedSession else { return }
-        documentRevisions[session, default: 0] += 1
-        let revision = documentRevisions[session]!
-        do {
-            let snapshot = try await bridge.request(.selectDocument(session: session, document: document, revision: revision), as: DocumentSnapshot.self)
-            guard documentRevisions[session] == revision, selectedSession == session, let index = workspaces.firstIndex(where: { $0.id == session }) else { return }
-            workspaces[index].selectedDocument = snapshot.document
-            apply(snapshot, session: session)
-            await refreshControls()
-        } catch { show(error) }
+        guard let page = pages.first(where: { $0.document == document }) else { return }
+        await selectPage(page.id)
     }
 
     public func cycleDocument(_ direction: Int) async { await cycleWorkspace(direction) }
 
     public func cycleWorkspace(_ direction: Int) async {
-        guard !pages.isEmpty else { return }
-        let index = pages.firstIndex { $0.id == selectedPage } ?? 0
-        await selectPage(pages[(index + direction + pages.count) % pages.count].id)
+        guard navigationAvailable, !pages.isEmpty else { return }
+        clearSharedInput()
+        plan.dismiss()
+        navigationRevision &+= 1
+        do {
+            adopt(try await application.cycleTabs(direction, revision: navigationRevision))
+            await activateSelection()
+        } catch { show(error) }
+    }
+
+    private func openSharedTab() async throws -> UUID? {
+        clearSharedInput()
+        plan.dismiss()
+        navigationRevision &+= 1
+        let created = try await application.openTab(revision: navigationRevision)
+        adopt(created.workspace)
+        return created.tab
     }
 
     public func newDocument() async {
         guard navigationAvailable else { return }
-        let page = WorkspacePage(id: UUID(), session: nil)
-        pages.append(page)
-        await selectPage(page.id)
-    }
-
-    private func loadDocument() async {
-        clearSharedInput()
-        plan.dismiss()
-        guard navigationAvailable, let session = selectedSession else { return }
-        documentRevisions[session, default: 0] += 1
-        let revision = documentRevisions[session]!
         do {
-            let document = try await bridge.request(.openDocument(session: session, revision: revision), as: DocumentSnapshot.self)
-            guard let index = workspaces.firstIndex(where: { $0.id == session }) else { return }
-            workspaces[index].documents.append(document)
-            if documentRevisions[session] == revision { workspaces[index].selectedDocument = document.document }
-            observe(session: session, document: document.document)
+            _ = try await openSharedTab()
+            await activateSelection()
         } catch { show(error) }
     }
 
     public func closeDocument(_ document: UUID) async {
-        guard let workspace = workspaces.first(where: { $0.documents.contains(where: { $0.document == document }) }) else { return }
-        await closeSession(workspace.id)
+        guard let page = pages.first(where: { $0.document == document }) else { return }
+        await closePage(page.id)
     }
 
     public func closeSession(_ session: UUID) async {
-        guard navigationAvailable, closingSessions.insert(session).inserted else { return }
-        if selectedSession == session { clearSharedInput(); plan.dismiss() }
-        defer { closingSessions.remove(session) }
-        do {
-            struct Closed: Decodable, Sendable { let closed: UUID }
-            for document in workspaces.first(where: { $0.id == session })?.documents ?? [] {
-                await draftWorkers[document.document]?.value
-                await contextWorkers[document.document]?.value
-            }
-            await probeWorkers[session]?.value
-            await plan.waitForCleanup()
-            let _: JSONValue = try await bridge.request(.awaitIdle(session: session), as: JSONValue.self)
-            let _: Closed = try await bridge.request(.closeSession(session: session), as: Closed.self)
-            let wasSelected = selectedSession == session
-            let index = pages.firstIndex(where: { $0.session == session }) ?? 0
-            removeWorkspace(session)
-            if wasSelected {
-                if pages.isEmpty { pages.append(WorkspacePage(id: UUID(), session: nil)) }
-                await selectPage(pages[min(index, pages.count - 1)].id)
-            } else { await refreshControls() }
-        } catch { show(error) }
+        guard let page = pages.first(where: { $0.session == session }) else { return }
+        await closePage(page.id)
     }
 
     private func observeControls(session: UUID) {
         controlObservation?.cancel()
-        controlObservation = Task { [weak self, bridge] in
+        controlObservation = Task { [weak self, application] in
             do {
-                let stream = try await bridge.observeControls(session: session)
+                let stream = try await application.controlUpdates(session: session)
                 for try await projection in stream {
                     guard !Task.isCancelled, let self else { return }
-                    if self.selectedSession == session, projection.session == session { self.controlRevision &+= 1; self.controls = projection }
+                    if self.selectedSession == session, projection.session == session { self.applyControls(projection) }
                 }
             } catch { if let self, !self.isClosed, !(error is CancellationError) { self.show(error) } }
         }
@@ -516,49 +523,44 @@ public final class ApplicationStore: ObservableObject {
 
     private func refreshActions(session: UUID) async {
         do {
-            let response = try await bridge.request(.actions(session: session), as: BackendActions.self)
+            let response = try await application.actions(session: session)
             if selectedSession == session, response.session == session { backendActions = response.actions }
         } catch { show(error) }
     }
 
+    func applyControls(_ projection: Controls) {
+        guard projection.revision >= controlRevision else { return }
+        controlRevision = projection.revision
+        controls = projection
+    }
+
     public func refreshControls() async {
-        controlRevision &+= 1
-        let revision = controlRevision
         let session = selectedSession
         do {
-            let projection = try await bridge.request(.controls, as: Controls.self)
-            if revision == controlRevision, selectedSession == session, projection.session == session {
-                controls = projection
-            }
+            let projection = try await application.controls()
+            if selectedSession == session, projection.session == session { applyControls(projection) }
         } catch { if !isClosed && !isShuttingDown { show(error) } }
     }
 
     public func shutdown() async throws {
         if isClosed { return }
         if let shutdownTask { try await shutdownTask.value; return }
-        try saveWorkspace()
         isShuttingDown = true
-        cellInspector.cancel()
-        rowInspector.close()
-        clearSharedInput()
-        inputPreview?.cancel()
-        for task in healthTimers.values { task.cancel() }
-        healthTimers.removeAll()
-        let pendingHealth = Array(probeWorkers.values) + Array(profileProbeWorkers.values)
-        let pendingInput = inputWorker
-        let pendingDrafts = Array(draftWorkers.values) + Array(contextWorkers.values)
-        plan.dismiss()
-        let sessions = workspaces.map(\.id)
-        let task = Task { [bridge, plan] in
-            for worker in pendingHealth { await worker.value }
+        reportAttentionLifecycle()
+        let task = Task { [self] in
+            try await saveWorkspace()
+            cellInspector.cancel()
+            rowInspector.close()
+            clearSharedInput()
+            let pendingInput = queryInteraction.pending
+            let pendingDrafts = editorAttachments.pending
+            plan.dismiss()
             await pendingInput?.value
-            await plan.waitForCleanup()
             for worker in pendingDrafts { await worker.value }
-            for session in sessions { let _: JSONValue = try await bridge.request(.awaitIdle(session: session), as: JSONValue.self) }
-            try await bridge.shutdown()
+            applyAttention(try await application.shutdown())
         }
         shutdownTask = task
-        defer { shutdownTask = nil; isShuttingDown = false }
+        defer { shutdownTask = nil; isShuttingDown = false; reportAttentionLifecycle() }
         do {
             try await task.value
             clearSharedInput()
@@ -567,38 +569,32 @@ public final class ApplicationStore: ObservableObject {
             #if DZBAN_TEST_FIXTURES
             responsiveness.stop()
             #endif
+            connectionHealth.retire()
+            queryInteraction.retire()
             controlObservation?.cancel()
             controlObservation = nil
             isClosed = true
-            queryAttention.clear()
-            synchronizeAttention()
+            queryAttention.retire()
             for task in observations.values { task.cancel() }
             observations.removeAll()
-            workspaces.removeAll()
-            pages.removeAll()
-            for editor in editors.values { editor.retire() }
-            editors.removeAll()
-            selectedSession = nil
+            inventory = nil
+            editorAttachments.retireAll()
             controls = nil
         } catch {
-            if let inventory = try? await bridge.request(.tabs, as: TabInventory.self) {
-                let sessions = Set(inventory.tabs.compactMap(\.session))
-                for workspace in workspaces where !sessions.contains(workspace.id) { removeWorkspace(workspace.id) }
-                if selectedSession == nil, let selected = inventory.tabs.first(where: { $0.tab == inventory.selected })?.session {
-                    isShuttingDown = false
-                    await selectSession(selected)
-                }
+            if let current = try? await application.workspace() {
+                adopt(current)
+                isShuttingDown = false
+                await activateSelection()
             }
-            for workspace in workspaces { startHealth(workspace.id) }
             show(error); throw error
         }
     }
 
     private func observe(session: UUID, document: UUID) {
         observations[document]?.cancel()
-        observations[document] = Task { [weak self, bridge] in
+        observations[document] = Task { [weak self, application] in
             do {
-                let stream = try await bridge.observeDocument(session: session, document: document)
+                let stream = try await application.documentUpdates(session: session, document: document)
                 for try await snapshot in stream {
                     guard !Task.isCancelled, let self else { return }
                     self.apply(snapshot, session: session)
@@ -609,61 +605,44 @@ public final class ApplicationStore: ObservableObject {
         }
     }
 
-    func updateApplicationVisibility(_ visible: Bool) {
-        queryAttention.setVisible(visible, selected: connectionsVisible ? nil : selectedSession)
-        synchronizeAttention()
+    private var viewedOutput: ViewedOutput? {
+        guard !connectionsVisible, let page = pages.first(where: { $0.id == selectedPage }), page.session != nil else { return nil }
+        return ViewedOutput(tab: page.id, document: page.document, generation: page.snapshot.generation)
     }
 
-    private func synchronizeAttention(request: Bool = false) {
-        for index in workspaces.indices {
-            let outcome = queryAttention.unseen[workspaces[index].id]
-            let unread = outcome != nil
-            let failed = outcome == .failure
-            if workspaces[index].hasUnseenResult != unread { workspaces[index].hasUnseenResult = unread }
-            if workspaces[index].unseenResultFailed != failed { workspaces[index].unseenResultFailed = failed }
-        }
-        attentionChanged?(QueryAttentionUpdate(unreadCount: unseenCompletionCount, requestAttention: request,
-            cancelAttention: queryAttention.applicationVisible || unseenCompletionCount == 0))
+    func updateApplicationVisibility(_ visible: Bool) {
+        guard navigationAvailable else { return }
+        queryAttention.visibility(visible, viewed: viewedOutput)
     }
+
+    private func reportAttentionLifecycle() {
+        guard !isClosed else { return }
+        queryAttention.report(.lifecycle(restoring: restoring, quitting: isShuttingDown))
+    }
+
+    private func reportViewedOutput() {
+        guard navigationAvailable else { return }
+        queryAttention.report(.viewed(viewedOutput))
+    }
+
+    func applyAttention(_ snapshot: AttentionSnapshot) { queryAttention.apply(snapshot) }
 
     private func apply(_ snapshot: DocumentSnapshot, session: UUID) {
-        guard let workspace = workspaces.firstIndex(where: { $0.id == session }),
-              let document = workspaces[workspace].documents.firstIndex(where: { $0.document == snapshot.document }) else { return }
-        let retained = workspaces[workspace].documents[document]
+        guard let index = inventory?.tabs.firstIndex(where: { $0.session == session && $0.document == snapshot.document }),
+              let retained = inventory?.tabs[index].snapshot else { return }
         guard snapshot.generation >= retained.generation, snapshot.draftRevision >= retained.draftRevision else { return }
-        if snapshot.execution == "finished", snapshot.query != nil, snapshot.history != true,
-           snapshot.termination != "canceled", !restoring, !isShuttingDown, !closingSessions.contains(session),
-           snapshot.generation != retained.generation || retained.execution != "finished" {
-            let failed = snapshot.termination == "failed" || (snapshot.error != nil && snapshot.error != .null)
-                || (snapshot.captureError != nil && snapshot.captureError != .null)
-            let request = queryAttention.complete(session: session, outcome: failed ? .failure : .success,
-                selected: selectedSession == session && !connectionsVisible)
-            if queryAttention.unseen[session] != nil { workspaces[workspace].completionRevision &+= 1 }
-            synchronizeAttention(request: request)
-        }
-        workspaces[workspace].documents[document] = snapshot
+        inventory?.tabs[index].snapshot = snapshot
+        if selectedSession == session { reportViewedOutput() }
     }
 
-    private func removeWorkspace(_ session: UUID) {
-        queryAttention.remove(session)
-        synchronizeAttention()
-        healthTimers.removeValue(forKey: session)?.cancel()
-        probeWorkers.removeValue(forKey: session)
-        health.removeValue(forKey: session)
-        if selectedSession == session { clearSharedInput(); plan.dismiss(); controlObservation?.cancel(); controlObservation = nil; backendActions = [] }
-        if results.scope?.session == session { results.retire() }
-        if let workspace = workspaces.first(where: { $0.id == session }) {
-            for document in workspace.documents {
-                results.tablePositions.removeValue(forKey: document.document)
-                observations.removeValue(forKey: document.document)?.cancel()
-                editors.removeValue(forKey: document.document)?.retire()
-                contextVersions.removeValue(forKey: document.document)
-            }
+    private func retire(_ page: TabInventory.Tab) {
+        if let session = page.session {
+            if selectedSession == session { clearSharedInput(); plan.dismiss(); controlObservation?.cancel(); controlObservation = nil; backendActions = [] }
+            if results.scope?.session == session { results.retire() }
         }
-        workspaces.removeAll { $0.id == session }
-        pages.removeAll { $0.session == session }
-        documentRevisions.removeValue(forKey: session)
-        if selectedSession == session { selectedSession = nil; controls = nil }
+        results.tablePositions.removeValue(forKey: page.document)
+        observations.removeValue(forKey: page.document)?.cancel()
+        editorAttachments.retire(page.document)
     }
 
     private func show(_ error: Error) {
@@ -674,171 +653,32 @@ public final class ApplicationStore: ObservableObject {
 }
 
 extension ApplicationStore {
-    private func startHealth(_ session: UUID) {
-        healthTimers[session]?.cancel()
-        healthTimers[session] = Task { [weak self] in
-            while !Task.isCancelled {
-                do { try await Task.sleep(for: .seconds(5)) } catch { return }
-                guard self?.workspaces.contains(where: { $0.id == session }) == true else { return }
-                await self?.probe(session: session)
-            }
-        }
-    }
-
     public func probe(session: UUID) async {
-        guard navigationAvailable, let workspace = workspaces.first(where: { $0.id == session }),
-              !workspace.documents.contains(where: { ["planning", "running", "canceling"].contains($0.execution) }),
-              selectedSession != session || (!plan.loading && inputHeld.isEmpty), probeWorkers[session] == nil else { return }
-        let version = health[session]?.version == nil
-        health[session, default: ConnectionHealth()].probing = true
-        let worker = Task { [weak self, bridge] in
-            do {
-                let result = try await bridge.request(.probe(session: session, version: version), as: ConnectionProbe.self)
-                guard let self, self.workspaces.contains(where: { $0.id == session }) else { return }
-                var status = self.health[session] ?? ConnectionHealth()
-                status.probing = false
-                if result.state != .busy {
-                    status.state = result.state
-                    status.latencyMicros = result.latencyMicros
-                    status.failure = result.error
-                    status.checkedAt = Date()
-                    if let version = result.version { status.version = version }
-                }
-                self.health[session] = status
-                self.profileHealth[workspace.profile] = status
-            } catch {
-                guard let self, self.workspaces.contains(where: { $0.id == session }) else { return }
-                var status = self.health[session] ?? ConnectionHealth()
-                status.probing = false
-                status.state = .error
-                status.latencyMicros = nil
-                status.failure = (error as? BridgeFailure)?.message ?? error.localizedDescription
-                self.health[session] = status
-            }
-        }
-        probeWorkers[session] = worker
-        await worker.value
-        probeWorkers[session] = nil
+        guard navigationAvailable else { return }
+        await connectionHealth.probe(session: session)
     }
 
     public func probeProfile(_ profile: String) async {
-        guard navigationAvailable, profileProbeWorkers[profile] == nil else { return }
-        if let workspace = workspaces.first(where: { $0.profile == profile }) { await probe(session: workspace.id); return }
-        profileHealth[profile, default: ConnectionHealth()].probing = true
-        let worker = Task { [weak self, bridge] in
-            do {
-                let result = try await bridge.request(.probe(profile: profile), as: ConnectionProbe.self)
-                guard let self else { return }
-                var status = ConnectionHealth()
-                status.state = result.state
-                status.latencyMicros = result.latencyMicros
-                status.version = result.version
-                status.failure = result.error
-                status.checkedAt = Date()
-                self.profileHealth[profile] = status
-            } catch {
-                guard let self else { return }
-                var status = ConnectionHealth()
-                status.state = .error
-                status.failure = (error as? BridgeFailure)?.message ?? error.localizedDescription
-                self.profileHealth[profile] = status
-            }
-        }
-        profileProbeWorkers[profile] = worker
-        await worker.value
-        profileProbeWorkers[profile] = nil
+        guard navigationAvailable else { return }
+        await connectionHealth.probe(profile: profile)
     }
 
-    public func probeAllProfiles() async { for profile in profiles { await probeProfile(profile.name) } }
+    public func probeAllProfiles() async {
+        guard navigationAvailable else { return }
+        await connectionHealth.probeAll()
+    }
 
     public func sendSharedKey(_ key: NativeInput.Key, pressed: Bool, at: UInt64) {
-        if pressed { inputHeld.insert(key) } else { inputHeld.remove(key) }
-        if !pressed && !sharedInputMode { return }
-        sharedInputMode = true
-        if pressed && key == .cancel { inputContext &+= 1 }
-        enqueueInput(pressed ? .press(key, at: at) : .release(key, at: at))
+        queryInteraction.send(key, pressed: pressed, at: at)
     }
 
-    public func resetSharedKeyboard() {
-        inputHeld.removeAll()
-        if sharedInputMode { enqueueInput(.reset) } else { plan.reset() }
-    }
+    public func resetSharedKeyboard() { queryInteraction.reset() }
+    public func clearSharedInput() { queryInteraction.clear() }
 
-    public func clearSharedInput() {
-        inputContext &+= 1
-        inputPreviewRevision &+= 1
-        inputPreview?.cancel()
-        inputPreview = nil
-        inputHeld.removeAll()
-        sharedInputMode = false
-        sharedInput = nil
-        enqueueInput(.contextChanged, publish: false)
+    var interactionTarget: NativeEditorTarget? {
+        guard !isClosed, let session = selectedSession, let document else { return nil }
+        return NativeEditorTarget(session: session, document: document)
     }
-
-    public func prepareLegacyPreview() async {
-        clearSharedInput()
-        plan.dismiss()
-        await inputWorker?.value
-        await plan.waitForCleanup()
-        if let session = selectedSession { await probeWorkers[session]?.value }
-    }
-
-    private func enqueueInput(_ event: NativeInput, publish: Bool = true) {
-        guard let session = selectedSession, let id = document?.document, !isClosed else { return }
-        let previous = inputWorker
-        let context = inputContext
-        inputWorker = Task { [weak self, bridge] in
-            await previous?.value
-            guard let self, self.inputContext == context, self.selectedSession == session, self.document?.document == id else { return }
-            await self.draftWorkers[id]?.value
-            await self.contextWorkers[id]?.value
-            await self.probeWorkers[session]?.value
-            guard self.inputContext == context, self.selectedSession == session, let document = self.document, document.document == id else { return }
-            do {
-                let projection = try await bridge.request(.input(session: session, document: id, revision: document.draftRevision, event: event), as: InputProjection.self)
-                guard self.inputContext == context, self.selectedSession == session, self.document?.document == id else { return }
-                if publish {
-                    self.sharedInput = projection
-                    await self.performInputCommands(projection.commands, context: context)
-                }
-            } catch {
-                if (error as? BridgeFailure)?.kind != "selection_superseded" { self.show(error) }
-            }
-        }
-    }
-
-    private func performInputCommands(_ commands: [String], context: UInt64) async {
-        for command in commands {
-            switch command {
-            case "begin_preview":
-                inputPreviewRevision &+= 1
-                let revision = inputPreviewRevision
-                inputPreview?.cancel()
-                inputPreview = Task { [weak self] in
-                    guard let self else { return }
-                    await self.refreshControls()
-                    await self.previewCurrent(display: false)
-                    guard !Task.isCancelled, self.inputContext == context, self.inputPreviewRevision == revision else { return }
-                    if let plan = self.plan.plan { self.enqueueInput(.ready(plan)) }
-                    else if let failure = self.plan.failure { self.enqueueInput(.failed(failure)) }
-                }
-            case "cancel_preview":
-                inputPreviewRevision &+= 1
-                inputPreview?.cancel()
-                plan.dismiss()
-                enqueueInput(.previewCanceled)
-            case "show_plan": plan.present(visible: true)
-            case "pin_plan": plan.present(visible: true, pinned: true)
-            case "hide_plan": plan.present(visible: false)
-            case "run_query":
-                inputPreviewRevision &+= 1
-                inputPreview?.cancel()
-                plan.dismiss()
-                if let command = editorCommand(.primary, session: nil, document: nil) { await performEditorCommand(command, context: context) }
-            case "cancel_query":
-                if let command = editorCommand(.cancel, session: nil, document: nil) { await performEditorCommand(command, context: context) }
-            default: break
-            }
-        }
-    }
+    var interactionAvailable: Bool { currentTabAvailable && selectedSession != nil }
+    func interactionFailed(_ error: Error) { show(error) }
 }

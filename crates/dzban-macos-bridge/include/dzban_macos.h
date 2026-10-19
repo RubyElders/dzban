@@ -12,11 +12,27 @@ typedef struct {
 } BridgeBuffer;
 
 uint32_t dzban_abi_version(void);
+/* Pure policy with no I/O; may run on the UI thread. Input is at most 32 MiB JSON.
+ * Status 7 means invalid input. Successful buffers use the normal token release rules. */
+BridgeBuffer dzban_result_view(const uint8_t *data, size_t length);
 uint64_t dzban_create(void);
+/* Syntax work has no I/O but belongs on a background worker. Copies up to 32 MiB of UTF-8.
+ * Read sequential binary batches of at most 512 spans; release each buffer token and the lexer handle.
+ * Little-endian u64 header: schema=1, revision, source bytes/scalars/UTF-16, span count, done.
+ * Each span: start bytes/scalars/UTF-16, end bytes/scalars/UTF-16, kind.
+ * Kinds: 0 keyword, 1 string, 2 number, 3 comment, 4 identifier, 5 function.
+ * Abort and release the reader after a failed read. */
+uint64_t dzban_syntax_create(const uint8_t *data, size_t length, uint64_t revision);
+BridgeBuffer dzban_syntax_read(uint64_t handle);
+/* Host attention input does no I/O and may run on the UI thread. Input is at most 1 MiB.
+ * Status 7 means invalid input; status 6 includes the 8 MiB response limit.
+ * Successful buffers use the normal token release rules. */
+BridgeBuffer dzban_attention(uint64_t app, const uint8_t *data, size_t length);
 #ifdef DZBAN_TEST_FIXTURES
 uint64_t dzban_create_fixture(void);
 #endif
-/* Copies at most 1 MiB of readable UTF-8 JSON before returning. Zero means admission failed. */
+/* Copies at most 1 MiB of readable UTF-8 JSON, or 32 MiB for workspace saves.
+ * Zero means admission failed. */
 uint64_t dzban_send(uint64_t app, const uint8_t *data, size_t length);
 /* One waiter per stream; never call on the UI thread. Timeout is capped at 60 seconds.
  * Status: 0 record, 1 timeout, 2 released, 3 concurrent waiter, 4 invalid handle,

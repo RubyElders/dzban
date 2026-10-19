@@ -5,33 +5,32 @@ import QuartzCore
 
 public enum ResultStatus {
     public static func describe(_ document: DocumentSnapshot) -> String {
-        if document.history == true {
-            if document.termination == "failed" { return "Saved query failed" }
-            if let command = document.commandResult { return command.affectedRows.map { "Saved command - \($0) rows affected" } ?? "Saved command" }
-            return "Saved - \(document.rows) of \(document.historyTotalRows ?? document.rows) rows"
-        }
-        if document.generation == 0 { return "Run a query to see results" }
-        if document.execution == "canceling" { return "Canceling - \(document.rows) rows captured" }
-        switch document.resultPhase {
-        case "waiting_for_schema": return "Waiting for schema"
-        case "receiving": return "Receiving - \(document.rows) rows"
-        case "draining": return "Truncated - \(document.rows) rows; waiting for cleanup"
-        case "failed_awaiting_cleanup": return "Result capture failed; waiting for cleanup"
-        case "finished":
-            if document.execution != "finished" { return "Finishing - \(document.rows) rows" }
-            if document.termination == "limited" || document.cutoff != nil { return "Truncated - \(document.rows) rows (\(document.cutoff == .string("Bytes") ? "byte" : "row") limit)" }
-            if document.termination == "canceled" { return "Canceled - \(document.rows) rows" }
-            if document.termination == "failed" { return "Failed - \(document.rows) rows" }
-            if let command = document.commandResult { return command.affectedRows.map { "\($0) rows affected" } ?? "Command completed" }
-            return "Complete - \(document.rows) rows"
-        default: return document.execution == "planning" ? "Planning query" : "Waiting for results"
+        let feedback = document.feedback
+        switch feedback.status {
+        case .ready: return "Run a query to see results"
+        case .planning: return "Planning query"
+        case .waiting: return "Waiting for results"
+        case .waitingForSchema: return "Waiting for schema"
+        case .receiving: return "Receiving - \(feedback.rows) rows"
+        case .draining: return "Truncated - \(feedback.rows) rows; waiting for cleanup"
+        case .captureFailedAwaitingCleanup: return "Result capture failed; waiting for cleanup"
+        case .finishing: return "Finishing - \(feedback.rows) rows"
+        case .canceling: return "Canceling - \(feedback.rows) rows captured"
+        case .limitedByRows: return "Truncated - \(feedback.rows) rows (row limit)"
+        case .limitedByBytes: return "Truncated - \(feedback.rows) rows (byte limit)"
+        case .canceled: return "Canceled - \(feedback.rows) rows"
+        case .failed: return "Failed - \(feedback.rows) rows"
+        case .command: return feedback.affectedRows.map { "\($0) rows affected" } ?? "Command completed"
+        case .complete: return "Complete - \(feedback.rows) rows"
+        case .savedFailed: return "Saved query failed"
+        case .savedCommand: return feedback.affectedRows.map { "Saved command - \($0) rows affected" } ?? "Saved command"
+        case .savedRows: return "Saved - \(feedback.rows) of \(feedback.totalRows ?? feedback.rows) rows"
         }
     }
 }
 
 struct ResultPanel: View {
     @ObservedObject var model: ResultViewport
-    let bridge: Bridge
     let session: UUID
     let document: DocumentSnapshot
     let cancel: () -> Bool
@@ -39,9 +38,8 @@ struct ResultPanel: View {
     @ObservedObject private var cell: CellInspectorModel
     @State private var inspecting: ResultAddress?
 
-    init(model: ResultViewport, cell: CellInspectorModel, row: RowInspectorModel, bridge: Bridge, session: UUID, document: DocumentSnapshot, cancel: @escaping () -> Bool) {
+    init(model: ResultViewport, cell: CellInspectorModel, row: RowInspectorModel, session: UUID, document: DocumentSnapshot, cancel: @escaping () -> Bool) {
         self.model = model
-        self.bridge = bridge
         self.session = session
         self.document = document
         self.cancel = cancel
@@ -54,42 +52,46 @@ struct ResultPanel: View {
         let document: UUID
         let generation: UInt64
         let rows: Int
-        let phase: String?
-        let execution: String
+        let phase: CapturePhase?
+        let execution: ExecutionPhase
     }
     private var revision: Revision { Revision(session: session, document: document.document, generation: document.generation, rows: document.rows, phase: document.resultPhase, execution: document.execution) }
 
     private var issues: [ResultIssue] {
         var issues: [ResultIssue] = []
-        if let error = document.error, error != .null, document.termination != "canceled" {
-            issues.append(ResultIssue(id: "query.error", title: "Query failed", detail: QueryDiagnostic.describe(error)))
+        if let diagnostic = document.feedback.queryDiagnostic {
+            issues.append(ResultIssue(id: "query.error", title: "Query failed", detail: diagnostic.text))
         }
         if let failure = model.loadError { issues.append(ResultIssue(id: "results.read-error", title: "Unable to load results", detail: failure)) }
         if let failure = model.copyError { issues.append(ResultIssue(id: "results.copy-error", title: "Unable to copy results", detail: failure)) }
         if let failure = cell.failure { issues.append(ResultIssue(id: "results.cell-error", title: "Unable to copy cell", detail: failure)) }
-        if let error = document.captureError, document.error == nil {
-            issues.append(ResultIssue(id: "results.capture-error", title: "Result capture stopped", detail: QueryDiagnostic.describe(error)))
+        if let diagnostic = document.feedback.captureDiagnostic {
+            issues.append(ResultIssue(id: "results.capture-error", title: "Result capture stopped", detail: diagnostic.text))
         }
         return issues
     }
 
     private var emptyTitle: String {
-        if document.generation == 0 { return "Ready to query" }
-        if document.commandResult != nil { return "Command complete" }
-        if document.termination == "canceled" { return "Query stopped" }
-        return "No rows returned"
+        switch document.feedback.empty {
+        case .ready: return "Ready to query"
+        case .command: return "Command complete"
+        case .canceled: return "Query stopped"
+        case .noRows: return "No rows returned"
+        }
     }
 
     private var emptyDetail: String {
-        if document.generation == 0 { return "Run your SQL to explore the results." }
-        if let command = document.commandResult { return command.affectedRows.map { "\($0) rows affected." } ?? "The command completed successfully." }
-        if document.termination == "canceled" { return "No rows were returned before the query stopped." }
-        return "The query completed without returning any rows."
+        switch document.feedback.empty {
+        case .ready: return "Run your SQL to explore the results."
+        case .command: return document.feedback.affectedRows.map { "\($0) rows affected." } ?? "The command completed successfully."
+        case .canceled: return "No rows were returned before the query stopped."
+        case .noRows: return "The query completed without returning any rows."
+        }
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            QueryProgress(busy: ["planning", "running", "canceling"].contains(document.execution))
+            QueryProgress(busy: document.feedback.progress != nil)
                 .frame(height: 2)
             VStack(spacing: 0) {
                 if !issues.isEmpty && model.availableRows > 0 {
@@ -107,11 +109,11 @@ struct ResultPanel: View {
                         ResultState(symbol: "exclamationmark.circle", title: issues.first?.title ?? "Unable to show results", tint: .red) {
                             ResultDiagnostic(issues: issues, retry: model.loadError == nil ? nil : { model.retry() }, showTitle: false)
                         }
-                    } else if ["planning", "running", "canceling"].contains(document.execution), let started = document.startedAtSeconds, document.history != true {
+                    } else if document.feedback.progress != nil, let started = document.startedAtSeconds, document.history != true {
                         QueryRunSummary(document: document, started: Date(timeIntervalSince1970: started))
                             .allowsHitTesting(false)
                     } else if model.availableRows == 0 && !model.isLoading {
-                        ResultState(symbol: document.generation == 0 ? "tablecells" : document.commandResult != nil ? "checkmark" : "line.3.horizontal.decrease", title: emptyTitle, tint: .secondary) {
+                        ResultState(symbol: document.feedback.empty == .ready ? "tablecells" : document.feedback.empty == .command ? "checkmark" : "line.3.horizontal.decrease", title: emptyTitle, tint: .secondary) {
                             Text(emptyDetail).font(.callout).foregroundStyle(.secondary)
                         }.allowsHitTesting(false)
                     }
@@ -143,7 +145,7 @@ struct ResultFooter: View {
     @ObservedObject var model: ResultViewport
     @ObservedObject var cell: CellInspectorModel
     let document: DocumentSnapshot?
-    let bridge: Bridge
+    let application: ApplicationClient
 
     var body: some View {
         HStack(spacing: 6) {
@@ -156,7 +158,7 @@ struct ResultFooter: View {
                     Text(estimate).foregroundStyle(.secondary).lineLimit(1)
                         .help(PlanFormatting.summary(plan)).accessibilityIdentifier("results.row-estimate")
                 }
-                if document.execution == "finished", document.history != true, document.commandResult == nil,
+                if document.execution == .finished, document.history != true, document.commandResult == nil,
                    let plan = document.executionPlan, let cost = PlanFormatting.costEstimate(plan) {
                     Text(cost).foregroundStyle(.secondary)
                         .help("Planner cost estimate").accessibilityIdentifier("results.cost-estimate")
@@ -167,7 +169,7 @@ struct ResultFooter: View {
                         .accessibilityIdentifier("history.sample-note")
                 }
                 if document.historyPlanAvailable == true, let session = document.session {
-                    SavedPlanButton(bridge: bridge, scope: ResultScope(session: session, document: document.document, generation: document.generation))
+                    SavedPlanButton(application: application, scope: ResultScope(session: session, document: document.document, generation: document.generation))
                 }
             } else { Text("-- rows") }
             if model.isLoading || cell.copying {
@@ -241,7 +243,7 @@ private struct QueryRunSummary: View {
         VStack(spacing: 7) {
             HStack(spacing: 7) {
                 ProgressView().controlSize(.small)
-                Text(document.execution == "canceling" ? "Stopping query" : document.execution == "planning" ? "Planning query" : "Running query")
+                Text(document.feedback.progress == .canceling ? "Stopping query" : document.feedback.progress == .planning ? "Planning query" : "Running query")
                     .font(.caption.weight(.medium)).foregroundStyle(.secondary)
             }
             Text(String(format: "Elapsed %.1fs", max(0, now.timeIntervalSince(started))))
@@ -256,7 +258,7 @@ private struct QueryRunSummary: View {
                 Text(PlanFormatting.compact(plan)).help(PlanFormatting.summary(plan))
                     .accessibilityIdentifier("results.estimate")
             } else {
-                Text(document.execution == "planning" ? "Estimating..." : "Estimate unavailable")
+                Text(document.feedback.progress == .planning ? "Estimating..." : "Estimate unavailable")
                     .accessibilityIdentifier("results.estimate")
             }
         }
@@ -324,8 +326,8 @@ struct CellInspectorView: View {
             }
         }
         .padding(20)
-        .onAppear { model.openEntire(address) }
-        .onDisappear { model.cancel() }
+        .task(id: address) { model.openEntire(address) }
+        .onDisappear { model.presentationEnded() }
     }
 }
 
@@ -335,6 +337,10 @@ struct ReadOnlyText: NSViewRepresentable {
     var focusOnAppear = false
 
     func makeNSView(context: Context) -> NSScrollView {
+        #if DZBAN_TEST_FIXTURES
+        ViewUpdateDiagnostics.frames.append("ResultPanel.swift")
+        defer { ViewUpdateDiagnostics.frames.removeLast() }
+        #endif
         let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 600, height: 400))
         scroll.hasVerticalScroller = true
         let view = ReadOnlyTextView(frame: scroll.contentView.bounds)
@@ -356,6 +362,10 @@ struct ReadOnlyText: NSViewRepresentable {
     }
 
     func updateNSView(_ scroll: NSScrollView, context: Context) {
+        #if DZBAN_TEST_FIXTURES
+        ViewUpdateDiagnostics.frames.append("ResultPanel.swift")
+        defer { ViewUpdateDiagnostics.frames.removeLast() }
+        #endif
         guard let view = scroll.documentView as? NSTextView, view.string != text else { return }
         view.string = text
         view.scrollRangeToVisible(NSRange(location: 0, length: 0))
@@ -364,6 +374,17 @@ struct ReadOnlyText: NSViewRepresentable {
 
 private final class ReadOnlyTextView: NSTextView {
     var focusOnAppear = false
+
+    #if DZBAN_TEST_FIXTURES
+    override func copy(_ sender: Any?) {
+        if ProcessInfo.processInfo.arguments.contains("--test-pasteboard") {
+            let pasteboard = ResultMarkdown.pasteboard
+            pasteboard.declareTypes([.string], owner: nil)
+            let text = string as NSString
+            pasteboard.setString(selectedRanges.map { text.substring(with: $0.rangeValue) }.joined(separator: "\n"), forType: .string)
+        } else { super.copy(sender) }
+    }
+    #endif
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()

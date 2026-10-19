@@ -1,3 +1,21 @@
+pub fn selected_sql(text: &str, start: usize, end: usize) -> Result<String, &'static str> {
+    let length = text.chars().count();
+    if start > end || end > length {
+        return Err("Selection is outside the draft");
+    }
+    let sql = if start == end {
+        query_at_cursor(text, start).map(|query| query.0)
+    } else {
+        Some(text.chars().skip(start).take(end - start).collect())
+    };
+    let sql = sql.unwrap_or_default().trim().to_owned();
+    if sql.is_empty() {
+        Err("Empty query")
+    } else {
+        Ok(sql)
+    }
+}
+
 pub fn query_at_cursor(text: &str, cursor: usize) -> Option<(String, usize, usize)> {
     let byte_cursor = if cursor == text.chars().count() {
         text.len()

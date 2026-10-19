@@ -35,21 +35,22 @@ public struct DocumentSnapshot: Decodable, Sendable {
     public let draftRevision: UInt64
     public let title: String
     public let draft: String
-    public let execution: String
-    public let resultPhase: String?
+    public let execution: ExecutionPhase
+    public let resultPhase: CapturePhase?
     public let resultAvailable: Bool
     public let rows: Int
     public let error: JSONValue?
     public let cutoff: JSONValue?
     public let receivedRows: Int?
     public let captureBytes: Int?
-    public let termination: String?
+    public let termination: CaptureTermination?
     public let captureError: JSONValue?
     public let commandResult: CommandResult?
     public let startedAtSeconds: Double?
     public let elapsedSeconds: Double?
-    public let executionPlan: JSONValue?
+    public let executionPlan: PlanPresentation?
     public let executionSeconds: Double?
+    public let feedback: ResultFeedback
     public let history: Bool?
     public let historyTotalRows: Int?
     public let historyPlanAvailable: Bool?
@@ -67,9 +68,10 @@ public struct Connection: Decodable, Sendable {
 }
 
 public struct Controls: Decodable, Sendable {
+    public let revision: UInt64
     public let session: UUID?
     public let query: UUID?
-    public let primaryAction: String
+    public let primaryAction: PrimaryAction
 }
 
 public struct Connections: Decodable, Sendable {
@@ -112,13 +114,15 @@ public struct Submission: Decodable, Sendable {
     public let generation: UInt64
 }
 
-public struct Column: Decodable, Sendable, Equatable {
+public struct Column: Codable, Sendable, Equatable {
     public let name: String
     public let typeName: String
 }
 
 #if DZBAN_TEST_FIXTURES
 public struct BridgeByteMetrics: Decodable, Sendable {
+    public let exportReaders: Int
+    public let observers: Int
     public let recordBytes: Int
     public let peakRecordBytes: Int
     public let bufferBytes: Int
@@ -178,7 +182,7 @@ public struct Preview: Decodable, Sendable {
     public let session: UUID
     public let document: UUID
     public let draftRevision: UInt64
-    public let plan: JSONValue
+    public let plan: PlanPresentation
 }
 
 public struct History: Decodable, Sendable {
@@ -186,9 +190,22 @@ public struct History: Decodable, Sendable {
     public let entries: [Entry]
 }
 
+public struct ExportRowRange: Encodable, Sendable {
+    public let start: Int
+    public let end: Int
+    public init(start: Int, end: Int) { self.start = start; self.end = end }
+}
+
+public struct ExportChunk: Decodable, Sendable {
+    public let text: String
+    public let done: Bool
+    public let isNull: Bool
+}
+
 public struct BridgeCommand: Encodable, Sendable {
     let command: String
     var profile: String?
+    var tab: UUID?
     var session: UUID?
     var document: UUID?
     var draft: String?
@@ -211,14 +228,20 @@ public struct BridgeCommand: Encodable, Sendable {
     var requestRevision: UInt64?
     var historyRevision: UUID?
     var index: Int?
+    var direction: Int?
     var includeVersion: Bool?
     var input: NativeInput?
+    var export: UUID?
+    var ranges: [ExportRowRange]?
+    var location: WorkspaceLocation?
+    var drafts: [WorkspaceDraft]?
 
-    public static func connect(profile: String, revision: UInt64? = nil) -> Self { Self(command: "connect", profile: profile, revision: revision) }
+    public static func restoreWorkspace(_ location: WorkspaceLocation) -> Self { Self(command: "restore_workspace", location: location) }
+    public static func saveWorkspace(_ location: WorkspaceLocation, drafts: [WorkspaceDraft]) -> Self { Self(command: "save_workspace", location: location, drafts: drafts) }
+    public static func connect(profile: String, tab: UUID? = nil, revision: UInt64? = nil) -> Self { Self(command: "connect", profile: profile, tab: tab, revision: revision) }
     public static func selectSession(_ session: UUID?, revision: UInt64? = nil) -> Self { Self(command: "select_session", session: session, revision: revision) }
-    public static func selectDocument(session: UUID, document: UUID, revision: UInt64? = nil) -> Self { Self(command: "select_document", session: session, document: document, revision: revision) }
     public static func closeDocument(session: UUID, document: UUID) -> Self { Self(command: "close_document", session: session, document: document) }
-    public static func openDocument(session: UUID, revision: UInt64? = nil) -> Self { Self(command: "open_document", session: session, revision: revision) }
+    public static func openDocument(session: UUID) -> Self { Self(command: "open_document", session: session) }
     public static func setDraft(session: UUID, document: UUID, draft: String) -> Self {
         Self(command: "set_draft", session: session, document: document, draft: draft)
     }
@@ -246,6 +269,11 @@ public struct BridgeCommand: Encodable, Sendable {
     }
     public static func cancelPreview(session: UUID, requestRevision: UInt64? = nil) -> Self { Self(command: "cancel_preview", session: session, requestRevision: requestRevision) }
     public static func history(session: UUID) -> Self { Self(command: "history", session: session) }
+    public static func startExport(_ export: UUID, session: UUID, document: UUID, generation: UInt64, row: Int? = nil, column: Int? = nil, ranges: [ExportRowRange]? = nil) -> Self {
+        Self(command: "start_export", session: session, document: document, generation: generation, row: row, column: column, export: export, ranges: ranges)
+    }
+    public static func readExport(_ export: UUID) -> Self { Self(command: "read_export", export: export) }
+    public static func closeExport(_ export: UUID) -> Self { Self(command: "close_export", export: export) }
     public static func readCell(session: UUID, document: UUID, generation: UInt64, row: Int, column: Int, offset: Int, count: Int) -> Self {
         Self(command: "read_cell", session: session, document: document, generation: generation, count: count, row: row, column: column, offset: offset)
     }
@@ -257,23 +285,26 @@ public struct BridgeCommand: Encodable, Sendable {
     #endif
     public static let profiles = Self(command: "profiles")
     public static let controls = Self(command: "controls")
+    public static let observeAttention = Self(command: "observe_attention")
     public static let connections = Self(command: "connections")
     public static let shutdown = Self(command: "shutdown")
 }
 
-private struct Envelope<T: Decodable>: Decodable {
+struct Envelope<T: Decodable>: Decodable {
     let schema: Int
     let revision: UInt64
     let payload: T
 }
 
+private struct Header: Decodable { let schema: Int }
 private struct FailurePayload: Decodable { let failure: BridgeFailure? }
 
-private func decode<T: Decodable>(_ data: Data, as type: T.Type) throws -> Envelope<T> {
+func decodeRecord<T: Decodable>(_ data: Data, as type: T.Type) throws -> Envelope<T> {
     let decoder = JSONDecoder()
     decoder.keyDecodingStrategy = .convertFromSnakeCase
+    let header = try decoder.decode(Header.self, from: data)
+    guard header.schema == 1 else { throw BridgeFailure(kind: "schema", message: "Unsupported bridge schema") }
     let probe = try decoder.decode(Envelope<FailurePayload>.self, from: data)
-    guard probe.schema == 1 else { throw BridgeFailure(kind: "schema", message: "Unsupported bridge schema") }
     if let error = probe.payload.failure { throw error }
     return try decoder.decode(Envelope<T>.self, from: data)
 }
@@ -351,7 +382,7 @@ public final class Bridge: Sendable {
                         while !observation.isReleased {
                             if let data = try wait(operation, after: 0) {
                                 guard !observation.isReleased else { throw CancellationError() }
-                                continuation.resume(returning: try decode(data, as: type).payload)
+                                continuation.resume(returning: try decodeRecord(data, as: type).payload)
                                 return
                             }
                         }
@@ -362,11 +393,32 @@ public final class Bridge: Sendable {
         } onCancel: { observation.release() }
     }
 
+    public func restoreWorkspace(_ location: WorkspaceLocation) async throws -> AsyncThrowingStream<WorkspaceRestoration, Error> {
+        try observe(.restoreWorkspace(location), as: WorkspaceRestoration.self)
+    }
     public func observeDocument(session: UUID, document: UUID) async throws -> AsyncThrowingStream<DocumentSnapshot, Error> {
         try observe(.observeDocument(session: session, document: document), as: DocumentSnapshot.self)
     }
     public func observeControls(session: UUID) async throws -> AsyncThrowingStream<Controls, Error> {
         try observe(.observeControls(session: session), as: Controls.self)
+    }
+    public func attention(_ input: AttentionInput) throws -> AttentionSnapshot {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let data = try encoder.encode(input)
+        let buffer = data.withUnsafeBytes { dzban_attention(handle, $0.bindMemory(to: UInt8.self).baseAddress, data.count) }
+        guard buffer.status == 0, let pointer = buffer.data else { throw BridgeFailure(kind: "attention", message: "Cannot report application visibility") }
+        defer { _ = dzban_buffer_release(buffer.token) }
+        return try decodeRecord(Data(bytes: pointer, count: buffer.length), as: AttentionSnapshot.self).payload
+    }
+    public func observeAttention() async throws -> AsyncThrowingStream<AttentionSnapshot, Error> {
+        try observe(.observeAttention, as: AttentionSnapshot.self)
+    }
+    public func observeHealth() async throws -> AsyncThrowingStream<HealthSnapshot, Error> {
+        try observe(.observeHealth, as: HealthSnapshot.self)
+    }
+    public func observeInteraction(session: UUID) async throws -> AsyncThrowingStream<InteractionProjection, Error> {
+        try observe(.observeInteraction(session: session), as: InteractionProjection.self)
     }
     private func observe<T: Decodable & Sendable>(_ command: BridgeCommand, as type: T.Type) throws -> AsyncThrowingStream<T, Error> {
         let stream = try send(command)
@@ -380,7 +432,7 @@ public final class Bridge: Sendable {
                     while !observation.isReleased {
                         if let data = try wait(stream, after: revision) {
                             guard !observation.isReleased else { break }
-                            let envelope = try decode(data, as: type)
+                            let envelope = try decodeRecord(data, as: type)
                             revision = envelope.revision
                             continuation.yield(envelope.payload)
                         }
@@ -392,11 +444,12 @@ public final class Bridge: Sendable {
         }
     }
 
-    public func shutdown() async throws {
-        struct Shutdown: Decodable, Sendable { let shutdown: Bool }
+    @discardableResult public func shutdown() async throws -> AttentionSnapshot {
+        struct Shutdown: Decodable, Sendable { let shutdown: Bool; let attention: AttentionSnapshot }
         let result = try await request(.shutdown, as: Shutdown.self)
         guard result.shutdown, dzban_release(handle) else {
             throw BridgeFailure(kind: "shutdown", message: "Application cleanup did not finish")
         }
+        return result.attention
     }
 }
