@@ -6,5 +6,6 @@
     <file>scalable/status/dzban-query-time-symbolic.svg</file>
     <file>scalable/status/dzban-result-rows-symbolic.svg</file>
     <file>scalable/status/dzban-ping-symbolic.svg</file>
+    <file>scalable/status/dzban-plan-symbolic.svg</file>
   </gresource>
 </gresources>

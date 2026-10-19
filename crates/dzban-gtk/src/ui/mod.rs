@@ -1,15 +1,20 @@
-mod connection_state;
-mod connections;
-mod db_tabs;
+mod action_search;
+mod app;
+mod chooser;
+mod editor;
+mod format;
+mod history;
 pub(crate) mod icons;
-mod plan_inspector;
-mod preview_overlay;
-mod query_history;
-mod query_tabs;
-mod result_inspector;
+mod navigation;
+mod plan_view;
+mod results;
+mod row_inspector;
 mod shortcuts;
-mod sidebar;
 mod statusbar;
+mod tab_page;
+#[cfg(test)]
+mod tests;
 mod window;
+mod workspace;
 
 pub use window::build_ui;

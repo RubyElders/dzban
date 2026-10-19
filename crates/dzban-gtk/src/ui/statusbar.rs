@@ -1,407 +1,475 @@
-use super::connection_state::ConnectionStateWidget;
-use super::icons;
-use dzban_gtk::database::{DatabaseBackend, DbConnection};
-use gtk4::prelude::*;
-use gtk4::{Box, Image, Label, Orientation, Separator};
+use std::cell::RefCell;
 use std::rc::Rc;
 
-struct BoundConnection {
-    connection: DbConnection,
-    handlers: Vec<gtk4::glib::SignalHandlerId>,
+use dzban_core::DatabaseBackend;
+use dzban_core::health::{HealthState, HealthStatus};
+use dzban_core::presentation::DocumentPresentation;
+use gtk4::prelude::*;
+
+use super::format;
+use super::icons;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectionDisplay {
+    Disconnected,
+    Connecting,
+    Connected,
+    Error,
 }
 
-#[derive(Default)]
-struct ConnectionBinding {
-    current: std::cell::RefCell<Option<BoundConnection>>,
-}
-
-impl ConnectionBinding {
-    fn replace(&self, connection: &DbConnection, handlers: Vec<gtk4::glib::SignalHandlerId>) {
-        self.clear();
-        self.current.replace(Some(BoundConnection {
-            connection: connection.clone(),
-            handlers,
-        }));
+impl ConnectionDisplay {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Disconnected => "Disconnected",
+            Self::Connecting => "Connecting",
+            Self::Connected => "Connected",
+            Self::Error => "Error",
+        }
     }
 
-    fn clear(&self) {
-        if let Some(binding) = self.current.borrow_mut().take() {
-            for handler in binding.handlers {
-                gtk4::glib::signal::signal_handler_disconnect(&binding.connection, handler);
-            }
+    fn class(self) -> &'static str {
+        match self {
+            Self::Disconnected => "status-disconnected",
+            Self::Connecting => "status-connecting",
+            Self::Connected => "status-connected",
+            Self::Error => "status-error",
         }
     }
 }
 
-pub struct Statusbar {
-    container: Box,
-    connection_widget: ConnectionStateWidget,
-    exec_time: Label,
-    rows_info: Label,
-    server_icon: Image,
-    server_version: Label,
-    latency: Label,
-    binding: Rc<ConnectionBinding>,
+#[derive(Clone, Debug, Default)]
+pub struct FooterState {
+    pub profile: Option<String>,
+    pub backend: Option<DatabaseBackend>,
+    pub connecting: bool,
+    pub health: Option<HealthStatus>,
+    pub failure: Option<String>,
+    pub document: Option<DocumentPresentation>,
+    pub loading: bool,
+    pub copying: bool,
+    pub ping_available: bool,
+}
+
+impl FooterState {
+    pub fn connection(&self) -> ConnectionDisplay {
+        if self.connecting {
+            return ConnectionDisplay::Connecting;
+        }
+        if self.failure.is_some() {
+            return ConnectionDisplay::Error;
+        }
+        match self.health.as_ref().map(|health| health.state) {
+            Some(HealthState::Connected) => ConnectionDisplay::Connected,
+            Some(HealthState::Error) => ConnectionDisplay::Error,
+            _ if self.profile.is_some() && self.ping_available => ConnectionDisplay::Connected,
+            _ => ConnectionDisplay::Disconnected,
+        }
+    }
+
+    pub fn connection_text(&self) -> String {
+        let name = self.profile.clone().unwrap_or_else(|| "No database".into());
+        if self.connection() == ConnectionDisplay::Error {
+            let cause = self
+                .failure
+                .clone()
+                .or_else(|| self.health.as_ref().and_then(|health| health.error.clone()))
+                .unwrap_or_else(|| "connection failed".into());
+            format!("{name}: {cause}")
+        } else {
+            name
+        }
+    }
+}
+
+type Callback = Rc<dyn Fn()>;
+
+#[derive(Default)]
+struct Callbacks {
+    ping: Option<Callback>,
+    saved_plan: Option<Callback>,
+    cancel_copy: Option<Callback>,
+    shortcuts: Option<Callback>,
+}
+
+struct Inner {
+    root: gtk4::Box,
+    dot: gtk4::Box,
+    connection: gtk4::Label,
+    duration: gtk4::Label,
+    status: gtk4::Label,
+    estimate: gtk4::Label,
+    cost: gtk4::Label,
+    sample: gtk4::Label,
+    saved_plan: gtk4::Button,
+    loading: gtk4::Spinner,
+    cancel_copy: gtk4::Button,
+    ping: gtk4::Button,
+    ping_spinner: gtk4::Spinner,
+    ping_icon: gtk4::Image,
+    latency: gtk4::Label,
+    server_icon: gtk4::Image,
+    version: gtk4::Label,
+    callbacks: RefCell<Callbacks>,
+}
+
+#[derive(Clone)]
+pub struct Statusbar(Rc<Inner>);
+
+fn divider() -> gtk4::Separator {
+    let separator = gtk4::Separator::new(gtk4::Orientation::Vertical);
+    separator.set_size_request(-1, 14);
+    separator.set_valign(gtk4::Align::Center);
+    separator
+}
+
+fn caption(text: &str) -> gtk4::Label {
+    let label = gtk4::Label::new(Some(text));
+    label.add_css_class("caption");
+    label.add_css_class("numeric");
+    label
+}
+
+fn icon(name: &str, label: &str) -> gtk4::Image {
+    let image = gtk4::Image::from_icon_name(name);
+    image.set_pixel_size(14);
+    image.add_css_class("dim-label");
+    image.update_property(&[gtk4::accessible::Property::Label(label)]);
+    image
+}
+
+fn connect_button(
+    button: &gtk4::Button,
+    inner: &Rc<Inner>,
+    pick: fn(&Callbacks) -> Option<Callback>,
+) {
+    let weak = Rc::downgrade(inner);
+    button.connect_clicked(move |_| {
+        if let Some(callback) = weak
+            .upgrade()
+            .and_then(|inner| pick(&inner.callbacks.borrow()))
+        {
+            callback();
+        }
+    });
 }
 
 impl Statusbar {
     pub fn new() -> Self {
-        let container = Box::new(Orientation::Vertical, 0);
-        container.add_css_class("toolbar");
-        container.add_css_class("workspace-statusbar");
+        let root = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(12)
+            .accessible_role(gtk4::AccessibleRole::Group)
+            .build();
+        root.add_css_class("workspace-statusbar");
+        root.set_size_request(-1, 30);
+        root.update_property(&[gtk4::accessible::Property::Label("Workspace status")]);
 
-        let statusbar = Box::new(Orientation::Horizontal, 12);
-        statusbar.set_margin_start(12);
-        statusbar.set_margin_end(12);
-        statusbar.set_margin_top(6);
-        statusbar.set_margin_bottom(6);
+        let connection_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 5);
+        let dot = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        dot.add_css_class("status-dot");
+        dot.set_valign(gtk4::Align::Center);
+        connection_box.append(&dot);
+        let connection = caption("No database");
+        connection.set_max_width_chars(28);
+        connection.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
+        connection_box.append(&connection);
+        root.append(&connection_box);
+        root.append(&divider());
 
-        // Connection status with state widget
-        let connection_widget = ConnectionStateWidget::new();
-        statusbar.append(connection_widget.get_widget());
+        let duration_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 5);
+        duration_box.set_tooltip_text(Some("Query execution time"));
+        duration_box.append(&icon(icons::QUERY_TIME, "Query execution time"));
+        let duration = caption("--");
+        duration_box.append(&duration);
+        root.append(&duration_box);
+        root.append(&divider());
 
-        // Separator
-        let sep1 = Separator::new(Orientation::Vertical);
-        statusbar.append(&sep1);
+        let result_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        result_box.append(&icon(icons::RESULT_ROWS, "Returned rows"));
+        let status = caption("Run a query to see results");
+        status.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        status.update_property(&[gtk4::accessible::Property::Description("Result status")]);
+        result_box.append(&status);
+        let estimate = caption("");
+        estimate.add_css_class("dim-label");
+        result_box.append(&estimate);
+        let cost = caption("");
+        cost.add_css_class("dim-label");
+        result_box.append(&cost);
+        let sample = caption("Text sample");
+        sample.add_css_class("dim-label");
+        sample.set_tooltip_text(Some(
+            "Saved history keeps text values without SQL types or NULL identity",
+        ));
+        result_box.append(&sample);
+        let saved_plan = gtk4::Button::with_label("Saved Plan");
+        saved_plan.add_css_class("flat");
+        saved_plan.add_css_class("caption");
+        saved_plan.set_tooltip_text(Some("Show the saved query plan"));
+        result_box.append(&saved_plan);
+        let loading = gtk4::Spinner::new();
+        result_box.append(&loading);
+        let cancel_copy = gtk4::Button::with_label("Cancel Copy");
+        cancel_copy.add_css_class("flat");
+        cancel_copy.add_css_class("caption");
+        result_box.append(&cancel_copy);
+        root.append(&result_box);
 
-        let (exec_time_widget, _, exec_time) =
-            metric(icons::QUERY_TIME, "--", "Query execution time");
-        statusbar.append(&exec_time_widget);
-
-        // Separator
-        let sep2 = Separator::new(Orientation::Vertical);
-        statusbar.append(&sep2);
-
-        let (rows_widget, _, rows_info) = metric(icons::RESULT_ROWS, "-- rows", "Returned rows");
-        statusbar.append(&rows_widget);
-
-        // Spacer to push next items to the right
-        let spacer = Box::new(Orientation::Horizontal, 0);
+        let spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
         spacer.set_hexpand(true);
-        statusbar.append(&spacer);
+        root.append(&spacer);
 
-        let (latency_widget, _, latency) = metric(icons::PING, "--", "Database ping latency");
-        statusbar.append(&latency_widget);
+        let ping = gtk4::Button::new();
+        ping.add_css_class("flat");
+        ping.set_tooltip_text(Some("Database ping latency. Click to probe now."));
+        ping.update_property(&[gtk4::accessible::Property::Label("Database ping latency")]);
+        let ping_content = gtk4::Box::new(gtk4::Orientation::Horizontal, 5);
+        let ping_spinner = gtk4::Spinner::new();
+        ping_spinner.set_visible(false);
+        ping_content.append(&ping_spinner);
+        let ping_icon = icon(icons::PING, "Database ping latency");
+        ping_content.append(&ping_icon);
+        let latency = caption("--");
+        ping_content.append(&latency);
+        ping.set_child(Some(&ping_content));
+        root.append(&ping);
+        root.append(&divider());
 
-        // Separator
-        let sep3 = Separator::new(Orientation::Vertical);
-        statusbar.append(&sep3);
-
-        let (server_widget, server_icon, server_version) =
-            metric(icons::POSTGRESQL, "--", "Database server version");
+        let server_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 5);
+        let server_icon = icon(icons::POSTGRESQL, "PostgreSQL database server");
+        server_icon.remove_css_class("dim-label");
         server_icon.set_visible(false);
-        statusbar.append(&server_widget);
-        container.append(&statusbar);
+        server_box.append(&server_icon);
+        let version = caption("--");
+        server_box.append(&version);
+        root.append(&server_box);
 
-        Self {
-            container,
-            connection_widget,
-            exec_time,
-            rows_info,
-            server_icon,
-            server_version,
-            latency,
-            binding: Rc::new(ConnectionBinding::default()),
-        }
-    }
+        let shortcuts = gtk4::Button::from_icon_name("input-keyboard-symbolic");
+        shortcuts.add_css_class("flat");
+        shortcuts.set_tooltip_text(Some("Keyboard Shortcuts (Ctrl+?)"));
+        shortcuts.update_property(&[gtk4::accessible::Property::Label("Keyboard shortcuts")]);
+        root.append(&shortcuts);
 
-    pub fn get_widget(&self) -> &Box {
-        &self.container
-    }
-
-    pub fn bind_to_connection(&self, db_name: &str, connection: &DbConnection) {
-        let db_name = db_name.to_string();
-        let statusbar = self.clone();
-        let latency_handler =
-            connection.connect_notify_local(Some("latency-micros"), move |connection, _| {
-                let latency = connection.latency();
-                statusbar.update_latency(latency);
-            });
-
-        let statusbar = self.clone();
-        let version_handler =
-            connection.connect_notify_local(Some("version"), move |connection, _| {
-                let version = connection.version();
-                statusbar.update_version(version.as_deref());
-            });
-
-        let statusbar = self.clone();
-        let db_name_for_state = db_name.clone();
-        let state_handler = connection.connect_notify_local(Some("state"), move |connection, _| {
-            let state = connection.state();
-            let db_name = db_name_for_state.clone();
-            let error = connection.last_error();
-            statusbar.update_connection(Some(&db_name), state, Some(&error));
-        });
-
-        let statusbar = self.clone();
-        let db_name_for_error = db_name.clone();
-        let error_handler =
-            connection.connect_notify_local(Some("last-error"), move |connection, _| {
-                let error = connection.last_error();
-                statusbar.update_connection(
-                    Some(&db_name_for_error),
-                    connection.state(),
-                    Some(&error),
-                );
-            });
-
-        self.binding.replace(
+        let statusbar = Self(Rc::new(Inner {
+            root,
+            dot,
             connection,
-            vec![
-                latency_handler,
-                version_handler,
-                state_handler,
-                error_handler,
-            ],
+            duration,
+            status,
+            estimate,
+            cost,
+            sample,
+            saved_plan: saved_plan.clone(),
+            loading,
+            cancel_copy: cancel_copy.clone(),
+            ping: ping.clone(),
+            ping_spinner,
+            ping_icon,
+            latency,
+            server_icon,
+            version,
+            callbacks: RefCell::new(Callbacks::default()),
+        }));
+        connect_button(&ping, &statusbar.0, |callbacks| callbacks.ping.clone());
+        connect_button(&saved_plan, &statusbar.0, |callbacks| {
+            callbacks.saved_plan.clone()
+        });
+        connect_button(&cancel_copy, &statusbar.0, |callbacks| {
+            callbacks.cancel_copy.clone()
+        });
+        connect_button(&shortcuts, &statusbar.0, |callbacks| {
+            callbacks.shortcuts.clone()
+        });
+        statusbar.update(&FooterState::default());
+        statusbar
+    }
+
+    pub fn widget(&self) -> &gtk4::Box {
+        &self.0.root
+    }
+
+    pub fn connect_ping(&self, callback: impl Fn() + 'static) {
+        self.0.callbacks.borrow_mut().ping = Some(Rc::new(callback));
+    }
+
+    pub fn connect_saved_plan(&self, callback: impl Fn() + 'static) {
+        self.0.callbacks.borrow_mut().saved_plan = Some(Rc::new(callback));
+    }
+
+    pub fn connect_cancel_copy(&self, callback: impl Fn() + 'static) {
+        self.0.callbacks.borrow_mut().cancel_copy = Some(Rc::new(callback));
+    }
+
+    pub fn connect_shortcuts(&self, callback: impl Fn() + 'static) {
+        self.0.callbacks.borrow_mut().shortcuts = Some(Rc::new(callback));
+    }
+
+    pub fn update(&self, state: &FooterState) {
+        let connection = state.connection();
+        for display in [
+            ConnectionDisplay::Disconnected,
+            ConnectionDisplay::Connecting,
+            ConnectionDisplay::Connected,
+            ConnectionDisplay::Error,
+        ] {
+            self.0.dot.remove_css_class(display.class());
+        }
+        self.0.dot.add_css_class(connection.class());
+        self.0
+            .dot
+            .update_property(&[gtk4::accessible::Property::Label(connection.label())]);
+        let text = state.connection_text();
+        self.0.connection.set_text(&text);
+        self.0
+            .connection
+            .set_tooltip_text(Some(&format!("{}: {text}", connection.label())));
+
+        let document = state.document.as_ref();
+        self.0.duration.set_text(
+            &document
+                .and_then(|document| document.execution_seconds)
+                .map(|seconds| format!("{seconds:.2}s"))
+                .unwrap_or_else(|| "--".into()),
         );
-
-        // Set initial values
-        self.update_latency(connection.latency());
-        self.update_backend(Some(connection.backend()));
-        self.update_version(connection.version().as_deref());
-        self.update_connection(
-            Some(&db_name),
-            connection.state(),
-            Some(&connection.last_error()),
+        self.0.status.set_text(
+            &document
+                .map(format::result_status)
+                .unwrap_or_else(|| "Run a query to see results".into()),
         );
-    }
-
-    /// Unbind from current model (if switching tabs or closing connection)
-    pub fn unbind(&self) {
-        self.clear_binding();
-        self.update_connection(
-            None,
-            dzban_gtk::database::ConnectionState::Disconnected,
-            None,
+        let plan = document.and_then(|document| document.execution_plan.as_ref());
+        let estimate = plan
+            .and_then(|plan| {
+                plan.estimate
+                    .rows
+                    .map(|rows| format::row_estimate(plan.backend, rows))
+            })
+            .unwrap_or_default();
+        self.0.estimate.set_text(&estimate);
+        self.0.estimate.set_visible(!estimate.is_empty());
+        let finished = document.is_some_and(|document| document.feedback.progress.is_none());
+        let cost = plan
+            .filter(|_| finished)
+            .and_then(
+                |plan| match (plan.estimate.startup_cost, plan.estimate.total_cost) {
+                    (Some(startup), Some(total)) if startup.is_finite() && total.is_finite() => {
+                        Some(format!("Cost {startup:.2}..{total:.2}"))
+                    }
+                    (None, Some(total)) if total.is_finite() => Some(format!("Cost {total:.2}")),
+                    _ => None,
+                },
+            )
+            .unwrap_or_default();
+        self.0.cost.set_text(&cost);
+        self.0.cost.set_visible(!cost.is_empty());
+        let saved = document.is_some_and(|document| document.history == Some(true));
+        self.0
+            .sample
+            .set_visible(saved && document.is_some_and(|document| document.rows > 0));
+        self.0.saved_plan.set_visible(
+            saved && document.is_some_and(|document| document.history_plan_available == Some(true)),
         );
-        self.update_backend(None);
-        self.update_version(None);
-        self.update_latency(None);
-        self.update_exec_time(None);
-        self.update_rows(None);
-    }
+        self.0.loading.set_spinning(state.loading);
+        self.0.loading.set_visible(state.loading);
+        self.0.cancel_copy.set_visible(state.copying);
 
-    fn clear_binding(&self) {
-        self.binding.clear();
-    }
+        let probing = state.health.as_ref().is_some_and(|health| health.probing);
+        self.0.ping_spinner.set_visible(probing);
+        self.0.ping_spinner.set_spinning(probing);
+        self.0.ping_icon.set_visible(!probing);
+        let latency = format::latency(
+            state
+                .health
+                .as_ref()
+                .and_then(|health| health.latency_micros),
+        );
+        self.0.latency.set_text(&latency);
+        self.0
+            .ping
+            .update_property(&[gtk4::accessible::Property::Description(&latency)]);
+        self.0.ping.set_sensitive(state.ping_available && !probing);
 
-    pub fn update_connection(
-        &self,
-        db_name: Option<&str>,
-        state: dzban_gtk::database::ConnectionState,
-        error: Option<&str>,
-    ) {
-        if let Some(name) = db_name {
-            let text = connection_status_text(name, state, error);
-            self.connection_widget.update_state(state, Some(&text));
-        } else {
-            self.connection_widget.update_state(
-                dzban_gtk::database::ConnectionState::Disconnected,
-                Some("No database"),
-            );
+        match state.backend {
+            Some(backend) => {
+                self.0
+                    .server_icon
+                    .set_icon_name(Some(icons::database_backend(backend)));
+                self.0
+                    .server_icon
+                    .update_property(&[gtk4::accessible::Property::Label(match backend {
+                        DatabaseBackend::Postgresql => "PostgreSQL database server",
+                        DatabaseBackend::Clickhouse => "ClickHouse database server",
+                    })]);
+                self.0.server_icon.set_visible(true);
+            }
+            None => self.0.server_icon.set_visible(false),
         }
+        let version = state
+            .health
+            .as_ref()
+            .and_then(|health| health.version.clone());
+        self.0
+            .version
+            .set_text(&format::short_version(version.as_deref()));
+        self.0.version.set_tooltip_text(Some(
+            version.as_deref().unwrap_or("Database server version"),
+        ));
     }
 
-    pub fn update_version(&self, version: Option<&str>) {
-        if let Some(v) = version {
-            self.server_version.set_text(v);
-        } else {
-            self.server_version.set_text("--");
-        }
-    }
-
-    fn update_backend(&self, backend: Option<DatabaseBackend>) {
-        if let Some(backend) = backend {
-            let accessible_label = match backend {
-                DatabaseBackend::Postgresql => "PostgreSQL database server",
-                DatabaseBackend::Clickhouse => "ClickHouse database server",
-            };
-            self.server_icon
-                .set_icon_name(Some(icons::database_backend(backend)));
-            self.server_icon
-                .update_property(&[gtk4::accessible::Property::Label(accessible_label)]);
-            self.server_icon.set_visible(true);
-        } else {
-            self.server_icon.set_visible(false);
-        }
-    }
-
-    pub fn update_latency(&self, latency: Option<std::time::Duration>) {
-        if let Some(duration) = latency {
-            let formatted = format_latency(duration);
-            self.latency.set_text(&formatted);
-        } else {
-            self.latency.set_text("--");
-        }
-    }
-
-    pub fn update_exec_time(&self, seconds: Option<f64>) {
-        if let Some(s) = seconds {
-            self.exec_time.set_text(&format!("{:.2}s", s));
-        } else {
-            self.exec_time.set_text("--");
-        }
-    }
-
-    pub fn update_rows(&self, count: Option<usize>) {
-        if let Some(n) = count {
-            self.rows_info.set_text(&format!("{} rows", n));
-        } else {
-            self.rows_info.set_text("-- rows");
-        }
-    }
-}
-
-fn connection_status_text(
-    name: &str,
-    state: dzban_gtk::database::ConnectionState,
-    error: Option<&str>,
-) -> String {
-    if state == dzban_gtk::database::ConnectionState::Error {
-        error
-            .filter(|error| !error.is_empty())
-            .map(|error| format!("{}: {}", name, error))
-            .unwrap_or_else(|| format!("{}: connection failed", name))
-    } else {
-        name.to_string()
-    }
-}
-
-impl Clone for Statusbar {
-    fn clone(&self) -> Self {
-        Self {
-            container: self.container.clone(),
-            connection_widget: self.connection_widget.clone(),
-            exec_time: self.exec_time.clone(),
-            rows_info: self.rows_info.clone(),
-            server_icon: self.server_icon.clone(),
-            server_version: self.server_version.clone(),
-            latency: self.latency.clone(),
-            binding: self.binding.clone(),
-        }
-    }
-}
-
-fn metric(icon_name: &str, text: &str, accessible_label: &str) -> (Box, Image, Label) {
-    let container = Box::new(Orientation::Horizontal, 5);
-    container.set_valign(gtk4::Align::Center);
-    container.set_tooltip_text(Some(accessible_label));
-
-    let icon = Image::from_icon_name(icon_name);
-    icon.set_pixel_size(16);
-    icon.add_css_class("dim-label");
-    icon.update_property(&[gtk4::accessible::Property::Label(accessible_label)]);
-    container.append(&icon);
-
-    let label = Label::new(Some(text));
-    label.add_css_class("dim-label");
-    label.add_css_class("caption");
-    container.append(&label);
-
-    (container, icon, label)
-}
-
-pub fn create_statusbar() -> Statusbar {
-    Statusbar::new()
-}
-
-/// Format latency with dynamic units
-/// - < 1ms: show in microseconds (µs)
-/// - < 1000ms: show in milliseconds (ms)
-/// - >= 1000ms: show in seconds (s)
-fn format_latency(duration: std::time::Duration) -> String {
-    let micros = duration.as_micros();
-
-    if micros < 1000 {
-        // Less than 1ms - show in microseconds
-        format!("{}µs", micros)
-    } else if micros < 1_000_000 {
-        // Less than 1 second - show in milliseconds
-        let ms = duration.as_millis();
-        format!("{}ms", ms)
-    } else {
-        // 1 second or more - show in seconds with 2 decimal places
-        let seconds = duration.as_secs_f64();
-        format!("{:.2}s", seconds)
+    #[cfg(test)]
+    pub fn connection_text(&self) -> String {
+        self.0.connection.text().to_string()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
-
-    #[test]
-    fn rebinding_disconnects_the_previous_connection() {
-        let binding = ConnectionBinding::default();
-        let first = DbConnection::new("host=first".to_string());
-        let second = DbConnection::new("host=second".to_string());
-        let first_notifications = Rc::new(Cell::new(0));
-        let second_notifications = Rc::new(Cell::new(0));
-
-        let count = first_notifications.clone();
-        let first_handler = first.connect_notify_local(Some("state"), move |_, _| {
-            count.set(count.get() + 1);
-        });
-        binding.replace(&first, vec![first_handler]);
-
-        let count = second_notifications.clone();
-        let second_handler = second.connect_notify_local(Some("state"), move |_, _| {
-            count.set(count.get() + 1);
-        });
-        binding.replace(&second, vec![second_handler]);
-
-        first.notify("state");
-        second.notify("state");
-
-        assert_eq!(first_notifications.get(), 0);
-        assert_eq!(second_notifications.get(), 1);
-    }
 
     #[test]
     fn connection_errors_include_the_database_and_cause() {
+        let state = FooterState {
+            profile: Some("reporting".into()),
+            failure: Some("password authentication failed".into()),
+            ..Default::default()
+        };
+        assert_eq!(state.connection(), ConnectionDisplay::Error);
         assert_eq!(
-            connection_status_text(
-                "reporting",
-                dzban_gtk::database::ConnectionState::Error,
-                Some("password authentication failed")
-            ),
+            state.connection_text(),
             "reporting: password authentication failed"
         );
     }
 
     #[test]
-    fn database_backends_have_distinct_footer_icons() {
-        assert_eq!(
-            icons::database_backend(DatabaseBackend::Postgresql),
-            "dzban-postgresql"
-        );
-        assert_eq!(
-            icons::database_backend(DatabaseBackend::Clickhouse),
-            "dzban-clickhouse"
-        );
+    fn connecting_takes_precedence_over_stale_health() {
+        let state = FooterState {
+            profile: Some("reporting".into()),
+            connecting: true,
+            health: Some(HealthStatus {
+                state: HealthState::Error,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(state.connection(), ConnectionDisplay::Connecting);
     }
 
     #[gtk4::test]
     #[ignore = "requires a graphical display"]
     fn footer_switches_the_server_icon_with_the_backend() {
         let statusbar = Statusbar::new();
-
-        statusbar.update_backend(Some(DatabaseBackend::Postgresql));
-        assert_eq!(
-            statusbar.server_icon.icon_name().as_deref(),
-            Some(icons::POSTGRESQL)
-        );
-        assert!(statusbar.server_icon.is_visible());
-
-        statusbar.update_backend(Some(DatabaseBackend::Clickhouse));
-        assert_eq!(
-            statusbar.server_icon.icon_name().as_deref(),
-            Some(icons::CLICKHOUSE)
-        );
-
-        statusbar.update_backend(None);
-        assert!(!statusbar.server_icon.is_visible());
+        for backend in [DatabaseBackend::Postgresql, DatabaseBackend::Clickhouse] {
+            statusbar.update(&FooterState {
+                backend: Some(backend),
+                ..Default::default()
+            });
+            assert_eq!(
+                statusbar.0.server_icon.icon_name().as_deref(),
+                Some(icons::database_backend(backend))
+            );
+            assert!(statusbar.0.server_icon.is_visible());
+        }
+        statusbar.update(&FooterState::default());
+        assert!(!statusbar.0.server_icon.is_visible());
+        assert_eq!(statusbar.connection_text(), "No database");
     }
 }

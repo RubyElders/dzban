@@ -1,1467 +1,1539 @@
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeSet, HashMap};
+use std::rc::Rc;
+use std::time::Instant;
+
 use adw::prelude::*;
-use adw::{Application, ApplicationWindow, HeaderBar, Toast, ToastOverlay, ToolbarView};
-use gtk4::prelude::*;
+use dzban_core::application::ApplicationPhase;
+use dzban_core::attention::{AttentionInput, AttentionSnapshot, ViewedOutput};
+use dzban_core::commands::EditorIntent;
+use dzban_core::interaction::{InputEvent, InputKey, PrimaryAction};
+use dzban_core::presentation::{InputHint, PlanPresentation};
+use dzban_core::tabs::{TabId, TabPhase};
+use dzban_gtk::runtime::RuntimeBridge;
+use gtk4::{gdk, gio, glib};
 use libadwaita as adw;
 
+use super::action_search::{ActionItem, ActionSearch};
+use super::app::App;
+use super::format;
+use super::navigation;
+use super::plan_view::{PlanContent, PlanScroll, PlanView};
+use super::shortcuts::{self, ShortcutAction};
+use super::statusbar::{FooterState, Statusbar};
+use super::tab_page::{TabEvent, TabPage};
+use super::workspace::{Workspace, WorkspaceEvent};
 use crate::APP_NAME;
 
-use super::db_tabs::DatabaseTabManager;
-use super::plan_inspector::PlanScroll;
-use super::shortcuts;
-use super::shortcuts::ShortcutAction;
-use super::statusbar::create_statusbar;
-
-fn plan_scroll(key: gtk4::gdk::Key) -> Option<PlanScroll> {
-    match key {
-        gtk4::gdk::Key::Up => Some(PlanScroll::LineUp),
-        gtk4::gdk::Key::Down => Some(PlanScroll::LineDown),
-        gtk4::gdk::Key::Page_Up => Some(PlanScroll::PageUp),
-        gtk4::gdk::Key::Page_Down => Some(PlanScroll::PageDown),
-        _ => None,
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    Primary,
+    Preview,
 }
 
-fn input_role(key: gtk4::gdk::Key) -> Option<dzban_gtk::database::InputRole> {
+pub fn modifier_role(key: gdk::Key) -> Option<Role> {
     match key {
-        gtk4::gdk::Key::Escape => Some(dzban_gtk::database::InputRole::Cancel),
-        gtk4::gdk::Key::Control_L | gtk4::gdk::Key::Control_R => {
-            Some(dzban_gtk::database::InputRole::PrimaryModifier)
-        }
-        gtk4::gdk::Key::Shift_L | gtk4::gdk::Key::Shift_R => {
-            Some(dzban_gtk::database::InputRole::PreviewModifier)
-        }
-        gtk4::gdk::Key::space => Some(dzban_gtk::database::InputRole::Inspect),
-        gtk4::gdk::Key::Return | gtk4::gdk::Key::KP_Enter => {
-            Some(dzban_gtk::database::InputRole::Submit)
-        }
+        gdk::Key::Control_L | gdk::Key::Control_R => Some(Role::Primary),
+        gdk::Key::Shift_L | gdk::Key::Shift_R => Some(Role::Preview),
         _ => None,
     }
 }
 
 #[derive(Default)]
-struct InputBindings {
-    pressed: std::collections::BTreeSet<gtk4::gdk::Key>,
+pub struct KeyState {
+    pressed: BTreeSet<gdk::Key>,
+    primary: bool,
+    preview: bool,
+    inspect: bool,
 }
 
-impl InputBindings {
-    fn press(&mut self, key: gtk4::gdk::Key) -> Option<dzban_gtk::database::InputRole> {
-        let role = input_role(key)?;
-        self.pressed.insert(key);
-        Some(role)
+impl KeyState {
+    pub fn press(&mut self, key: gdk::Key) -> bool {
+        self.pressed.insert(key)
     }
 
-    fn release(&mut self, key: gtk4::gdk::Key) -> Option<dzban_gtk::database::InputRole> {
-        if !self.pressed.remove(&key) {
-            return None;
-        }
-        let role = input_role(key)?;
-        (!self
-            .pressed
+    pub fn release(&mut self, key: gdk::Key) -> bool {
+        self.pressed.remove(&key)
+    }
+
+    fn held(&self, role: Role) -> bool {
+        self.pressed
             .iter()
-            .any(|key| input_role(*key) == Some(role)))
-        .then_some(role)
+            .any(|key| modifier_role(*key) == Some(role))
     }
 
-    fn reset(&mut self) {
-        self.pressed.clear();
+    pub fn sync(&mut self, allowed: bool) -> Vec<(InputKey, bool)> {
+        let mut events = Vec::new();
+        let primary = allowed && self.held(Role::Primary);
+        let preview = allowed && self.held(Role::Preview);
+        if primary != self.primary {
+            self.primary = primary;
+            events.push((InputKey::Primary, primary));
+        }
+        if preview != self.preview {
+            self.preview = preview;
+            events.push((InputKey::Preview, preview));
+        }
+        events
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn primary(&self) -> bool {
+        self.primary
+    }
+
+    pub fn preview(&self) -> bool {
+        self.preview
     }
 }
 
-pub fn build_ui(app: &Application) {
-    install_styles();
+pub fn input_hint(hint: &InputHint) -> (String, Option<&'static str>) {
+    match hint {
+        InputHint::Default => (default_hint(), None),
+        InputHint::PrimaryGuide => (
+            "Enter: run - Shift: estimate - Shift+Enter: estimate and run".into(),
+            Some("guidance"),
+        ),
+        InputHint::Estimating => (
+            "Enter to run - Space for plan - estimating...".into(),
+            Some("progress"),
+        ),
+        InputHint::EstimateReady { plan } => (
+            format!(
+                "Enter to run - Space for plan - {}",
+                format::compact_estimate(plan)
+            ),
+            Some("ready"),
+        ),
+        InputHint::EstimateError { error } => (
+            format!("Enter to run - estimate unavailable: {error}"),
+            Some("error"),
+        ),
+        InputHint::Planning => (
+            "Estimating query before execution...".into(),
+            Some("progress"),
+        ),
+        InputHint::Running { plan: Some(plan) } => (
+            format!("Running query - {}", format::compact_estimate(plan)),
+            Some("progress"),
+        ),
+        InputHint::Running { plan: None } => ("Running query...".into(), Some("progress")),
+        InputHint::Canceling { plan: Some(plan) } => (
+            format!("Stopping query - {}", format::compact_estimate(plan)),
+            Some("progress"),
+        ),
+        InputHint::Canceling { plan: None } => ("Stopping query...".into(), Some("progress")),
+    }
+}
 
-    // Create main application window
-    let window = ApplicationWindow::builder()
-        .application(app)
-        .default_width(1400)
-        .default_height(900)
+fn default_hint() -> String {
+    format!(
+        "Search actions and connections ({})",
+        shortcuts::shortcut(ShortcutAction::FocusSearch).accelerator()
+    )
+}
+
+struct Inner {
+    app: App,
+    window: adw::ApplicationWindow,
+    workspace: Workspace,
+    statusbar: Statusbar,
+    search: ActionSearch,
+    plan: PlanView,
+    history_button: gtk4::Button,
+    plan_button: gtk4::Button,
+    run_button: gtk4::Button,
+    shortcuts: adw::Dialog,
+    keys: RefCell<KeyState>,
+    clock: Instant,
+    saved_plan: RefCell<Option<(TabId, u64, PlanPresentation)>>,
+    viewed: RefCell<Option<(bool, Option<ViewedOutput>)>>,
+    attention_request: Cell<u64>,
+    controls: Cell<PrimaryAction>,
+    closing: Cell<bool>,
+}
+
+#[derive(Clone)]
+pub struct Shell(Rc<Inner>);
+
+pub fn build_ui(application: &adw::Application) {
+    install_styles();
+    let bridge = RuntimeBridge::new().expect("Failed to create the Tokio runtime");
+    let app = App::new(bridge);
+    let window = adw::ApplicationWindow::builder()
+        .application(application)
+        .default_width(1150)
+        .default_height(760)
+        .width_request(900)
+        .height_request(500)
         .title(APP_NAME)
         .build();
-
-    // Use ToolbarView for modern header/content/bottom layout (v1_4+)
-    let toolbar_view = ToolbarView::new();
-
-    // Create toast overlay for notifications
-    let toast_overlay = ToastOverlay::new();
-
-    // Create status bar at the bottom
-    let statusbar = create_statusbar();
-
-    // Create database tab manager (main content)
-    let db_tab_manager = DatabaseTabManager::new(statusbar.clone());
-    dzban_gtk::shutdown::bind_window_shutdown(
-        &window,
-        db_tab_manager.runtime_bridge(),
-        &toast_overlay,
-    );
-    let content = db_tab_manager.get_widget().clone();
-
-    let shortcuts_dialog = shortcuts::create_shortcuts_window();
-
-    // Create header bar with search/action bar and controls
-    let (header, search_entry) =
-        create_header_bar(&db_tab_manager, &toast_overlay, &window, &shortcuts_dialog);
-    toolbar_view.add_top_bar(&header);
-
-    let query_preview_controller = gtk4::EventControllerKey::new();
-    query_preview_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
-    let db_manager_for_preview = db_tab_manager.clone();
-    let input_clock = std::rc::Rc::new(std::time::Instant::now());
-    let press_clock = input_clock.clone();
-    let bindings = std::rc::Rc::new(std::cell::RefCell::new(InputBindings::default()));
-    let press_bindings = bindings.clone();
-    query_preview_controller.connect_key_pressed(move |_, key, _, _| {
-        let role = press_bindings.borrow_mut().press(key);
-        if let Some(key) = role
-            && db_manager_for_preview
-                .handle_input_pressed(key, press_clock.elapsed().as_millis() as u64)
-        {
-            return gtk4::glib::Propagation::Stop;
-        }
-        if let Some(direction) = plan_scroll(key)
-            && db_manager_for_preview.scroll_query_plan(direction)
-        {
-            return gtk4::glib::Propagation::Stop;
-        }
-        gtk4::glib::Propagation::Proceed
-    });
-    let db_manager_for_preview = db_tab_manager.clone();
-    let release_bindings = bindings.clone();
-    query_preview_controller.connect_key_released(move |_, key, _, _| {
-        let role = release_bindings.borrow_mut().release(key);
-        if let Some(key) = role {
-            db_manager_for_preview
-                .handle_input_released(key, input_clock.elapsed().as_millis() as u64);
-        }
-    });
-    window.add_controller(query_preview_controller);
-    let db_manager_for_focus = db_tab_manager.clone();
-    window.connect_is_active_notify(move |window| {
-        if !window.is_active() {
-            bindings.borrow_mut().reset();
-            db_manager_for_focus.reset_input();
-        }
-    });
-
-    // Setup keyboard shortcuts using unified system
-    let search_entry_for_shortcuts = search_entry.clone();
-    let db_manager_for_shortcuts = db_tab_manager.clone();
-    let window_for_shortcuts = window.clone();
-    let shortcuts_dialog_for_shortcut = shortcuts_dialog.clone();
-
-    let key_controller = shortcuts::create_controller(move |action| {
-        execute_shortcut_action(
-            action,
-            &db_manager_for_shortcuts,
-            &search_entry_for_shortcuts,
-            &window_for_shortcuts,
-            &shortcuts_dialog_for_shortcut,
-        )
-    });
-    window.add_controller(key_controller);
-
-    toast_overlay.set_child(Some(&content));
-    toast_overlay.set_vexpand(true);
-
-    let workspace = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-    workspace.set_vexpand(true);
-    workspace.append(&toast_overlay);
-    workspace.append(statusbar.get_widget());
-    toolbar_view.set_content(Some(&workspace));
-
-    window.set_content(Some(&toolbar_view));
-
-    // Setup toast example
-    setup_toasts(&toast_overlay);
-
+    let shell = Shell::new(app, window.clone());
     window.present();
-    let manager_for_initial_focus = db_tab_manager;
-    let window_for_initial_focus = window.clone();
-    glib::timeout_add_local_once(std::time::Duration::from_millis(100), move || {
-        if let Some(row) = manager_for_initial_focus.selected_connection_row() {
-            gtk4::prelude::GtkWindowExt::set_focus(&window_for_initial_focus, Some(&row));
-        }
+    shell.start();
+    let retained = RefCell::new(Some(shell));
+    window.connect_destroy(move |_| {
+        retained.take();
     });
 }
 
-fn execute_shortcut_action(
-    action: ShortcutAction,
-    db_manager: &DatabaseTabManager,
-    search_entry: &gtk4::Entry,
-    window: &ApplicationWindow,
-    shortcuts_dialog: &adw::Dialog,
-) -> bool {
-    match action {
-        ShortcutAction::FocusSearch => {
-            db_manager.cancel_query_preview();
-            search_entry.grab_focus()
-        }
-        ShortcutAction::ShowConnections => {
-            db_manager.open_connection_manager();
-            true
-        }
-        ShortcutAction::TestAllConnections => {
-            db_manager.open_connection_manager();
-            db_manager.test_all_connections()
-        }
-        ShortcutAction::FocusDatabaseTabs => db_manager.focus_database_tabs(),
-        ShortcutAction::NextDatabaseTab => db_manager.select_next_database_tab(),
-        ShortcutAction::PreviousDatabaseTab => db_manager.select_previous_database_tab(),
-        ShortcutAction::LocateDatabaseTab => {
-            search_entry.set_text("select open database tab");
-            search_entry.grab_focus()
-        }
-        ShortcutAction::ToggleSidebar => {
-            db_manager.toggle_current_sidebar();
-            true
-        }
-        ShortcutAction::NewQueryTab => {
-            db_manager.new_query_in_current_db();
-            true
-        }
-        ShortcutAction::CloseQueryTab => {
-            if !db_manager.close_current_query_tab() {
-                window.close();
+impl Shell {
+    pub fn new(app: App, window: adw::ApplicationWindow) -> Self {
+        let workspace = Workspace::new(&app);
+        let statusbar = Statusbar::new();
+        let search = ActionSearch::new();
+        let plan = PlanView::new();
+        let toasts = adw::ToastOverlay::new();
+        app.set_toast_overlay(&toasts);
+
+        let header = adw::HeaderBar::new();
+        let history_button = gtk4::Button::from_icon_name("sidebar-show-symbolic");
+        history_button.set_size_request(34, 34);
+        history_button.set_tooltip_text(Some(
+            &shortcuts::shortcut(ShortcutAction::ToggleHistory).tooltip(),
+        ));
+        history_button
+            .update_property(&[gtk4::accessible::Property::Label("Toggle query history")]);
+        header.pack_start(&history_button);
+
+        let title = adw::Clamp::new();
+        title.set_maximum_size(600);
+        title.set_tightening_threshold(380);
+        title.set_child(Some(search.widget()));
+        header.set_title_widget(Some(&title));
+
+        let menu = gio::Menu::new();
+        menu.append(Some("Test All Connections"), Some("win.test-all"));
+        menu.append(Some("Keyboard Shortcuts"), Some("win.shortcuts"));
+        menu.append(Some("Quit"), Some("win.quit"));
+        let menu_button = gtk4::MenuButton::new();
+        menu_button.set_icon_name("open-menu-symbolic");
+        menu_button.set_menu_model(Some(&menu));
+        menu_button.set_tooltip_text(Some("Main Menu"));
+        menu_button.update_property(&[gtk4::accessible::Property::Label("Main Menu")]);
+        header.pack_end(&menu_button);
+
+        let run_button = gtk4::Button::from_icon_name("media-playback-start-symbolic");
+        run_button.set_size_request(34, 34);
+        run_button.add_css_class("suggested-action");
+        header.pack_end(&run_button);
+        let plan_button = gtk4::Button::from_icon_name(super::icons::PLAN);
+        plan_button.set_size_request(34, 34);
+        plan_button.set_tooltip_text(Some("Preview the current query plan (Ctrl+Shift+Space)"));
+        plan_button.update_property(&[
+            gtk4::accessible::Property::Label("Preview query plan"),
+            gtk4::accessible::Property::KeyShortcuts("Control+Shift+space"),
+        ]);
+        header.pack_end(&plan_button);
+
+        let overlay = gtk4::Overlay::new();
+        overlay.set_child(Some(workspace.widget()));
+        overlay.add_overlay(plan.widget());
+        toasts.set_child(Some(&overlay));
+        toasts.set_vexpand(true);
+
+        let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        content.append(&toasts);
+        content.append(statusbar.widget());
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&header);
+        toolbar.set_content(Some(&content));
+        window.set_content(Some(&toolbar));
+
+        let shell = Self(Rc::new(Inner {
+            app,
+            window,
+            workspace,
+            statusbar,
+            search,
+            plan,
+            history_button: history_button.clone(),
+            plan_button: plan_button.clone(),
+            run_button: run_button.clone(),
+            shortcuts: shortcuts::create_dialog(),
+            keys: RefCell::new(KeyState::default()),
+            clock: Instant::now(),
+            saved_plan: RefCell::new(None),
+            viewed: RefCell::new(None),
+            attention_request: Cell::new(0),
+            controls: Cell::new(PrimaryAction::Unavailable),
+            closing: Cell::new(false),
+        }));
+
+        let weak = shell.weak();
+        history_button.connect_clicked(move |_| {
+            if let Some(shell) = upgrade(&weak) {
+                shell.execute(ShortcutAction::ToggleHistory);
             }
-            true
-        }
-        ShortcutAction::NextQueryTab => db_manager.select_next_query_tab(),
-        ShortcutAction::PreviousQueryTab => db_manager.select_previous_query_tab(),
-        ShortcutAction::RenameQueryTab => show_rename_query_dialog(db_manager, window),
-        ShortcutAction::LocateQueryTab => {
-            search_entry.set_text("select query tab");
-            search_entry.grab_focus()
-        }
-        ShortcutAction::FocusQueryTabs => db_manager.focus_query_tabs(),
-        ShortcutAction::FocusQueryEditor => db_manager.focus_query_editor(),
-        ShortcutAction::FocusQueryResults => db_manager.focus_query_results(),
-        ShortcutAction::PreviewResultRow => {
-            db_manager.focus_query_results()
-                && db_manager.show_focused_result()
-                && db_manager.pin_result_preview()
-        }
-        ShortcutAction::FocusQueryHistory => db_manager.focus_query_history(),
-        ShortcutAction::RunQuery => {
-            db_manager.close_query_plan();
-            db_manager.cancel_query_preview();
-            db_manager.run_current_query();
-            true
-        }
-        ShortcutAction::StopQuery => {
-            db_manager.request_cancel_current_query();
-            true
-        }
-        ShortcutAction::PreviewQuery => {
-            db_manager.begin_query_preview();
-            true
-        }
-        ShortcutAction::PeekPlan => {
-            if !db_manager.show_query_plan() {
-                db_manager.begin_query_preview();
+        });
+        let weak = shell.weak();
+        run_button.connect_clicked(move |_| {
+            if let Some(page) = upgrade(&weak).and_then(|shell| shell.0.workspace.selected()) {
+                page.editor_command(EditorIntent::Primary);
             }
-            db_manager.show_query_plan() && db_manager.pin_query_plan()
+        });
+        let weak = shell.weak();
+        plan_button.connect_clicked(move |_| {
+            if let Some(shell) = upgrade(&weak) {
+                shell.open_plan();
+            }
+        });
+        let weak = shell.weak();
+        shell.0.plan.connect_pin(move || {
+            if let Some(shell) = upgrade(&weak)
+                && shell.0.saved_plan.borrow().is_none()
+                && let Some(page) = shell.0.workspace.selected()
+            {
+                page.send_input(InputEvent::Pin);
+            }
+        });
+        let weak = shell.weak();
+        shell.0.plan.connect_close(move || {
+            if let Some(shell) = upgrade(&weak) {
+                shell.close_plan();
+            }
+        });
+
+        let weak = shell.weak();
+        shell.0.workspace.connect_event(move |event| {
+            if let Some(shell) = upgrade(&weak) {
+                shell.workspace_event(event);
+            }
+        });
+        let weak = shell.weak();
+        shell.0.workspace.set_close_handler(move |id| {
+            if let Some(shell) = upgrade(&weak) {
+                if shell.0.workspace.is_last_chooser(id) {
+                    shell.0.window.close();
+                } else {
+                    shell.0.workspace.close_tab(id);
+                }
+            }
+        });
+
+        shell.bind_statusbar();
+        shell.bind_search();
+        shell.bind_actions();
+        shell.bind_keys();
+        shell.bind_lifecycle();
+        shell.refresh();
+        shell
+    }
+
+    fn weak(&self) -> std::rc::Weak<Inner> {
+        Rc::downgrade(&self.0)
+    }
+
+    #[cfg(test)]
+    pub fn app(&self) -> &App {
+        &self.0.app
+    }
+
+    #[cfg(test)]
+    pub fn workspace(&self) -> &Workspace {
+        &self.0.workspace
+    }
+
+    pub fn start(&self) {
+        let context = self.0.app.context().clone();
+        context.attention().input(AttentionInput::Lifecycle {
+            restoring: true,
+            quitting: false,
+        });
+        self.0.workspace.set_restoring(true);
+        let reload = self.0.app.reload_config();
+        let weak = self.weak();
+        glib::spawn_future_local(async move {
+            let state = reload.await;
+            let Some(shell) = upgrade(&weak) else {
+                return;
+            };
+            let config = match state {
+                super::app::ConfigState::Ready(config) => Some(config),
+                super::app::ConfigState::Failed(error) => {
+                    shell
+                        .0
+                        .app
+                        .toast(&format!("Could not load connection profiles: {error}"));
+                    None
+                }
+                super::app::ConfigState::Loading => None,
+            };
+            let restore = {
+                let _runtime = shell.0.app.bridge().enter();
+                context.start_restore_workspace(shell.0.app.workspace_location(), config)
+            };
+            let progress = shell.0.app.run(restore.wait());
+            shell.0.workspace.reconcile();
+            let progress = progress.await;
+            let Some(shell) = upgrade(&weak) else {
+                return;
+            };
+            context.attention().input(AttentionInput::Lifecycle {
+                restoring: false,
+                quitting: false,
+            });
+            shell.0.workspace.set_restoring(false);
+            if let Ok(progress) = progress {
+                for issue in &progress.issues {
+                    let profile = issue.profile.as_deref().unwrap_or("A saved tab");
+                    shell
+                        .0
+                        .app
+                        .toast(&format!("Could not reopen {profile}: {}", issue.message));
+                }
+                if let Some(error) = progress.error {
+                    shell
+                        .0
+                        .app
+                        .toast(&format!("Could not restore open tabs: {error}"));
+                }
+            }
+            if shell.0.workspace.tab_count() == 0 {
+                shell.0.workspace.new_tab();
+            }
+            if let Some(page) = shell.0.workspace.selected() {
+                page.focus_primary();
+            }
+            shell.refresh();
+        });
+    }
+
+    fn workspace_event(&self, event: WorkspaceEvent) {
+        match event {
+            WorkspaceEvent::Selection => {
+                self.0.saved_plan.replace(None);
+                self.reset_keys();
+                self.refresh();
+            }
+            WorkspaceEvent::Tab(TabEvent::Interaction) => self.render_interaction(),
+            WorkspaceEvent::Tab(TabEvent::Document) => {
+                let replaced =
+                    self.0
+                        .saved_plan
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|(_, generation, _)| {
+                            self.0
+                                .workspace
+                                .selected()
+                                .and_then(|page| page.document())
+                                .is_none_or(|document| document.generation != *generation)
+                        });
+                if replaced {
+                    self.0.saved_plan.replace(None);
+                    self.render_interaction();
+                }
+                self.refresh_controls();
+                self.refresh_footer();
+                self.report_attention();
+            }
+            WorkspaceEvent::Tab(_) | WorkspaceEvent::Health => {
+                self.refresh_controls();
+                self.refresh_footer();
+            }
+            WorkspaceEvent::Attention => self.apply_attention(self.0.workspace.attention()),
+            WorkspaceEvent::Empty => {
+                if !self.0.closing.get() {
+                    self.0.workspace.new_tab();
+                }
+            }
         }
-        ShortcutAction::ClosePlan => {
-            if db_manager.close_result_preview() {
-                true
-            } else if db_manager.close_query_plan() {
-                db_manager.cancel_query_preview();
-                true
+    }
+
+    fn refresh(&self) {
+        self.refresh_controls();
+        self.render_interaction();
+        self.refresh_footer();
+        self.report_attention();
+        if self.0.workspace.history_visible() {
+            self.0.history_button.add_css_class("raised");
+        } else {
+            self.0.history_button.remove_css_class("raised");
+        }
+    }
+
+    fn refresh_controls(&self) {
+        let ready = self
+            .0
+            .workspace
+            .selected()
+            .is_some_and(|page| page.is_ready());
+        let action = if ready {
+            self.0.app.context().tabs.controls().primary_action
+        } else {
+            PrimaryAction::Unavailable
+        };
+        self.0.controls.set(action);
+        let (icon, label, sensitive, keys) = match action {
+            PrimaryAction::Run => (
+                "media-playback-start-symbolic",
+                "Run query",
+                true,
+                "Control+Return Control+Shift+Return",
+            ),
+            PrimaryAction::Unavailable => (
+                "media-playback-start-symbolic",
+                "Run query",
+                false,
+                "Control+Return Control+Shift+Return",
+            ),
+            PrimaryAction::Stop => ("media-playback-stop-symbolic", "Stop query", true, "Escape"),
+            PrimaryAction::Stopping => {
+                ("media-playback-stop-symbolic", "Stopping query", false, "")
+            }
+        };
+        let button = &self.0.run_button;
+        button.set_icon_name(icon);
+        button.set_sensitive(sensitive);
+        button.set_tooltip_text(Some(&match action {
+            PrimaryAction::Stop => "Stop query (Escape)".to_string(),
+            _ => format!("{label} (Ctrl+Enter)"),
+        }));
+        button.update_property(&[
+            gtk4::accessible::Property::Label(label),
+            gtk4::accessible::Property::KeyShortcuts(keys),
+        ]);
+        self.0
+            .plan_button
+            .set_sensitive(ready && action == PrimaryAction::Run);
+    }
+
+    fn render_interaction(&self) {
+        let page = self.0.workspace.selected();
+        let interaction = page.as_ref().and_then(TabPage::interaction);
+        let (hint, class) = interaction
+            .as_ref()
+            .map(|interaction| input_hint(&interaction.input.hint))
+            .unwrap_or_else(|| (default_hint(), None));
+        self.0.search.set_hint(&hint, class);
+        if let Some((tab, _, plan)) = self.0.saved_plan.borrow().as_ref()
+            && page.as_ref().is_some_and(|page| page.id() == *tab)
+        {
+            self.0
+                .plan
+                .show(PlanContent::Ready(Box::new(plan.clone())), true);
+            return;
+        }
+        match interaction.filter(|interaction| interaction.visible && !interaction.retired) {
+            Some(interaction) => {
+                let content = match (&interaction.plan, &interaction.error) {
+                    (Some(plan), _) => PlanContent::Ready(Box::new(plan.clone())),
+                    (None, Some(error)) => PlanContent::Error(error.clone()),
+                    _ => PlanContent::Loading,
+                };
+                self.0.plan.show(content, interaction.input.pinned);
+            }
+            None => self.0.plan.hide(),
+        }
+    }
+
+    fn footer_state(&self) -> FooterState {
+        let Some(page) = self.0.workspace.selected() else {
+            return FooterState::default();
+        };
+        let tab = page.tab();
+        let profile = tab.profile.as_ref().map(|profile| profile.0.clone());
+        let health = self.0.workspace.health();
+        let status = page
+            .session()
+            .and_then(|session| {
+                health
+                    .sessions
+                    .iter()
+                    .find(|status| status.session == session.0)
+                    .map(|status| status.status.clone())
+            })
+            .or_else(|| {
+                profile.as_ref().and_then(|profile| {
+                    health
+                        .profiles
+                        .iter()
+                        .find(|status| &status.profile == profile)
+                        .map(|status| status.status.clone())
+                })
+            });
+        let interaction = page.interaction();
+        FooterState {
+            backend: tab
+                .backend
+                .or_else(|| profile.as_deref().and_then(|name| self.0.app.backend(name))),
+            profile,
+            connecting: tab.phase == TabPhase::Connecting,
+            health: status,
+            failure: match &tab.phase {
+                TabPhase::Failed(error) => Some(error.to_string()),
+                _ => None,
+            },
+            document: page.document().filter(|_| page.is_workspace()),
+            loading: page.results().is_loading(),
+            copying: page.results().is_copying(),
+            ping_available: page.is_ready()
+                && self.0.controls.get() != PrimaryAction::Stop
+                && !interaction.is_some_and(|interaction| interaction.loading),
+        }
+    }
+
+    fn refresh_footer(&self) {
+        self.0.statusbar.update(&self.footer_state());
+    }
+
+    fn bind_statusbar(&self) {
+        let weak = self.weak();
+        self.0.statusbar.connect_ping(move || {
+            let Some(shell) = upgrade(&weak) else {
+                return;
+            };
+            let Some(page) = shell.0.workspace.selected() else {
+                return;
+            };
+            let context = shell.0.app.context().clone();
+            let probe = {
+                let _runtime = shell.0.app.bridge().enter();
+                context.health.check_tab(&context, page.id())
+            };
+            let work = shell.0.app.run(probe.wait());
+            glib::spawn_future_local(async move {
+                let _ = work.await;
+            });
+        });
+        let weak = self.weak();
+        self.0.statusbar.connect_saved_plan(move || {
+            if let Some(shell) = upgrade(&weak) {
+                shell.show_saved_plan();
+            }
+        });
+        let weak = self.weak();
+        self.0.statusbar.connect_cancel_copy(move || {
+            if let Some(page) = upgrade(&weak).and_then(|shell| shell.0.workspace.selected()) {
+                page.results().cancel_copy();
+            }
+        });
+        let weak = self.weak();
+        self.0.statusbar.connect_shortcuts(move || {
+            if let Some(shell) = upgrade(&weak) {
+                shell.execute(ShortcutAction::ShowShortcuts);
+            }
+        });
+    }
+
+    fn show_saved_plan(&self) {
+        let Some(page) = self.0.workspace.selected() else {
+            return;
+        };
+        match page.saved_plan() {
+            Ok(Some(plan)) => {
+                let generation = page.document().map_or(0, |document| document.generation);
+                self.0
+                    .saved_plan
+                    .replace(Some((page.id(), generation, plan)));
+                self.render_interaction();
+            }
+            Ok(None) => self.0.app.toast("No saved plan for this query"),
+            Err(error) => self.0.app.toast(&error),
+        }
+    }
+
+    fn open_plan(&self) {
+        if let Some(page) = self.0.workspace.selected()
+            && page.is_ready()
+        {
+            self.0.saved_plan.replace(None);
+            page.send_input(InputEvent::OpenPlan);
+        }
+    }
+
+    fn close_plan(&self) {
+        if self.0.saved_plan.borrow_mut().take().is_some() {
+            self.render_interaction();
+            return;
+        }
+        if let Some(page) = self.0.workspace.selected() {
+            page.dismiss_plan();
+        }
+        self.0.plan.hide();
+    }
+
+    fn bind_search(&self) {
+        let weak = self.weak();
+        self.0.search.set_provider(move || {
+            upgrade(&weak).map_or_else(Vec::new, |shell| shell.search_items())
+        });
+    }
+
+    fn search_items(&self) -> Vec<ActionItem> {
+        use ShortcutAction as Action;
+        let page = self.0.workspace.selected();
+        let ready = page.as_ref().is_some_and(TabPage::is_ready);
+        let multiple = self.0.workspace.tab_count() > 1;
+        let action = self.0.controls.get();
+        let mut items = Vec::new();
+        let mut add = |shortcut: Action, title: Option<&str>, enabled: bool| {
+            let entry = shortcuts::shortcut(shortcut);
+            let weak = self.weak();
+            items.push(
+                ActionItem::new(
+                    title.unwrap_or(entry.name),
+                    entry.description,
+                    "system-run-symbolic",
+                    move || {
+                        if let Some(shell) = upgrade(&weak) {
+                            shell.execute(shortcut);
+                        }
+                    },
+                )
+                .keywords(entry.keywords)
+                .enabled(enabled),
+            );
+        };
+        add(Action::FocusEditor, None, ready);
+        add(Action::FocusResults, None, ready);
+        add(Action::ShowConnections, None, true);
+        add(Action::ToggleHistory, None, true);
+        add(Action::FocusHistory, None, true);
+        add(Action::NewTab, None, true);
+        add(
+            Action::RunQuery,
+            Some(if action == PrimaryAction::Stop {
+                "Stop Query"
             } else {
-                false
+                "Run Query"
+            }),
+            matches!(action, PrimaryAction::Run | PrimaryAction::Stop),
+        );
+        add(
+            Action::OpenPlan,
+            None,
+            ready && action == PrimaryAction::Run,
+        );
+        add(Action::Disconnect, None, ready);
+        add(Action::TestAllConnections, None, true);
+        add(Action::ShowShortcuts, None, true);
+        add(Action::RenameTab, None, page.is_some());
+        add(Action::CloseTab, None, page.is_some());
+        add(Action::NextTab, None, multiple);
+        add(Action::PreviousTab, None, multiple);
+        add(Action::FocusTabs, None, true);
+        add(Action::Quit, None, true);
+        for (profile, _) in self.0.app.profiles() {
+            let weak = self.weak();
+            let name = profile.clone();
+            items.push(
+                ActionItem::new(
+                    profile.clone(),
+                    "Open database connection",
+                    "network-server-symbolic",
+                    move || {
+                        if let Some(shell) = upgrade(&weak) {
+                            shell.0.workspace.open_profile(&name);
+                        }
+                    },
+                )
+                .keywords(&["connect", "database"]),
+            );
+        }
+        for (id, title) in self.0.workspace.tab_titles() {
+            let weak = self.weak();
+            items.push(
+                ActionItem::new(
+                    format!("Tab: {title}"),
+                    "Select query tab",
+                    "go-jump-symbolic",
+                    move || {
+                        if let Some(shell) = upgrade(&weak) {
+                            shell.0.workspace.select(id);
+                            if let Some(page) = shell.0.workspace.page(id) {
+                                page.focus_primary();
+                            }
+                        }
+                    },
+                )
+                .keywords(&["switch", "query tab"]),
+            );
+        }
+        items
+    }
+
+    pub fn execute(&self, action: ShortcutAction) -> bool {
+        use ShortcutAction as Action;
+        let workspace = &self.0.workspace;
+        let page = workspace.selected();
+        match action {
+            Action::FocusSearch => {
+                let restore = gtk4::prelude::GtkWindowExt::focus(&self.0.window);
+                if let Some(page) = &page {
+                    page.send_input(InputEvent::Reset);
+                }
+                self.0.search.open("", restore)
+            }
+            Action::FocusEditor => {
+                page.is_some_and(|page| page.is_workspace() && page.editor().focus())
+            }
+            Action::FocusResults => {
+                page.is_some_and(|page| page.is_workspace() && page.results().focus())
+            }
+            Action::CycleFocus => page.is_some_and(|page| {
+                if !page.is_workspace() {
+                    return false;
+                }
+                if page.editor().has_focus() {
+                    page.results().focus()
+                } else {
+                    page.editor().focus()
+                }
+            }),
+            Action::FocusHistory => {
+                workspace.set_history_visible(true);
+                self.refresh();
+                page.is_some_and(|page| page.history().focus())
+            }
+            Action::ToggleHistory => {
+                let visible = !workspace.history_visible();
+                workspace.set_history_visible(visible);
+                self.refresh();
+                if !visible && let Some(page) = &page {
+                    page.focus_primary();
+                }
+                true
+            }
+            Action::FocusTabs => workspace.focus_tabs(),
+            Action::ShowConnections => {
+                match &page {
+                    Some(page) if !page.is_workspace() => {
+                        page.chooser().focus();
+                    }
+                    _ => {
+                        workspace.new_tab();
+                    }
+                }
+                true
+            }
+            Action::TestAllConnections => {
+                super::tab_page::test_all(&self.0.app);
+                true
+            }
+            Action::NewTab => workspace.new_tab().is_some(),
+            Action::CloseTab | Action::Disconnect => {
+                if action == Action::Disconnect && !page.as_ref().is_some_and(TabPage::is_ready) {
+                    return false;
+                }
+                if !workspace.close_selected() {
+                    self.0.window.close();
+                }
+                true
+            }
+            Action::NextTab => workspace.cycle(1),
+            Action::PreviousTab => workspace.cycle(-1),
+            Action::RenameTab => self.rename_dialog(),
+            Action::RunQuery | Action::StopQuery => page.is_some_and(|page| {
+                page.editor_command(if action == Action::StopQuery {
+                    EditorIntent::Cancel
+                } else {
+                    EditorIntent::Primary
+                });
+                true
+            }),
+            Action::EstimateAndRun => false,
+            Action::Estimate | Action::OpenPlan => {
+                self.open_plan();
+                true
+            }
+            Action::PreviewRow => {
+                page.is_some_and(|page| page.results().focus() && page.results().show_row_preview())
+            }
+            Action::CopyResults => page.is_some_and(|page| {
+                page.results().copy_selection();
+                true
+            }),
+            Action::ShowShortcuts => {
+                if self.0.shortcuts.parent().is_none() {
+                    self.0.shortcuts.present(Some(&self.0.window));
+                }
+                true
+            }
+            Action::Fullscreen => {
+                if self.0.window.is_fullscreen() {
+                    self.0.window.unfullscreen();
+                } else {
+                    self.0.window.fullscreen();
+                }
+                true
+            }
+            Action::Quit => {
+                self.0.window.close();
+                true
             }
         }
-        ShortcutAction::ShowShortcuts => {
-            shortcuts_dialog.present(Some(window));
-            true
+    }
+
+    fn rename_dialog(&self) -> bool {
+        let Some(page) = self.0.workspace.selected() else {
+            return false;
+        };
+        let dialog = adw::AlertDialog::new(Some("Rename Query Tab"), None);
+        let entry = gtk4::Entry::new();
+        entry.set_text(&page.tab().document.snapshot().title);
+        entry.set_activates_default(true);
+        entry.update_property(&[gtk4::accessible::Property::Label("Query tab name")]);
+        dialog.set_extra_child(Some(&entry));
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("rename", "Rename");
+        dialog.set_response_appearance("rename", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("rename"));
+        dialog.set_close_response("cancel");
+        let weak = self.weak();
+        dialog.connect_response(None, move |_, response| {
+            if response == "rename"
+                && let Some(shell) = upgrade(&weak)
+            {
+                if page.rename(&entry.text()) {
+                    shell.0.workspace.reconcile();
+                } else {
+                    shell.0.app.toast("Tab names cannot be empty");
+                }
+            }
+        });
+        dialog.present(Some(&self.0.window));
+        true
+    }
+
+    fn bind_actions(&self) {
+        let window = &self.0.window;
+        for (name, action) in [
+            ("test-all", ShortcutAction::TestAllConnections),
+            ("shortcuts", ShortcutAction::ShowShortcuts),
+            ("quit", ShortcutAction::Quit),
+        ] {
+            let entry = gio::SimpleAction::new(name, None);
+            let weak = self.weak();
+            entry.connect_activate(move |_, _| {
+                if let Some(shell) = upgrade(&weak) {
+                    shell.execute(action);
+                }
+            });
+            window.add_action(&entry);
         }
+    }
+
+    fn input_allowed(&self) -> bool {
+        let Some(page) = self.0.workspace.selected() else {
+            return false;
+        };
+        if !page.is_ready() {
+            return false;
+        }
+        let search = self.0.search.widget();
+        !gtk4::prelude::GtkWindowExt::focus(&self.0.window).is_some_and(|focus| {
+            focus == *search.upcast_ref::<gtk4::Widget>() || focus.is_ancestor(search)
+        })
+    }
+
+    fn at(&self) -> u64 {
+        self.0.clock.elapsed().as_millis() as u64
+    }
+
+    fn sync_modifiers(&self) {
+        let allowed = self.input_allowed();
+        let events = self.0.keys.borrow_mut().sync(allowed);
+        if events.is_empty() {
+            return;
+        }
+        let Some(page) = self.0.workspace.selected() else {
+            return;
+        };
+        let at = self.at();
+        for (key, pressed) in events {
+            page.send_input(if pressed {
+                InputEvent::Press { key, at_ms: at }
+            } else {
+                InputEvent::Release { key, at_ms: at }
+            });
+        }
+    }
+
+    fn reset_keys(&self) {
+        self.0.keys.borrow_mut().reset();
+        if let Some(page) = self.0.workspace.selected() {
+            page.send_input(InputEvent::Reset);
+        }
+    }
+
+    fn send_key(&self, key: InputKey) {
+        if let Some(page) = self.0.workspace.selected() {
+            let at = self.at();
+            page.send_input(InputEvent::Press { key, at_ms: at });
+            page.send_input(InputEvent::Release { key, at_ms: at });
+        }
+    }
+
+    fn key_pressed(&self, key: gdk::Key, modifiers: gdk::ModifierType) -> glib::Propagation {
+        let modifiers = modifiers
+            & (gdk::ModifierType::CONTROL_MASK
+                | gdk::ModifierType::SHIFT_MASK
+                | gdk::ModifierType::ALT_MASK);
+        let repeat = !self.0.keys.borrow_mut().press(key);
+        if modifier_role(key).is_some() {
+            self.sync_modifiers();
+            return glib::Propagation::Proceed;
+        }
+        if modifiers.is_empty()
+            && let Some(direction) = navigation::vim(key)
+            && !gtk4::prelude::GtkWindowExt::focus(&self.0.window)
+                .is_some_and(|focus| navigation::is_text_input(&focus))
+            && let Some(page) = self.0.workspace.selected()
+            && (page.results().navigate(direction)
+                || page.history().navigate(direction)
+                || page.chooser().navigate(direction))
+        {
+            return glib::Propagation::Stop;
+        }
+        let allowed = self.input_allowed();
+        let page = self.0.workspace.selected();
+        let control = gdk::ModifierType::CONTROL_MASK;
+        let shift = gdk::ModifierType::SHIFT_MASK;
+        if key == gdk::Key::space && modifiers == control | shift {
+            if allowed {
+                let keys = self.0.keys.borrow();
+                let (primary, preview) = (keys.primary(), keys.preview());
+                drop(keys);
+                if primary && preview {
+                    if !repeat {
+                        self.0.keys.borrow_mut().inspect = true;
+                        self.0.saved_plan.replace(None);
+                        if let Some(page) = &page {
+                            page.send_input(InputEvent::Press {
+                                key: InputKey::Inspect,
+                                at_ms: self.at(),
+                            });
+                        }
+                    }
+                    return glib::Propagation::Stop;
+                }
+                if !repeat {
+                    self.open_plan();
+                }
+                return glib::Propagation::Stop;
+            }
+            return glib::Propagation::Proceed;
+        }
+        if matches!(key, gdk::Key::Return | gdk::Key::KP_Enter)
+            && modifiers.contains(control)
+            && allowed
+        {
+            if !repeat {
+                self.send_key(InputKey::Submit);
+            }
+            return glib::Propagation::Stop;
+        }
+        if key == gdk::Key::Escape && modifiers.is_empty() {
+            if let Some(page) = &page {
+                if page.results().close_inspector() {
+                    return glib::Propagation::Stop;
+                }
+                if self.0.workspace.history_visible() && page.history().has_focus() {
+                    return glib::Propagation::Proceed;
+                }
+                if allowed && self.0.controls.get() == PrimaryAction::Stop {
+                    self.send_key(InputKey::Cancel);
+                    return glib::Propagation::Stop;
+                }
+            }
+            let estimating =
+                page.as_ref()
+                    .and_then(TabPage::interaction)
+                    .is_some_and(|interaction| {
+                        interaction.loading
+                            || interaction.visible
+                            || matches!(interaction.input.hint, InputHint::Estimating)
+                    });
+            if self.0.plan.is_visible() || estimating {
+                self.close_plan();
+                return glib::Propagation::Stop;
+            }
+            return glib::Propagation::Proceed;
+        }
+        if self.0.plan.is_visible() && self.0.keys.borrow().preview() {
+            let scroll = match key {
+                gdk::Key::Up => Some(PlanScroll::LineUp),
+                gdk::Key::Down => Some(PlanScroll::LineDown),
+                gdk::Key::Page_Up => Some(PlanScroll::PageUp),
+                gdk::Key::Page_Down => Some(PlanScroll::PageDown),
+                _ => None,
+            };
+            if let Some(scroll) = scroll
+                && self.0.plan.scroll(scroll)
+            {
+                return glib::Propagation::Stop;
+            }
+        }
+        if let Some(action) = shortcuts::matching(key, modifiers) {
+            use ShortcutAction as Action;
+            if matches!(
+                action,
+                Action::RunQuery
+                    | Action::EstimateAndRun
+                    | Action::Estimate
+                    | Action::OpenPlan
+                    | Action::StopQuery
+                    | Action::PreviewRow
+                    | Action::CopyResults
+            ) {
+                return glib::Propagation::Proceed;
+            }
+            if !repeat || matches!(action, Action::NextTab | Action::PreviousTab) {
+                self.execute(action);
+            }
+            return glib::Propagation::Stop;
+        }
+        glib::Propagation::Proceed
+    }
+
+    fn key_released(&self, key: gdk::Key) {
+        self.0.keys.borrow_mut().release(key);
+        if key == gdk::Key::space
+            && std::mem::take(&mut self.0.keys.borrow_mut().inspect)
+            && let Some(page) = self.0.workspace.selected()
+        {
+            page.send_input(InputEvent::Release {
+                key: InputKey::Inspect,
+                at_ms: self.at(),
+            });
+        }
+        if modifier_role(key).is_some() {
+            self.sync_modifiers();
+        }
+    }
+
+    fn bind_keys(&self) {
+        let controller = gtk4::EventControllerKey::new();
+        controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let weak = self.weak();
+        controller.connect_key_pressed(move |_, key, _, modifiers| {
+            upgrade(&weak).map_or(glib::Propagation::Proceed, |shell| {
+                shell.key_pressed(key, modifiers)
+            })
+        });
+        let weak = self.weak();
+        controller.connect_key_released(move |_, key, _, _| {
+            if let Some(shell) = upgrade(&weak) {
+                shell.key_released(key);
+            }
+        });
+        self.0.window.add_controller(controller);
+    }
+
+    fn bind_lifecycle(&self) {
+        let weak = self.weak();
+        self.0.window.connect_is_active_notify(move |window| {
+            let Some(shell) = upgrade(&weak) else {
+                return;
+            };
+            if !window.is_active() {
+                shell.reset_keys();
+            } else if let Some(page) = shell.0.workspace.selected()
+                && page.history_visible()
+            {
+                page.refresh_history();
+            }
+            shell.report_attention();
+        });
+        let weak = self.weak();
+        self.0.window.connect_close_request(move |_| {
+            upgrade(&weak).map_or(glib::Propagation::Proceed, |shell| shell.close_request())
+        });
+    }
+
+    fn report_attention(&self) {
+        let visible = self.0.window.is_active() && self.0.window.is_visible();
+        let viewed = self.0.workspace.selected().and_then(|page| {
+            let document = page.document()?;
+            (page.is_ready() && document.generation != 0).then(|| ViewedOutput {
+                tab: page.id().0,
+                document: document.document,
+                generation: document.generation,
+            })
+        });
+        let current = Some((visible, viewed));
+        if *self.0.viewed.borrow() == current {
+            return;
+        }
+        self.0.viewed.replace(current);
+        self.0
+            .app
+            .context()
+            .attention()
+            .input(AttentionInput::Visibility { visible, viewed });
+    }
+
+    fn apply_attention(&self, snapshot: AttentionSnapshot) {
+        let Some(application) = self.0.window.application() else {
+            return;
+        };
+        if snapshot.cancel_attention {
+            application.withdraw_notification("query-completed");
+        }
+        let previous = self.0.attention_request.replace(snapshot.request_revision);
+        if snapshot.request_revision > previous && !snapshot.application_visible {
+            let unseen = snapshot
+                .tabs
+                .iter()
+                .filter(|tab| tab.unseen.is_some())
+                .count();
+            if unseen > 0 {
+                let notification = gio::Notification::new("Query finished");
+                notification.set_body(Some(&if unseen == 1 {
+                    "A query has new results".to_string()
+                } else {
+                    format!("{unseen} queries have new results")
+                }));
+                application.send_notification(Some("query-completed"), &notification);
+            }
+        }
+    }
+
+    fn close_request(&self) -> glib::Propagation {
+        let context = self.0.app.context().clone();
+        let phase = *context.subscribe_phase().borrow();
+        match phase {
+            ApplicationPhase::Closed => glib::Propagation::Proceed,
+            ApplicationPhase::Draining => glib::Propagation::Stop,
+            ApplicationPhase::Running => {
+                if self.0.closing.replace(true) {
+                    return glib::Propagation::Stop;
+                }
+                let drafts = self
+                    .0
+                    .workspace
+                    .pages()
+                    .into_iter()
+                    .map(|page| (page.id(), page.editor().text()))
+                    .collect::<HashMap<_, _>>();
+                let location = self.0.app.workspace_location();
+                let save_context = context.clone();
+                let saving = self
+                    .0
+                    .app
+                    .run(async move { save_context.save_workspace(location, drafts).await });
+                let weak = self.weak();
+                glib::spawn_future_local(async move {
+                    let saved = saving.await;
+                    let Some(shell) = upgrade(&weak) else {
+                        return;
+                    };
+                    match saved {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            shell.0.closing.set(false);
+                            shell
+                                .0
+                                .app
+                                .toast(&format!("Could not save open tabs: {error}"));
+                            return;
+                        }
+                        Err(error) => {
+                            shell.0.closing.set(false);
+                            shell.0.app.toast(&error.to_string());
+                            return;
+                        }
+                    }
+                    context.attention().input(AttentionInput::Lifecycle {
+                        restoring: false,
+                        quitting: true,
+                    });
+                    let shutdown = {
+                        let _runtime = shell.0.app.bridge().enter();
+                        context.start_shutdown()
+                    };
+                    let shutdown = match shutdown {
+                        Ok(handle) => shell.0.app.run(handle.wait()),
+                        Err(error) => {
+                            shell.0.closing.set(false);
+                            shell.0.app.toast(&error.to_string());
+                            return;
+                        }
+                    };
+                    let result = shutdown.await;
+                    let Some(shell) = upgrade(&weak) else {
+                        return;
+                    };
+                    match result {
+                        Ok(Ok(())) => shell.0.window.close(),
+                        Ok(Err(error)) => {
+                            shell.0.closing.set(false);
+                            context.attention().input(AttentionInput::Lifecycle {
+                                restoring: false,
+                                quitting: false,
+                            });
+                            shell.0.workspace.reconcile();
+                            shell.0.app.toast(&format!(
+                                "Cannot close Dzban: {error}. Finish or cancel running work and try again."
+                            ));
+                        }
+                        Err(error) => {
+                            shell.0.closing.set(false);
+                            shell
+                                .0
+                                .app
+                                .toast(&format!("Shutdown did not complete: {error}"));
+                        }
+                    }
+                });
+                glib::Propagation::Stop
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn search(&self) -> &ActionSearch {
+        &self.0.search
+    }
+
+    #[cfg(test)]
+    pub fn plan(&self) -> &PlanView {
+        &self.0.plan
+    }
+
+    #[cfg(test)]
+    pub fn footer(&self) -> &Statusbar {
+        &self.0.statusbar
+    }
+
+    #[cfg(test)]
+    pub fn plan_button(&self) -> &gtk4::Button {
+        &self.0.plan_button
+    }
+
+    #[cfg(test)]
+    pub fn run_button(&self) -> &gtk4::Button {
+        &self.0.run_button
+    }
+
+    #[cfg(test)]
+    pub fn history_button(&self) -> &gtk4::Button {
+        &self.0.history_button
+    }
+
+    #[cfg(test)]
+    pub fn press(&self, key: gdk::Key, modifiers: gdk::ModifierType) -> glib::Propagation {
+        self.key_pressed(key, modifiers)
+    }
+
+    #[cfg(test)]
+    pub fn release(&self, key: gdk::Key) {
+        self.key_released(key)
     }
 }
 
-fn show_rename_query_dialog(db_manager: &DatabaseTabManager, window: &ApplicationWindow) -> bool {
-    let Some(current_title) = db_manager.current_query_tab_title() else {
-        return false;
-    };
-    let dialog = adw::Dialog::new();
-    dialog.set_title("Rename Query Tab");
-    dialog.set_content_width(420);
-
-    let toolbar = ToolbarView::new();
-    let header = HeaderBar::new();
-    header.set_show_start_title_buttons(true);
-    toolbar.add_top_bar(&header);
-
-    let content = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
-    content.set_margin_top(18);
-    content.set_margin_bottom(18);
-    content.set_margin_start(18);
-    content.set_margin_end(18);
-    let entry = gtk4::Entry::new();
-    entry.set_text(&current_title);
-    entry.set_activates_default(true);
-    entry.update_property(&[gtk4::accessible::Property::Label("Query tab name")]);
-    let rename = gtk4::Button::with_label("Rename");
-    rename.add_css_class("suggested-action");
-    rename.set_halign(gtk4::Align::End);
-    rename.set_receives_default(true);
-    content.append(&entry);
-    content.append(&rename);
-    toolbar.set_content(Some(&content));
-    dialog.set_child(Some(&toolbar));
-
-    let manager_for_rename = db_manager.clone();
-    let entry_for_rename = entry.clone();
-    let dialog_for_rename = dialog.clone();
-    rename.connect_clicked(move |_| {
-        if manager_for_rename.rename_current_query_tab(&entry_for_rename.text()) {
-            dialog_for_rename.close();
-        }
-    });
-    let rename_for_activate = rename.clone();
-    entry.connect_activate(move |_| rename_for_activate.emit_clicked());
-    dialog.present(Some(window));
-    entry.grab_focus();
-    true
+fn upgrade(weak: &std::rc::Weak<Inner>) -> Option<Shell> {
+    weak.upgrade().map(Shell)
 }
 
-fn install_styles() {
+pub fn install_styles() {
     let provider = gtk4::CssProvider::new();
     provider.load_from_string(
         "entry.query-action-field {
-            min-height: 36px;
-            border: 1px solid alpha(@window_fg_color, 0.22);
-            border-radius: 9px;
-            background-color: alpha(@view_bg_color, 0.88);
-            box-shadow: 0 1px 3px alpha(black, 0.12);
+            min-height: 30px;
         }
-        entry.query-action-field:focus {
-            border-color: alpha(@accent_color, 0.75);
-            background-color: @view_bg_color;
-        }
-        #query-action-control.guidance entry.query-action-field,
-        #query-action-control.ready entry.query-action-field {
-            border-color: alpha(@accent_color, 0.75);
+        entry.query-action-field.guidance,
+        entry.query-action-field.ready {
+            outline: 1px solid alpha(@accent_color, 0.6);
             background-color: alpha(@accent_bg_color, 0.12);
         }
-        #query-action-control.progress entry.query-action-field {
-            border-color: alpha(@accent_color, 0.85);
+        entry.query-action-field.progress {
+            outline: 1px solid alpha(@accent_color, 0.7);
             background-color: alpha(@accent_bg_color, 0.16);
         }
-        #query-action-control.error entry.query-action-field {
-            border-color: alpha(@error_color, 0.75);
+        entry.query-action-field.error {
+            outline: 1px solid alpha(@error_color, 0.7);
             background-color: alpha(@error_color, 0.10);
         }
-        progressbar.query-action-progress {
-            min-width: 0;
-            min-height: 2px;
-            margin: 0;
-            padding: 0;
-        }
-        progressbar.query-action-progress trough {
-            min-width: 0;
+        progressbar.query-progress,
+        progressbar.query-progress trough,
+        progressbar.query-progress progress {
             min-height: 2px;
             margin: 0;
             padding: 0;
             border: none;
             border-radius: 0;
+        }
+        progressbar.query-progress trough {
             background-color: transparent;
         }
-        progressbar.query-action-progress progress {
-            min-width: 0;
-            min-height: 2px;
-            border-radius: 0;
+        progressbar.query-progress progress {
             background-color: @accent_bg_color;
         }
-        .plan-inspector {
+        .floating-inspector {
             background-color: @window_bg_color;
             box-shadow: 0 6px 24px alpha(black, 0.28);
         }
+        .run-summary {
+            padding: 18px 28px;
+            background-color: alpha(@window_bg_color, 0.92);
+        }
+        .run-summary-elapsed {
+            font-size: 24pt;
+            font-weight: 600;
+        }
+        .result-issues {
+            padding: 8px 12px;
+            background-color: alpha(@error_color, 0.04);
+            border-bottom: 1px solid alpha(@window_fg_color, 0.12);
+        }
+        .result-null {
+            color: alpha(@window_fg_color, 0.5);
+            font-style: italic;
+        }
+        .result-state-tile {
+            min-width: 44px;
+            min-height: 44px;
+            border-radius: 10px;
+            background-color: alpha(@window_fg_color, 0.08);
+        }
+        .result-state-tile.error {
+            color: @error_color;
+            background-color: alpha(@error_color, 0.12);
+        }
+        .result-state-title {
+            font-size: 15px;
+            font-weight: 600;
+        }
+        columnview.result-table > listview > row {
+            min-height: 24px;
+            padding: 0;
+        }
+        columnview.result-table > listview > row > cell {
+            padding: 2px 6px;
+        }
+        columnview.result-table row:nth-child(even) {
+            background-color: alpha(@window_fg_color, 0.03);
+        }
+        columnview.result-table row:selected {
+            background-color: alpha(@accent_bg_color, 0.25);
+        }
+        columnview.result-table .result-cursor {
+            background-color: alpha(@accent_bg_color, 0.45);
+            box-shadow: inset 0 0 0 1px @accent_color;
+        }
         .query-history-pane {
             background-color: @view_bg_color;
-            border-right: 1px solid alpha(@window_fg_color, 0.18);
+            border-right: 1px solid alpha(@window_fg_color, 0.12);
         }
-        .workspace-section-header {
-            background-color: @headerbar_bg_color;
-            border-bottom: 1px solid alpha(@window_fg_color, 0.18);
+        .query-history-content {
+            padding: 8px 12px;
         }
-        .workspace-list {
-            background-color: @view_bg_color;
-        }
-        .workspace-list row {
-            border-radius: 0;
-        }
-        .workspace-list row:hover {
-            background-color: alpha(@view_fg_color, 0.06);
+        .query-history-title {
+            font-size: 9pt;
         }
         .workspace-list row:selected {
             background-color: alpha(@accent_bg_color, 0.16);
             color: @view_fg_color;
         }
-        .query-history-list row {
-            min-height: 54px;
-            padding: 0;
-            transition: background-color 140ms ease;
-        }
-        .query-history-content {
-            padding: 9px 12px;
-        }
-        .query-history-title {
-            font-weight: 600;
-        }
-        .query-history-status {
-            border-radius: 999px;
-        }
-        .query-history-status.success {
-            background-color: @success_color;
-        }
-        .query-history-status.error {
-            background-color: @error_color;
-        }
-        .query-history-row .history-row-action {
-            min-width: 20px;
-            min-height: 20px;
-            padding: 0;
-            opacity: 0;
-            transition: opacity 140ms ease;
-        }
-        .query-history-row:hover .history-row-action,
-        .query-history-row:selected .history-row-action,
-        .query-history-row:focus-within .history-row-action {
-            opacity: 1;
+        .connection-list row:selected {
+            background-color: alpha(@accent_bg_color, 0.12);
+            box-shadow: inset 0 0 0 1.5px @accent_color;
         }
         paned.query-split > separator {
             min-height: 1px;
-            background-color: alpha(@window_fg_color, 0.18);
+            background-color: alpha(@window_fg_color, 0.12);
+        }
+        .query-editor {
+            font-size: 11pt;
         }
         .workspace-statusbar {
-            border-top: 1px solid alpha(@window_fg_color, 0.18);
+            min-height: 30px;
+            padding: 0 32px 0 19px;
+            border-top: 1px solid alpha(@window_fg_color, 0.12);
             background-color: @headerbar_bg_color;
+        }
+        .workspace-statusbar button {
+            min-height: 22px;
+            padding: 0 4px;
+        }
+        .status-dot {
+            min-width: 7px;
+            min-height: 7px;
+            border-radius: 999px;
+            background-color: alpha(@window_fg_color, 0.4);
+        }
+        .status-dot.status-connected {
+            background-color: @success_color;
+        }
+        .status-dot.status-connecting {
+            background-color: @warning_color;
+        }
+        .status-dot.status-error {
+            background-color: @error_color;
         }",
     );
     gtk4::style_context_add_provider_for_display(
-        &gtk4::gdk::Display::default().expect("a display is available after GTK initialization"),
+        &gdk::Display::default().expect("a display is available after GTK initialization"),
         &provider,
         gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
-}
-
-fn create_header_bar(
-    db_tab_manager: &DatabaseTabManager,
-    toast_overlay: &ToastOverlay,
-    window: &ApplicationWindow,
-    shortcuts_dialog: &adw::Dialog,
-) -> (HeaderBar, gtk4::Entry) {
-    use gtk4::{
-        Button, Entry, EntryIconPosition, EventControllerKey, Label, ListBox, Popover,
-        ScrolledWindow, gdk,
-    };
-    use std::cell::RefCell;
-    use std::rc::Rc;
-
-    let header = HeaderBar::new();
-
-    // Left side - sidebar toggle
-    let sidebar_toggle = Button::from_icon_name("sidebar-show-symbolic");
-    sidebar_toggle.set_tooltip_text(Some(
-        &shortcuts::shortcut(ShortcutAction::ToggleSidebar).tooltip(),
-    ));
-    sidebar_toggle.update_property(&[gtk4::accessible::Property::Label("Toggle query history")]);
-
-    // Wire up sidebar toggle
-    let db_manager_clone = db_tab_manager.clone();
-    sidebar_toggle.connect_clicked(move |btn| {
-        db_manager_clone.toggle_current_sidebar();
-        // Update icon based on state
-        let is_showing = db_manager_clone.is_current_sidebar_visible();
-        if is_showing {
-            btn.set_icon_name("sidebar-hide-symbolic");
-        } else {
-            btn.set_icon_name("sidebar-show-symbolic");
-        }
-    });
-
-    header.pack_start(&sidebar_toggle);
-
-    let (search_container, db_search, progress_bar) = create_query_action_field();
-
-    let pulse_timer: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
-    let search_for_preview = db_search.clone();
-    let progress_for_preview = progress_bar.clone();
-    let pulse_timer_for_preview = Rc::clone(&pulse_timer);
-    let search_container_for_state = search_container.clone();
-    db_tab_manager.set_app_state_callback(move |state| {
-        if let Some(timer) = pulse_timer_for_preview.borrow_mut().take() {
-            timer.remove();
-        }
-
-        search_for_preview.set_placeholder_text(Some(&query_action_message(&state)));
-        for class in ["guidance", "progress", "ready", "error"] {
-            search_container_for_state.remove_css_class(class);
-        }
-        match state.action_hint() {
-            dzban_gtk::database::ActionHint::Estimating
-            | dzban_gtk::database::ActionHint::Planning
-            | dzban_gtk::database::ActionHint::Running(_)
-            | dzban_gtk::database::ActionHint::Canceling(_) => {
-                search_container_for_state.add_css_class("progress");
-                let tooltip = match state.action_hint() {
-                    dzban_gtk::database::ActionHint::Estimating => "Release Ctrl+Shift to dismiss",
-                    dzban_gtk::database::ActionHint::Planning => {
-                        "Estimating the query before execution"
-                    }
-                    dzban_gtk::database::ActionHint::Running(_) => {
-                        "Query is running in the background"
-                    }
-                    dzban_gtk::database::ActionHint::Canceling(_) => "Canceling the running query",
-                    _ => unreachable!(),
-                };
-                search_for_preview.set_tooltip_text(Some(tooltip));
-                progress_for_preview.set_visible(true);
-                progress_for_preview.set_fraction(0.2);
-                let weak_progress = progress_for_preview.downgrade();
-                *pulse_timer_for_preview.borrow_mut() = Some(glib::timeout_add_local(
-                    std::time::Duration::from_millis(80),
-                    move || {
-                        let Some(progress) = weak_progress.upgrade() else {
-                            return glib::ControlFlow::Break;
-                        };
-                        progress.pulse();
-                        glib::ControlFlow::Continue
-                    },
-                ));
-            }
-            dzban_gtk::database::ActionHint::EstimateError(error) => {
-                search_container_for_state.add_css_class("error");
-                search_for_preview.set_tooltip_text(Some(&error));
-                clear_progress(&progress_for_preview);
-            }
-            dzban_gtk::database::ActionHint::EstimateReady(_) => {
-                search_container_for_state.add_css_class("ready");
-                search_for_preview.set_tooltip_text(None);
-                clear_progress(&progress_for_preview);
-            }
-            dzban_gtk::database::ActionHint::PrimaryGuide => {
-                search_container_for_state.add_css_class("guidance");
-                search_for_preview.set_tooltip_text(Some("Ctrl is held"));
-                clear_progress(&progress_for_preview);
-            }
-            dzban_gtk::database::ActionHint::Default => {
-                search_for_preview.set_tooltip_text(None);
-                clear_progress(&progress_for_preview);
-            }
-        }
-    });
-
-    let suggestions_popover = Popover::new();
-    suggestions_popover.set_parent(&db_search);
-    suggestions_popover.set_autohide(false); // Don't auto-hide to keep focus in search
-    suggestions_popover.set_has_arrow(false);
-    suggestions_popover.set_width_request(500); // Fixed wider width
-
-    let suggestions_scroll = ScrolledWindow::new();
-    suggestions_scroll.set_max_content_height(400);
-    suggestions_scroll.set_propagate_natural_height(true);
-    suggestions_scroll.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
-
-    let suggestions_list = ListBox::new();
-    suggestions_list.add_css_class("navigation-sidebar");
-    suggestions_scroll.set_child(Some(&suggestions_list));
-    suggestions_popover.set_child(Some(&suggestions_scroll));
-
-    // Track selected row index
-    let selected_index: Rc<RefCell<i32>> = Rc::new(RefCell::new(0));
-
-    #[derive(Clone)]
-    enum SearchActionKind {
-        Shortcut(ShortcutAction),
-        OpenDatabase(String),
-        FocusConnection(String),
-        SelectDatabase(String),
-    }
-
-    #[derive(Clone)]
-    struct SearchAction {
-        title: String,
-        subtitle: String,
-        icon: String,
-        action: SearchActionKind,
-    }
-
-    let manager_for_actions = db_tab_manager.clone();
-    let create_search_actions = move |search_text: &str| -> Vec<SearchAction> {
-        let mut actions = Vec::new();
-        let search_lower = search_text.to_lowercase();
-
-        for action in shortcuts::shortcuts() {
-            let searchable = std::iter::once(action.name)
-                .chain(std::iter::once(action.description))
-                .chain(action.keywords.iter().copied())
-                .any(|value| value.to_lowercase().contains(&search_lower));
-            if search_text.is_empty() || searchable {
-                actions.push(SearchAction {
-                    title: action.name.to_string(),
-                    subtitle: action.description.to_string(),
-                    icon: "system-run-symbolic".to_string(),
-                    action: SearchActionKind::Shortcut(action.action),
-                });
-            }
-        }
-
-        let databases = manager_for_actions.get_database_list();
-        for db_name in &databases {
-            let subtitle = "Open database connection";
-            if search_text.is_empty()
-                || db_name.to_lowercase().contains(&search_lower)
-                || subtitle.to_lowercase().contains(&search_lower)
-            {
-                actions.push(SearchAction {
-                    title: db_name.clone(),
-                    subtitle: subtitle.to_string(),
-                    icon: "server-database-symbolic".to_string(),
-                    action: SearchActionKind::OpenDatabase(db_name.clone()),
-                });
-            }
-        }
-
-        for db_name in databases {
-            let subtitle = "Focus database in the connection list";
-            let searchable = format!("connection database {} {}", db_name, subtitle).to_lowercase();
-            if search_text.is_empty() || searchable.contains(&search_lower) {
-                actions.push(SearchAction {
-                    title: format!("Connection: {}", db_name),
-                    subtitle: subtitle.to_string(),
-                    icon: "network-server-symbolic".to_string(),
-                    action: SearchActionKind::FocusConnection(db_name),
-                });
-            }
-        }
-
-        for (tab_id, db_name) in manager_for_actions.open_database_tabs() {
-            let subtitle = "Select open query tab";
-            let searchable = format!("database tab {} {}", db_name, subtitle).to_lowercase();
-            if search_text.is_empty() || searchable.contains(&search_lower) {
-                actions.push(SearchAction {
-                    title: format!("Query tab: {}", db_name),
-                    subtitle: subtitle.to_string(),
-                    icon: "go-jump-symbolic".to_string(),
-                    action: SearchActionKind::SelectDatabase(tab_id),
-                });
-            }
-        }
-
-        actions
-    };
-
-    let execute_action = {
-        let db_manager = db_tab_manager.clone();
-        let toast = toast_overlay.clone();
-        let window = window.clone();
-        let shortcuts_dialog = shortcuts_dialog.clone();
-        move |action: &SearchActionKind, entry: &Entry| {
-            let message = match action {
-                SearchActionKind::Shortcut(action) => {
-                    execute_shortcut_action(
-                        *action,
-                        &db_manager,
-                        entry,
-                        &window,
-                        &shortcuts_dialog,
-                    );
-                    None
-                }
-                SearchActionKind::OpenDatabase(db_name) => {
-                    db_manager.open_database(db_name);
-                    Some(format!("Opened: {}", db_name))
-                }
-                SearchActionKind::FocusConnection(db_name) => {
-                    db_manager.focus_connection(db_name);
-                    None
-                }
-                SearchActionKind::SelectDatabase(db_name) => {
-                    db_manager.select_database_tab(db_name);
-                    None
-                }
-            };
-            entry.set_text("");
-            if let Some(message) = message {
-                let toast_msg = Toast::new(&message);
-                toast_msg.set_timeout(2);
-                toast.add_toast(toast_msg);
-            }
-        }
-    };
-
-    // Helper to create highlighted text markup
-    let create_highlighted_markup = |text: &str, search: &str| -> String {
-        if search.is_empty() {
-            return gtk4::glib::markup_escape_text(text).to_string();
-        }
-
-        // Create markup with bold matched parts
-        let search_lower = search.to_lowercase();
-        let text_lower = text.to_lowercase();
-
-        if let Some(pos) = text_lower.find(&search_lower) {
-            let before = &text[..pos];
-            let matched = &text[pos..pos + search.len()];
-            let after = &text[pos + search.len()..];
-
-            format!(
-                "{}<b>{}</b>{}",
-                gtk4::glib::markup_escape_text(before),
-                gtk4::glib::markup_escape_text(matched),
-                gtk4::glib::markup_escape_text(after)
-            )
-        } else {
-            gtk4::glib::markup_escape_text(text).to_string()
-        }
-    };
-
-    let update_suggestions = {
-        let suggestions_list = suggestions_list.clone();
-        let suggestions_popover = suggestions_popover.clone();
-        let selected_index = selected_index.clone();
-        let db_search = db_search.clone();
-        let execute_action = execute_action.clone();
-
-        move |search_text: &str| {
-            // Clear previous suggestions
-            while let Some(child) = suggestions_list.first_child() {
-                suggestions_list.remove(&child);
-            }
-
-            *selected_index.borrow_mut() = 0;
-
-            let actions = create_search_actions(search_text);
-
-            if actions.is_empty() {
-                suggestions_popover.popdown();
-                return;
-            }
-
-            // Add action rows
-            for (idx, action) in actions.iter().enumerate() {
-                let row = adw::ActionRow::new();
-
-                // Use markup for title with highlighting
-                let title_markup = create_highlighted_markup(&action.title, search_text);
-                let subtitle_markup = create_highlighted_markup(&action.subtitle, search_text);
-
-                // ActionRow doesn't support markup directly, so we need to use a workaround
-                // Set title and subtitle as plain text first
-                row.set_title(&action.title);
-                row.set_subtitle(&action.subtitle);
-                row.update_property(&[
-                    gtk4::accessible::Property::Label(&action.title),
-                    gtk4::accessible::Property::Description(&action.subtitle),
-                ]);
-
-                // Then replace with markup by accessing the internal labels
-                if let Some(title_widget) = row.first_child()
-                    && let Ok(box_widget) = title_widget.downcast::<gtk4::Box>()
-                {
-                    // Find both title and subtitle labels in the box
-                    let mut child = box_widget.first_child();
-                    while let Some(widget) = child {
-                        if let Ok(label) = widget.clone().downcast::<Label>() {
-                            let css_classes = label.css_classes();
-                            let has_title = css_classes.iter().any(|c| c.as_str() == "title");
-                            let has_subtitle = css_classes
-                                .iter()
-                                .any(|c| c.as_str() == "subtitle" || c.as_str() == "caption");
-
-                            if has_title {
-                                label.set_markup(&title_markup);
-                            } else if has_subtitle {
-                                label.set_markup(&subtitle_markup);
-                            }
-                        }
-                        child = widget.next_sibling();
-                    }
-                }
-
-                // Add icon as prefix
-                let icon = gtk4::Image::from_icon_name(&action.icon);
-                row.add_prefix(&icon);
-
-                row.set_activatable(true);
-
-                let action_kind = action.action.clone();
-                let execute_clone = execute_action.clone();
-                let entry_clone = db_search.clone();
-                let popover_clone = suggestions_popover.clone();
-
-                let action_button = Button::from_icon_name("go-next-symbolic");
-                action_button.add_css_class("flat");
-                action_button.update_property(&[gtk4::accessible::Property::Label(&format!(
-                    "Run action: {}",
-                    action.title
-                ))]);
-                let action_for_button = action_kind.clone();
-                let execute_for_button = execute_action.clone();
-                let entry_for_button = db_search.clone();
-                let popover_for_button = suggestions_popover.clone();
-                action_button.connect_clicked(move |_| {
-                    execute_for_button(&action_for_button, &entry_for_button);
-                    popover_for_button.popdown();
-                });
-                row.add_suffix(&action_button);
-
-                row.connect_activated(move |_| {
-                    execute_clone(&action_kind, &entry_clone);
-                    popover_clone.popdown();
-                });
-
-                suggestions_list.append(&row);
-
-                // Select first row by default
-                if idx == 0 {
-                    suggestions_list.select_row(Some(&row));
-                }
-            }
-
-            suggestions_popover.popup();
-        }
-    };
-
-    // Wire up search changed to update suggestions
-    let update_suggestions_clone = update_suggestions.clone();
-    db_search.connect_changed(move |entry| {
-        let text = entry.text();
-        entry.set_icon_from_icon_name(
-            EntryIconPosition::Secondary,
-            (!text.is_empty()).then_some("edit-clear-symbolic"),
-        );
-        update_suggestions_clone(&text);
-    });
-    let update_suggestions_on_focus = update_suggestions.clone();
-    db_search.connect_has_focus_notify(move |entry| {
-        if entry.has_focus() {
-            update_suggestions_on_focus(&entry.text());
-        }
-    });
-    db_search.connect_icon_release(|entry, position| {
-        if position == EntryIconPosition::Secondary {
-            entry.set_text("");
-        }
-    });
-
-    // Wire up keyboard navigation (Up/Down arrows)
-    let key_controller = EventControllerKey::new();
-    let suggestions_list_keys = suggestions_list.clone();
-    let selected_index_keys = selected_index.clone();
-    let suggestions_popover_keys = suggestions_popover.clone();
-    key_controller.connect_key_pressed(move |_controller, keyval, _keycode, _state| {
-        match keyval {
-            gdk::Key::Down => {
-                // Move selection down
-                let mut idx = selected_index_keys.borrow_mut();
-                let n_items = suggestions_list_keys.observe_children().n_items();
-                if n_items > 0 {
-                    *idx = (*idx + 1).min(n_items as i32 - 1);
-                    if let Some(row) = suggestions_list_keys.row_at_index(*idx) {
-                        suggestions_list_keys.select_row(Some(&row));
-                        row.grab_focus();
-                    }
-                }
-                gtk4::glib::Propagation::Stop
-            }
-            gdk::Key::Up => {
-                // Move selection up
-                let mut idx = selected_index_keys.borrow_mut();
-                *idx = (*idx - 1).max(0);
-                if let Some(row) = suggestions_list_keys.row_at_index(*idx) {
-                    suggestions_list_keys.select_row(Some(&row));
-                    row.grab_focus();
-                }
-                gtk4::glib::Propagation::Stop
-            }
-            gdk::Key::Escape => {
-                // Close popover on Escape
-                suggestions_popover_keys.popdown();
-                gtk4::glib::Propagation::Stop
-            }
-            _ => gtk4::glib::Propagation::Proceed,
-        }
-    });
-    db_search.add_controller(key_controller);
-
-    // Wire up Enter key to activate selected row or first row
-    let suggestions_list_enter = suggestions_list.clone();
-    let suggestions_popover_enter = suggestions_popover.clone();
-    let selected_index_enter = selected_index.clone();
-    let toast_enter = toast_overlay.clone();
-    db_search.connect_activate(move |entry| {
-        let text = entry.text();
-        let search_text = text.trim();
-
-        // Check if we have a selected row in the popover
-        if suggestions_popover_enter.is_visible() {
-            let idx = *selected_index_enter.borrow();
-            if let Some(row) = suggestions_list_enter.row_at_index(idx) {
-                // Activate the selected row
-                row.activate();
-                suggestions_popover_enter.popdown();
-                return;
-            }
-        }
-
-        // Fallback: no popover or no selection, show error
-        if !search_text.is_empty() {
-            let toast_msg = Toast::new(&format!("Unknown action: {}", search_text));
-            toast_msg.set_timeout(2);
-            toast_enter.add_toast(toast_msg);
-            entry.set_text("");
-        }
-
-        suggestions_popover_enter.popdown();
-    });
-
-    header.set_title_widget(Some(&search_container));
-
-    // Right side controls
-
-    // Run query button (primary action)
-    let run_button = Button::from_icon_name("media-playback-start-symbolic");
-    run_button.set_tooltip_text(Some(
-        &shortcuts::shortcut(ShortcutAction::RunQuery).tooltip(),
-    ));
-    run_button.update_property(&[
-        gtk4::accessible::Property::Label("Run query"),
-        gtk4::accessible::Property::KeyShortcuts("Control+Return Control+Shift+Return"),
-    ]);
-    run_button.add_css_class("suggested-action");
-
-    let run_button_for_operation = run_button.clone();
-    db_tab_manager.set_app_state_callback(move |state| {
-        render_primary_action(&run_button_for_operation, state.primary_action());
-    });
-
-    let db_manager_run = db_tab_manager.clone();
-    run_button.connect_clicked(move |_| {
-        db_manager_run.activate_primary_action();
-    });
-
-    header.pack_end(&run_button);
-
-    // New query tab button
-    let new_query_button = Button::from_icon_name("tab-new-symbolic");
-    new_query_button.set_tooltip_text(Some(
-        &shortcuts::shortcut(ShortcutAction::NewQueryTab).tooltip(),
-    ));
-    new_query_button.update_property(&[
-        gtk4::accessible::Property::Label("New query tab"),
-        gtk4::accessible::Property::KeyShortcuts("Control+t"),
-    ]);
-
-    let db_manager_clone = db_tab_manager.clone();
-    new_query_button.connect_clicked(move |_| {
-        db_manager_clone.new_query_in_current_db();
-    });
-
-    header.pack_end(&new_query_button);
-
-    // Settings menu
-    let menu_button = Button::from_icon_name("open-menu-symbolic");
-    menu_button.set_tooltip_text(Some("Main Menu"));
-    menu_button.update_property(&[gtk4::accessible::Property::Label("Main Menu")]);
-
-    let menu_popover = Popover::new();
-    let menu_content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-    menu_content.set_margin_top(6);
-    menu_content.set_margin_bottom(6);
-    menu_content.set_margin_start(6);
-    menu_content.set_margin_end(6);
-    let shortcuts_button = Button::new();
-    shortcuts_button.add_css_class("flat");
-    shortcuts_button.set_halign(gtk4::Align::Fill);
-    let shortcuts_content = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-    shortcuts_content.append(&gtk4::Image::from_icon_name("input-keyboard-symbolic"));
-    shortcuts_content.append(&Label::new(Some("Keyboard Shortcuts")));
-    shortcuts_button.set_child(Some(&shortcuts_content));
-    shortcuts_button.set_tooltip_text(Some(
-        &shortcuts::shortcut(ShortcutAction::ShowShortcuts).tooltip(),
-    ));
-    shortcuts_button.update_property(&[
-        gtk4::accessible::Property::Label("Keyboard shortcuts"),
-        gtk4::accessible::Property::KeyShortcuts("F1"),
-    ]);
-    let shortcuts_dialog_for_button = shortcuts_dialog.clone();
-    let window_for_button = window.clone();
-    let menu_popover_for_button = menu_popover.clone();
-    shortcuts_button.connect_clicked(move |_| {
-        menu_popover_for_button.popdown();
-        shortcuts_dialog_for_button.present(Some(&window_for_button));
-    });
-    menu_content.append(&shortcuts_button);
-    menu_popover.set_child(Some(&menu_content));
-    menu_popover.set_parent(&menu_button);
-    let menu_popover_for_menu = menu_popover.clone();
-    menu_button.connect_clicked(move |_| menu_popover_for_menu.popup());
-    header.pack_end(&menu_button);
-
-    (header, db_search)
-}
-
-fn query_action_message(state: &dzban_gtk::database::AppState) -> String {
-    match state.action_hint() {
-        dzban_gtk::database::ActionHint::Default => default_action_hint(),
-        dzban_gtk::database::ActionHint::PrimaryGuide => {
-            "Enter: run - Shift: estimate - Shift+Enter: estimate and run".to_string()
-        }
-        dzban_gtk::database::ActionHint::Estimating => {
-            "Enter to run - Space for plan - estimating rows and cost...".to_string()
-        }
-        dzban_gtk::database::ActionHint::EstimateReady(plan) => {
-            format!("Enter to run - Space for plan - {}", plan_estimate(&plan))
-        }
-        dzban_gtk::database::ActionHint::Planning => {
-            "Estimating query before execution...".to_string()
-        }
-        dzban_gtk::database::ActionHint::Running(Some(plan)) => {
-            format!("Running query - {}", plan_estimate(&plan))
-        }
-        dzban_gtk::database::ActionHint::Running(None) => "Running query...".to_string(),
-        dzban_gtk::database::ActionHint::Canceling(Some(plan)) => {
-            format!("Stopping query - {}", plan_estimate(&plan))
-        }
-        dzban_gtk::database::ActionHint::Canceling(None) => "Stopping query...".to_string(),
-        dzban_gtk::database::ActionHint::EstimateError(error) => {
-            format!("Enter to run - estimate unavailable: {}", error)
-        }
-    }
-}
-
-fn render_primary_action(button: &gtk4::Button, action: dzban_gtk::database::PrimaryAction) {
-    use dzban_gtk::database::PrimaryAction;
-    let (icon, label, sensitive, shortcut) = match action {
-        PrimaryAction::Run => (
-            "media-playback-start-symbolic",
-            "Run query",
-            true,
-            "Control+Return Control+Shift+Return",
-        ),
-        PrimaryAction::Unavailable => (
-            "media-playback-start-symbolic",
-            "Run query",
-            false,
-            "Control+Return Control+Shift+Return",
-        ),
-        PrimaryAction::Stop => (
-            "media-playback-stop-symbolic",
-            "Stop query",
-            true,
-            "Escape Control+period",
-        ),
-        PrimaryAction::Stopping => ("media-playback-stop-symbolic", "Stopping query", false, ""),
-    };
-    button.set_icon_name(icon);
-    button.set_sensitive(sensitive);
-    button.set_tooltip_text(Some(label));
-    button.update_property(&[
-        gtk4::accessible::Property::Label(label),
-        gtk4::accessible::Property::KeyShortcuts(shortcut),
-    ]);
-}
-
-fn plan_estimate(plan: &dzban_gtk::database::QueryPlan) -> String {
-    match (
-        plan.estimate.rows,
-        plan.estimate.startup_cost,
-        plan.estimate.total_cost,
-        plan.estimate.parts,
-        plan.estimate.marks,
-    ) {
-        (Some(rows), Some(startup), Some(total), _, _) => {
-            format!("~{rows} rows - cost {startup:.2}..{total:.2}")
-        }
-        (Some(rows), _, _, Some(parts), Some(marks)) => {
-            format!("~{rows} rows - {parts} parts - {marks} marks")
-        }
-        (Some(rows), _, _, _, _) => format!("~{rows} rows"),
-        _ => "estimate ready".to_string(),
-    }
-}
-
-fn default_action_hint() -> String {
-    format!(
-        "Actions and databases ({})",
-        shortcuts::shortcut(ShortcutAction::FocusSearch).accelerator()
-    )
-}
-
-fn create_query_action_field() -> (gtk4::Overlay, gtk4::Entry, gtk4::ProgressBar) {
-    let overlay = gtk4::Overlay::new();
-    overlay.set_halign(gtk4::Align::Center);
-    overlay.set_width_request(600);
-    overlay.set_overflow(gtk4::Overflow::Hidden);
-    overlay.set_widget_name("query-action-control");
-
-    let entry = gtk4::Entry::new();
-    entry.set_widget_name("database-search-action");
-    entry.update_property(&[
-        gtk4::accessible::Property::Label("Database search and query action"),
-        gtk4::accessible::Property::Description("Search actions or display query estimates"),
-        gtk4::accessible::Property::KeyShortcuts("Control+k"),
-    ]);
-    entry.set_placeholder_text(Some(&default_action_hint()));
-    entry.set_width_request(600);
-    gtk4::prelude::EntryExt::set_alignment(&entry, 0.5);
-    entry.add_css_class("query-action-field");
-    entry.connect_has_focus_notify(|entry| {
-        if entry.has_focus() {
-            gtk4::prelude::EntryExt::set_alignment(entry, 0.0);
-            entry.set_icon_from_icon_name(
-                gtk4::EntryIconPosition::Primary,
-                Some("system-search-symbolic"),
-            );
-        } else {
-            gtk4::prelude::EntryExt::set_alignment(entry, 0.5);
-            entry.set_icon_from_icon_name(gtk4::EntryIconPosition::Primary, None);
-        }
-    });
-    overlay.set_child(Some(&entry));
-
-    let progress = gtk4::ProgressBar::new();
-    progress.add_css_class("query-action-progress");
-    progress.set_halign(gtk4::Align::Fill);
-    progress.set_valign(gtk4::Align::End);
-    progress.set_pulse_step(0.08);
-    progress.set_can_target(false);
-    progress.set_visible(false);
-    overlay.add_overlay(&progress);
-    overlay.set_measure_overlay(&progress, false);
-
-    (overlay, entry, progress)
-}
-
-fn clear_progress(progress: &gtk4::ProgressBar) {
-    progress.set_fraction(0.0);
-    progress.set_visible(false);
-}
-
-fn setup_toasts(toast_overlay: &ToastOverlay) {
-    // Example: Show a toast notification
-    let toast = Toast::new("Welcome to Dzban!");
-    toast.set_timeout(3);
-    toast_overlay.add_toast(toast);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[gtk4::test]
-    #[ignore = "requires a graphical display"]
-    fn primary_button_changes_from_run_to_stop_and_back() {
-        let button = gtk4::Button::new();
-        let mut state = dzban_gtk::database::AppState::default();
-        state.transition(dzban_gtk::database::AppEvent::QueryAvailabilityChanged(
-            true,
-        ));
-        render_primary_action(&button, state.primary_action());
-        assert_eq!(
-            button.icon_name().as_deref(),
-            Some("media-playback-start-symbolic")
-        );
-        assert!(button.is_sensitive());
-        state.transition(dzban_gtk::database::AppEvent::QueryPlanning);
-        state.transition(dzban_gtk::database::AppEvent::QueryAvailabilityChanged(
-            false,
-        ));
-        render_primary_action(&button, state.primary_action());
-        assert_eq!(
-            button.icon_name().as_deref(),
-            Some("media-playback-stop-symbolic")
-        );
-        assert!(button.is_sensitive());
-        state.transition(dzban_gtk::database::AppEvent::QueryCanceling);
-        render_primary_action(&button, state.primary_action());
-        assert!(!button.is_sensitive());
-        state.transition(dzban_gtk::database::AppEvent::QueryFinished);
-        state.transition(dzban_gtk::database::AppEvent::QueryAvailabilityChanged(
-            true,
-        ));
-        render_primary_action(&button, state.primary_action());
-        assert_eq!(
-            button.icon_name().as_deref(),
-            Some("media-playback-start-symbolic")
-        );
-        assert!(button.is_sensitive());
+    #[test]
+    fn modifier_aliases_release_only_after_the_last_physical_key() {
+        let mut keys = KeyState::default();
+        keys.press(gdk::Key::Control_L);
+        keys.press(gdk::Key::Control_R);
+        assert_eq!(keys.sync(true), vec![(InputKey::Primary, true)]);
+        keys.release(gdk::Key::Control_L);
+        assert!(keys.sync(true).is_empty());
+        keys.release(gdk::Key::Control_R);
+        assert_eq!(keys.sync(true), vec![(InputKey::Primary, false)]);
+        keys.press(gdk::Key::Shift_L);
+        assert!(keys.sync(false).is_empty());
+        assert_eq!(keys.sync(true), vec![(InputKey::Preview, true)]);
+        keys.reset();
+        assert!(!keys.preview());
+        assert!(keys.sync(false).is_empty());
     }
 
     #[test]
-    fn keyboard_adapter_maps_interaction_keys() {
-        assert_eq!(
-            input_role(gtk4::gdk::Key::Escape),
-            Some(dzban_gtk::database::InputRole::Cancel)
-        );
-        assert_eq!(
-            input_role(gtk4::gdk::Key::Control_L),
-            Some(dzban_gtk::database::InputRole::PrimaryModifier)
-        );
-        assert_eq!(
-            input_role(gtk4::gdk::Key::Shift_R),
-            Some(dzban_gtk::database::InputRole::PreviewModifier)
-        );
-        assert_eq!(
-            input_role(gtk4::gdk::Key::space),
-            Some(dzban_gtk::database::InputRole::Inspect)
-        );
-        assert_eq!(
-            input_role(gtk4::gdk::Key::Return),
-            Some(dzban_gtk::database::InputRole::Submit)
-        );
-        assert_eq!(input_role(gtk4::gdk::Key::Down), None);
+    fn repeated_presses_are_reported_once() {
+        let mut keys = KeyState::default();
+        assert!(keys.press(gdk::Key::space));
+        assert!(!keys.press(gdk::Key::space));
+        assert!(keys.release(gdk::Key::space));
+        assert!(!keys.release(gdk::Key::space));
     }
 
     #[test]
-    fn input_aliases_release_only_after_the_last_physical_key_and_reset_on_focus_loss() {
-        use dzban_gtk::database::InputRole;
-        use gtk4::gdk::Key;
-        let mut bindings = InputBindings::default();
-        for (left, right, role) in [
-            (Key::Control_L, Key::Control_R, InputRole::PrimaryModifier),
-            (Key::Shift_L, Key::Shift_R, InputRole::PreviewModifier),
-            (Key::Return, Key::KP_Enter, InputRole::Submit),
-        ] {
-            assert_eq!(bindings.press(left), Some(role));
-            assert_eq!(bindings.press(left), Some(role));
-            assert_eq!(bindings.press(right), Some(role));
-            assert_eq!(bindings.release(left), None);
-            assert_eq!(bindings.release(right), Some(role));
-            assert_eq!(bindings.release(right), None);
-            bindings.press(left);
-            bindings.reset();
-            assert_eq!(bindings.release(left), None);
-            assert_eq!(bindings.press(right), Some(role));
-            assert_eq!(bindings.release(right), Some(role));
-        }
-        assert_eq!(bindings.press(Key::a), None);
-    }
-
-    #[test]
-    fn plan_scroll_keys_are_mapped_without_frontend_state() {
-        assert_eq!(
-            plan_scroll(gtk4::gdk::Key::Page_Down),
-            Some(PlanScroll::PageDown)
-        );
-        assert_eq!(
-            plan_scroll(gtk4::gdk::Key::Down),
-            Some(PlanScroll::LineDown)
-        );
-        assert_eq!(plan_scroll(gtk4::gdk::Key::space), None);
-    }
-
-    #[test]
-    fn ready_query_preview_prompts_for_execution_with_estimates() {
-        let mut state = dzban_gtk::database::AppState::default();
-        state.transition(dzban_gtk::database::AppEvent::QueryAvailabilityChanged(
-            true,
-        ));
-        state.transition(dzban_gtk::database::AppEvent::KeyPressed {
-            key: dzban_gtk::database::InputRole::PrimaryModifier,
-            at_ms: 0,
-        });
-        state.transition(dzban_gtk::database::AppEvent::KeyPressed {
-            key: dzban_gtk::database::InputRole::PreviewModifier,
-            at_ms: 1,
-        });
-        state.transition(dzban_gtk::database::AppEvent::PreviewReady(
-            dzban_gtk::database::QueryPlan {
-                backend: dzban_gtk::database::DatabaseBackend::Postgresql,
-                document: serde_json::json!([]),
-                estimate: dzban_gtk::database::QueryEstimate {
-                    rows: Some(42),
-                    startup_cost: Some(1.25),
-                    total_cost: Some(9.5),
-                    parts: None,
-                    marks: None,
-                    ..Default::default()
-                },
+    fn hints_follow_the_shared_interaction_state() {
+        let plan = PlanPresentation::from(&dzban_core::QueryPlan {
+            backend: dzban_core::DatabaseBackend::Postgresql,
+            document: serde_json::json!([]),
+            estimate: dzban_core::QueryEstimate {
+                rows: Some(42),
+                startup_cost: Some(1.25),
+                total_cost: Some(9.5),
+                ..Default::default()
             },
-        ));
-        let message = query_action_message(&state);
-
+        });
         assert_eq!(
-            message,
+            input_hint(&InputHint::EstimateReady { plan: plan.clone() }).0,
             "Enter to run - Space for plan - ~42 rows - cost 1.25..9.50"
         );
-    }
-
-    #[test]
-    fn clickhouse_preview_shows_scan_estimates_without_fake_cost() {
-        let mut state = dzban_gtk::database::AppState::default();
-        state.transition(dzban_gtk::database::AppEvent::QueryAvailabilityChanged(
-            true,
-        ));
-        state.transition(dzban_gtk::database::AppEvent::KeyPressed {
-            key: dzban_gtk::database::InputRole::PrimaryModifier,
-            at_ms: 0,
-        });
-        state.transition(dzban_gtk::database::AppEvent::KeyPressed {
-            key: dzban_gtk::database::InputRole::PreviewModifier,
-            at_ms: 1,
-        });
-        state.transition(dzban_gtk::database::AppEvent::PreviewReady(
-            dzban_gtk::database::QueryPlan {
-                backend: dzban_gtk::database::DatabaseBackend::Clickhouse,
-                document: serde_json::json!({}),
-                estimate: dzban_gtk::database::QueryEstimate {
-                    rows: Some(42),
-                    startup_cost: None,
-                    total_cost: None,
-                    parts: Some(2),
-                    marks: Some(7),
-                    ..Default::default()
-                },
-            },
-        ));
-        let message = query_action_message(&state);
-
         assert_eq!(
-            message,
-            "Enter to run - Space for plan - ~42 rows - 2 parts - 7 marks"
-        );
-    }
-
-    #[test]
-    fn submitted_query_reports_planning_then_running_estimates() {
-        assert_eq!(
-            query_action_message(&dzban_gtk::database::AppState {
-                execution: dzban_gtk::database::QueryExecutionState::Planning,
-                ..Default::default()
-            }),
-            "Estimating query before execution..."
+            input_hint(&InputHint::Running { plan: Some(plan) }).0,
+            "Running query - ~42 rows - cost 1.25..9.50"
         );
         assert_eq!(
-            query_action_message(&dzban_gtk::database::AppState {
-                execution: dzban_gtk::database::QueryExecutionState::Running { plan: None },
-                ..Default::default()
-            }),
-            "Running query..."
-        );
-        let plan = dzban_gtk::database::QueryPlan {
-            backend: dzban_gtk::database::DatabaseBackend::Postgresql,
-            document: serde_json::json!([]),
-            estimate: dzban_gtk::database::QueryEstimate {
-                rows: Some(33508),
-                startup_cost: Some(0.0),
-                total_cost: Some(7829.08),
-                parts: None,
-                marks: None,
-                ..Default::default()
-            },
-        };
-        assert_eq!(
-            query_action_message(&dzban_gtk::database::AppState {
-                execution: dzban_gtk::database::QueryExecutionState::Running { plan: Some(plan) },
-                ..Default::default()
-            }),
-            "Running query - ~33508 rows - cost 0.00..7829.08"
-        );
-    }
-
-    #[test]
-    fn query_preview_errors_are_visible_without_a_tooltip() {
-        let mut state = dzban_gtk::database::AppState::default();
-        state.transition(dzban_gtk::database::AppEvent::QueryAvailabilityChanged(
-            true,
-        ));
-        state.transition(dzban_gtk::database::AppEvent::KeyPressed {
-            key: dzban_gtk::database::InputRole::PrimaryModifier,
-            at_ms: 0,
-        });
-        state.transition(dzban_gtk::database::AppEvent::KeyPressed {
-            key: dzban_gtk::database::InputRole::PreviewModifier,
-            at_ms: 1,
-        });
-        state.transition(dzban_gtk::database::AppEvent::PreviewFailed(
-            "Database is not connected".to_string(),
-        ));
-        let message = query_action_message(&state);
-
-        assert_eq!(
-            message,
+            input_hint(&InputHint::EstimateError {
+                error: "Database is not connected".into()
+            })
+            .0,
             "Enter to run - estimate unavailable: Database is not connected"
         );
-        assert!(!message.contains("hover"));
-    }
-
-    #[gtk4::test]
-    #[ignore = "requires a graphical display"]
-    fn query_action_progress_preserves_layout_and_can_restart() {
-        install_styles();
-        let (field, entry, progress) = create_query_action_field();
-        let window = gtk4::Window::new();
-        window.set_child(Some(&field));
-        window.present();
-        gtk4::test_widget_wait_for_draw(&field);
-        let baseline = (field.width(), field.height());
-
-        progress.set_visible(true);
-        progress.pulse();
-        gtk4::test_widget_wait_for_draw(&field);
-        assert!(progress.is_visible());
-        assert!(progress.height() <= 2);
-        assert_eq!((field.width(), field.height()), baseline);
-        assert_eq!(field.overflow(), gtk4::Overflow::Hidden);
-
-        clear_progress(&progress);
-        gtk4::test_widget_wait_for_draw(&field);
-        assert!(!progress.is_visible());
-        assert_eq!(progress.fraction(), 0.0);
-        assert_eq!((field.width(), field.height()), baseline);
-
-        progress.set_visible(true);
-        progress.pulse();
-        gtk4::test_widget_wait_for_draw(&field);
-        assert!(progress.is_visible());
-        assert!(progress.height() <= 2);
-        assert_eq!((field.width(), field.height()), baseline);
-
-        clear_progress(&progress);
-        assert_eq!(
-            entry.placeholder_text().as_deref(),
-            Some(default_action_hint().as_str())
-        );
-        window.close();
-    }
-
-    #[gtk4::test]
-    #[ignore = "requires a graphical display"]
-    fn close_query_action_returns_to_connections_before_closing_the_window() {
-        let statusbar = create_statusbar();
-        let manager = DatabaseTabManager::new(statusbar);
-        manager.open_test_database("Close Test");
-        let window = ApplicationWindow::builder().build();
-        let search = gtk4::Entry::new();
-        let shortcuts = shortcuts::create_shortcuts_window();
-        window.present();
-        gtk4::test_widget_wait_for_draw(&window);
-
-        assert!(execute_shortcut_action(
-            ShortcutAction::CloseQueryTab,
-            &manager,
-            &search,
-            &window,
-            &shortcuts,
-        ));
-        assert!(window.is_visible());
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while !manager.open_database_tabs().is_empty() && std::time::Instant::now() < deadline {
-            glib::MainContext::default().iteration(false);
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        assert!(manager.open_database_tabs().is_empty());
-
-        assert!(execute_shortcut_action(
-            ShortcutAction::CloseQueryTab,
-            &manager,
-            &search,
-            &window,
-            &shortcuts,
-        ));
-        assert!(!window.is_visible());
+        assert_eq!(input_hint(&InputHint::Default).0, default_hint());
+        assert_eq!(input_hint(&InputHint::PrimaryGuide).1, Some("guidance"));
     }
 }

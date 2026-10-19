@@ -8,11 +8,10 @@ Run the suite serially because tests share service fixtures:
 docker compose -f docker-compose.test.yml up -d --wait
 CCACHE_DISABLE=1 cargo +1.88.0 test -p dzban-db -- --ignored --skip certificate_validation_and_cancel_recovery --test-threads=1
 CCACHE_DISABLE=1 cargo +1.88.0 test -p dzban-cli --test database -- --ignored --test-threads=1
-CCACHE_DISABLE=1 cargo +1.88.0 test -p dzban-gtk --test connection_integration_tests --test clickhouse_integration_tests --test streamed_connection_tests --test runtime_bridge_isolation_tests --test config_tests --test manager_tests --test query_tab_tests -- --ignored --test-threads=1
 docker compose -f docker-compose.test.yml down
 ```
 
-The reusable wrapper is `skills/dzban-testing/scripts/run-db-integration.sh`. It runs `DZBAN_TEST_DATABASES=1 bash scripts/test-cli.sh`, using ShellSpec process contracts and `scripts/test-cli-pty.py` against the disposable services. Run `bash scripts/test-cli.sh` alone for database-free process contracts; its PTY case is explicitly skipped without the fixture flag. The terminal test requires Python `pexpect` and `pspg`, uses temporary history data, and checks the picker, query submission, plan/history inspection, cancellation, restart, resize, and pager return. Explicit wire-level checks cover Enter, Ctrl+Enter, Shift+Enter, table listing and quitting with an unfinished draft on both adapters. It never reads a user connection file.
+The reusable wrapper is `skills/dzban-testing/scripts/run-db-integration.sh`. It runs `DZBAN_TEST_DATABASES=1 bash scripts/test-cli.sh`, using ShellSpec process contracts and `scripts/test-cli-pty.py` against the disposable services. Run `bash scripts/test-cli.sh` alone for database-free process contracts; its PTY case is explicitly skipped without the fixture flag. The terminal test requires Python `pexpect` and `pspg`, uses temporary history data, and checks the picker, query submission, plan/history inspection, cancellation, restart, resize, and pager return. Explicit wire-level checks cover Enter, Ctrl+Enter, Shift+Enter, table listing and quitting with an unfinished draft on both adapters. It never reads a user connection file. GTK database workflows are covered by the Dogtail runner in `skills/dzban-ui-testing`; GTK lifecycle tests use injected adapters in `scripts/test-gtk.sh`.
 
 The ordinary Compose runner excludes `certificate_validation_and_cancel_recovery`, which needs its separate TLS endpoints. On macOS, run `python3 scripts/test-macos-tls.py` for the isolated TLS trust, rejection, and cancellation gate.
 

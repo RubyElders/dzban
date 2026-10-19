@@ -1,15 +1,101 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 
 use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 
-use crate::database::RuntimeBridge;
-use dzban_core::result_stream::ResultHandle;
+use crate::runtime::RuntimeBridge;
+use dzban_core::result_store::MAX_PAGE_ROWS;
+use dzban_core::{ResultCell, ResultSet};
 
 const CACHE_BYTES: usize = 2 * 1024 * 1024;
+const PREVIEW_CHARS: usize = 512;
+
+pub type PageFuture = Pin<Box<dyn Future<Output = Result<ResultSet, String>> + Send>>;
+
+#[derive(Clone)]
+pub struct PageReader(Arc<dyn Fn(usize, usize) -> PageFuture + Send + Sync>);
+
+impl PageReader {
+    pub fn new(read: impl Fn(usize, usize) -> PageFuture + Send + Sync + 'static) -> Self {
+        Self(Arc::new(read))
+    }
+
+    pub fn from_output(reader: dzban_core::outputs::ResultReader) -> Self {
+        Self::new(move |start, count| {
+            let reader = reader.clone();
+            Box::pin(async move {
+                reader
+                    .page(start, count)
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+        })
+    }
+
+    pub fn from_handle(result: dzban_core::result_stream::ResultHandle) -> Self {
+        Self::new(move |start, count| {
+            let result = result.clone();
+            Box::pin(async move {
+                result
+                    .read_page(start, count)
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+        })
+    }
+
+    pub fn page(&self, start: usize, count: usize) -> PageFuture {
+        (self.0)(start, count)
+    }
+
+    pub fn preview_rows(
+        &self,
+        start: usize,
+    ) -> impl Future<Output = Result<Vec<String>, String>> + Send + 'static + use<> {
+        let page = self.page(start, MAX_PAGE_ROWS);
+        async move {
+            let page = page.await?;
+            let mut bytes = 0usize;
+            Ok(page
+                .rows
+                .iter()
+                .map(|row| {
+                    let chars = (1_048_576usize / row.len().max(1)).saturating_sub(3) / 6;
+                    encode_row(row, chars.min(PREVIEW_CHARS))
+                })
+                .take_while(|row| {
+                    if bytes + row.len() > CACHE_BYTES {
+                        return false;
+                    }
+                    bytes += row.len();
+                    true
+                })
+                .collect())
+        }
+    }
+}
+
+pub fn encode_row(row: &[ResultCell], chars: usize) -> String {
+    serde_json::to_string(
+        &row.iter()
+            .map(|cell| match cell {
+                ResultCell::Null => None,
+                ResultCell::Text(text) => Some(text.chars().take(chars).collect::<String>()),
+            })
+            .collect::<Vec<_>>(),
+    )
+    .expect("result preview serialization")
+}
+
+pub fn decode_row(row: &str) -> Vec<Option<String>> {
+    serde_json::from_str(row).unwrap_or_default()
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ResultModelPhase {
@@ -23,7 +109,7 @@ pub enum ResultModelPhase {
 use ResultModelPhase as Loading;
 
 struct Source {
-    result: ResultHandle,
+    reader: PageReader,
     bridge: RuntimeBridge,
     placeholder: String,
 }
@@ -55,6 +141,7 @@ mod imp {
             SIGNALS.get_or_init(|| {
                 vec![
                     glib::subclass::Signal::builder("page-ready").build(),
+                    glib::subclass::Signal::builder("idle").build(),
                     glib::subclass::Signal::builder("load-error")
                         .param_types([String::static_type()])
                         .build(),
@@ -106,10 +193,10 @@ glib::wrapper! {
 }
 
 impl ResultListModel {
-    pub fn new(result: ResultHandle, bridge: RuntimeBridge, columns: usize, rows: usize) -> Self {
+    pub fn new(reader: PageReader, bridge: RuntimeBridge, columns: usize, rows: usize) -> Self {
         let model: Self = glib::Object::new();
         model.imp().source.replace(Some(Source {
-            result,
+            reader,
             bridge,
             placeholder: serde_json::to_string(&vec![""; columns])
                 .expect("result placeholder serialization"),
@@ -147,31 +234,32 @@ impl ResultListModel {
     pub fn phase(&self) -> ResultModelPhase {
         *self.imp().loading.borrow()
     }
+
     pub fn cached_bytes(&self) -> usize {
         self.imp().cache.borrow().values().map(String::len).sum()
     }
 
-    pub fn cached_values(&self) -> Vec<Vec<String>> {
+    pub fn cached_values(&self) -> Vec<Vec<Option<String>>> {
         self.imp()
             .cache
             .borrow()
             .values()
-            .filter_map(|row| serde_json::from_str(row).ok())
+            .map(|row| decode_row(row))
             .collect()
     }
 
-    pub fn read_row(
+    pub fn read_page(
         &self,
-        position: u32,
-    ) -> crate::database::connection_gobject::QueryReceiver<
-        dzban_core::ResultSet,
-        dzban_core::error::ExecutionError,
-    > {
-        let source = self.imp().source.borrow();
-        let source = source.as_ref().expect("result source initialized");
-        source
-            .bridge
-            .read_result_page(source.result.clone(), position as usize, 1)
+        start: usize,
+        count: usize,
+    ) -> impl Future<Output = Result<ResultSet, String>> + 'static + use<> {
+        let (reader, bridge) = {
+            let source = self.imp().source.borrow();
+            let source = source.as_ref().expect("result source initialized");
+            (source.reader.clone(), source.bridge.clone())
+        };
+        let response = bridge.run(reader.page(start, count));
+        async move { response.await.map_err(|error| error.to_string())? }
     }
 
     fn request(&self, position: u32) {
@@ -194,6 +282,7 @@ impl ResultListModel {
     fn load_next(&self) {
         let Some(start) = self.imp().pending.borrow_mut().pop_first() else {
             self.imp().loading.replace(Loading::Idle);
+            self.emit_by_name::<()>("idle", &[]);
             return;
         };
         self.imp().loading.replace(Loading::Reading);
@@ -202,15 +291,13 @@ impl ResultListModel {
             let source = source.as_ref().expect("result source initialized");
             source
                 .bridge
-                .read_result_rows(source.result.clone(), start as usize)
+                .run(source.reader.preview_rows(start as usize))
         };
         let weak = self.downgrade();
         glib::spawn_future_local(async move {
-            let rows = response.await.unwrap_or_else(|error| {
-                Err(dzban_core::error::ExecutionError::Message(
-                    error.to_string(),
-                ))
-            });
+            let rows = response
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()));
             let Some(model) = weak.upgrade() else {
                 return;
             };
@@ -252,7 +339,7 @@ impl ResultListModel {
                     model.load_next();
                 }
                 Ok(_) => model.fail("Result page is missing".into()),
-                Err(error) => model.fail(error.to_string()),
+                Err(error) => model.fail(error),
             }
         });
     }

@@ -3,19 +3,10 @@ name = "dzban-gtk"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-autoexamples = false
 
 [[bin]]
 name = "dzban"
 path = "src/main.rs"
-
-[[example]]
-name = "minimal_reactive"
-path = "examples/minimal_reactive.rs"
-
-[[example]]
-name = "simple_reactive"
-path = "examples/simple_reactive.rs"
 
 [dependencies]
 # UI dependencies
@@ -31,6 +22,7 @@ dzban-core = { path = "../dzban-core" }
 
 # JSON support
 serde_json.workspace = true
+uuid.workspace = true
 
 # Shared workspace dependencies
 glib.workspace = true
