@@ -1,0 +1,767 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
+use adw::prelude::*;
+use async_trait::async_trait;
+use dzban_core::adapter::{AdapterFactory, AdapterRegistry, DatabaseSession};
+use dzban_core::application::ApplicationContext;
+use dzban_core::commands::EditorIntent;
+use dzban_core::error::ExecutionError;
+use dzban_core::interaction::PrimaryAction;
+use dzban_core::presentation::{ExecutionPhase, InputHint, ResultStatusReason};
+use dzban_core::result_stream::ResultSink;
+use dzban_core::tabs::TabPhase;
+use dzban_core::{
+    Config, DatabaseBackend, DatabaseConfig, QueryEstimate, QueryPlan, ResultCell, ResultColumn,
+    ResultSet,
+};
+use dzban_gtk::runtime::RuntimeBridge;
+use gtk4::{gdk, glib};
+use libadwaita as adw;
+use tokio::sync::Notify;
+
+use super::app::App;
+use super::shortcuts::ShortcutAction;
+use super::tab_page::TabPage;
+use super::window::Shell;
+
+#[derive(Default)]
+struct Fixture {
+    sessions: AtomicUsize,
+    executions: AtomicUsize,
+    active: AtomicUsize,
+    peak: AtomicUsize,
+    hold_connect: AtomicBool,
+    connect_release: Notify,
+    reject_close: AtomicBool,
+    release: Notify,
+}
+
+struct Session {
+    fixture: Arc<Fixture>,
+    canceled: Notify,
+}
+
+#[async_trait]
+impl DatabaseSession for Session {
+    async fn connect(&self) -> Result<(), String> {
+        if self.fixture.hold_connect.load(Ordering::SeqCst) {
+            self.fixture.connect_release.notified().await;
+        }
+        Ok(())
+    }
+    async fn disconnect(&self) -> Result<(), ExecutionError> {
+        if self.fixture.reject_close.swap(false, Ordering::SeqCst) {
+            return Err(ExecutionError::Message("Fixture cleanup failed".into()));
+        }
+        Ok(())
+    }
+    async fn ping(&self) -> Result<u64, String> {
+        Ok(1)
+    }
+    async fn version(&self) -> Result<String, String> {
+        Ok("Fixture 1.0 server".into())
+    }
+    async fn execute(&self, _: &str) -> Result<ResultSet, String> {
+        Err("Use streaming".into())
+    }
+    async fn cancel(&self) -> Result<(), String> {
+        self.canceled.notify_one();
+        Ok(())
+    }
+    async fn explain(&self, _: &str) -> Result<QueryPlan, String> {
+        Ok(QueryPlan {
+            backend: DatabaseBackend::Postgresql,
+            document: serde_json::json!([{"Plan": {"Node Type": "Fixture Scan"}}]),
+            estimate: QueryEstimate {
+                rows: Some(3),
+                startup_cost: Some(0.0),
+                total_cost: Some(1.5),
+                ..Default::default()
+            },
+        })
+    }
+    async fn execute_streamed(
+        &self,
+        sql: &str,
+        sink: &mut ResultSink,
+    ) -> Result<Option<dzban_core::CommandAcknowledgment>, ExecutionError> {
+        let fixture = &self.fixture;
+        fixture.executions.fetch_add(1, Ordering::SeqCst);
+        let active = fixture.active.fetch_add(1, Ordering::SeqCst) + 1;
+        fixture.peak.fetch_max(active, Ordering::SeqCst);
+        let result = async {
+            if sql.starts_with("wide") {
+                return stream_wide(sink, sql == "wide slowly").await;
+            }
+            sink.schema(vec![
+                ResultColumn {
+                    name: "id".into(),
+                    type_name: "integer".into(),
+                },
+                ResultColumn {
+                    name: "value".into(),
+                    type_name: "text".into(),
+                },
+            ])
+            .await?;
+            for id in 0..3 {
+                sink.row(vec![
+                    ResultCell::Text(id.to_string()),
+                    if id == 1 {
+                        ResultCell::Null
+                    } else {
+                        ResultCell::Text(format!("row {id}"))
+                    },
+                ])
+                .await?;
+            }
+            match sql {
+                "wait" => {
+                    self.canceled.notified().await;
+                    Err(ExecutionError::Canceled)
+                }
+                "hold" => {
+                    fixture.release.notified().await;
+                    Ok(None)
+                }
+                _ => Ok(None),
+            }
+        }
+        .await;
+        fixture.active.fetch_sub(1, Ordering::SeqCst);
+        result
+    }
+}
+
+async fn stream_wide(
+    sink: &mut ResultSink,
+    slowly: bool,
+) -> Result<Option<dzban_core::CommandAcknowledgment>, ExecutionError> {
+    let columns = (0..40)
+        .map(|column| ResultColumn {
+            name: format!("c{column}"),
+            type_name: "text".into(),
+        })
+        .collect();
+    sink.schema(columns).await?;
+    for row in 0..500 {
+        sink.row(
+            (0..40)
+                .map(|column| ResultCell::Text(format!("r{row}c{column}")))
+                .collect(),
+        )
+        .await?;
+        if slowly && row % 5 == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    Ok(None)
+}
+
+struct Factory(Arc<Fixture>);
+
+impl AdapterFactory for Factory {
+    fn backend(&self) -> DatabaseBackend {
+        DatabaseBackend::Postgresql
+    }
+    fn create(&self, _: DatabaseConfig) -> Result<Arc<dyn DatabaseSession>, String> {
+        self.0.sessions.fetch_add(1, Ordering::SeqCst);
+        Ok(Arc::new(Session {
+            fixture: self.0.clone(),
+            canceled: Notify::new(),
+        }))
+    }
+}
+
+struct Directory(std::path::PathBuf);
+
+impl Drop for Directory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+struct Harness {
+    fixture: Arc<Fixture>,
+    shell: Shell,
+    window: adw::ApplicationWindow,
+    directory: Directory,
+}
+
+impl Drop for Harness {
+    fn drop(&mut self) {
+        self.window.destroy();
+    }
+}
+
+fn directory() -> Directory {
+    let path = std::env::temp_dir().join(format!("dzban-gtk-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&path).unwrap();
+    Directory(path)
+}
+
+fn harness_in(directory: Directory) -> Harness {
+    adw::init().unwrap();
+    super::icons::register();
+    let fixture = Arc::new(Fixture::default());
+    let mut registry = AdapterRegistry::default();
+    registry
+        .register(Arc::new(Factory(fixture.clone())))
+        .unwrap();
+    let bridge = RuntimeBridge::with_context(Arc::new(ApplicationContext::new(registry))).unwrap();
+    let config: Config = toml::from_str(
+        r#"
+[[databases]]
+name = "fixture"
+host = "fixture"
+user = "fixture"
+database = "fixture"
+
+[[databases]]
+name = "other"
+host = "fixture"
+user = "fixture"
+database = "other"
+"#,
+    )
+    .unwrap();
+    let app = App::with_fixture(bridge, config, &directory.0);
+    let window = adw::ApplicationWindow::builder()
+        .default_width(1150)
+        .default_height(760)
+        .build();
+    let shell = Shell::new(app, window.clone());
+    window.present();
+    shell.start();
+    let harness = Harness {
+        fixture,
+        shell,
+        window,
+        directory,
+    };
+    wait_until("the initial chooser", || {
+        harness.shell.workspace().selected().is_some() && harness.shell.app().config().is_some()
+    });
+    harness
+}
+
+fn harness() -> Harness {
+    harness_in(directory())
+}
+
+#[track_caller]
+fn wait_until(what: &str, mut predicate: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !predicate() {
+        assert!(Instant::now() < deadline, "Timed out waiting for {what}");
+        glib::MainContext::default().iteration(false);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+impl Harness {
+    fn selected(&self) -> TabPage {
+        self.shell.workspace().selected().unwrap()
+    }
+
+    #[track_caller]
+    fn connect(&self, profile: &str) -> TabPage {
+        let page = self.selected();
+        page.connect(profile);
+        wait_until("a ready connection", || page.is_ready());
+        page
+    }
+
+    #[track_caller]
+    fn run(&self, page: &TabPage, sql: &str) {
+        page.editor().set_text(sql);
+        let before = page.document().map_or(0, |document| document.generation);
+        page.editor_command(EditorIntent::Primary);
+        wait_until("the query to start", || {
+            page.document()
+                .is_some_and(|document| document.generation > before)
+        });
+    }
+
+    #[track_caller]
+    fn finished(&self, page: &TabPage) {
+        wait_until("the query to finish", || {
+            page.document()
+                .is_some_and(|document| document.execution == ExecutionPhase::Finished)
+        });
+    }
+}
+
+#[gtk4::test]
+#[ignore = "requires a graphical display"]
+fn two_tabs_on_one_profile_keep_independent_sessions_and_run_concurrently() {
+    let harness = harness();
+    let first = harness.connect("fixture");
+    harness.shell.workspace().open_profile("fixture");
+    let second = harness.selected();
+    assert_ne!(first.id(), second.id());
+    wait_until("the second session", || second.is_ready());
+    assert_ne!(first.session(), second.session());
+    assert_eq!(harness.fixture.sessions.load(Ordering::SeqCst), 2);
+    let titles = harness
+        .shell
+        .workspace()
+        .tab_titles()
+        .into_iter()
+        .map(|(_, title)| title)
+        .collect::<Vec<_>>();
+    assert_eq!(titles, ["fixture - Query 1", "fixture - Query 2"]);
+
+    harness.shell.workspace().select(first.id());
+    harness.run(&first, "hold");
+    harness.shell.workspace().select(second.id());
+    harness.run(&second, "hold");
+    wait_until("two concurrent queries", || {
+        harness.fixture.active.load(Ordering::SeqCst) == 2
+    });
+    assert_eq!(harness.fixture.peak.load(Ordering::SeqCst), 2);
+    harness.fixture.release.notify_waiters();
+    harness.finished(&first);
+    harness.finished(&second);
+}
+
+#[gtk4::test]
+#[ignore = "requires a graphical display"]
+fn pending_connection_can_be_canceled_and_retried_in_the_same_tab() {
+    let harness = harness();
+    let page = harness.selected();
+    page.editor().set_text("kept draft");
+    harness.fixture.hold_connect.store(true, Ordering::SeqCst);
+    page.connect("fixture");
+    wait_until("the pending connection", || {
+        page.tab().phase == TabPhase::Connecting
+    });
+    page.cancel_chooser();
+    harness.fixture.connect_release.notify_waiters();
+    wait_until("the retained chooser", || {
+        page.tab().phase == TabPhase::Choosing
+    });
+    assert_eq!(harness.shell.workspace().tab_count(), 1);
+    assert!(!page.is_workspace());
+    assert_eq!(page.editor().text(), "kept draft");
+
+    harness.fixture.hold_connect.store(false, Ordering::SeqCst);
+    page.connect("fixture");
+    wait_until("the retried connection", || page.is_ready());
+    assert_eq!(harness.selected().id(), page.id());
+    assert_eq!(page.editor().text(), "kept draft");
+}
+
+#[gtk4::test]
+#[ignore = "requires a graphical display"]
+fn failed_cleanup_keeps_the_tab_until_a_retry_succeeds() {
+    let harness = harness();
+    let page = harness.connect("fixture");
+    harness.fixture.reject_close.store(true, Ordering::SeqCst);
+    harness.shell.workspace().close_tab(page.id());
+    wait_until("the failed cleanup", || {
+        !harness.fixture.reject_close.load(Ordering::SeqCst) && page.tab().phase == TabPhase::Ready
+    });
+    assert_eq!(
+        harness.shell.workspace().selected().unwrap().id(),
+        page.id()
+    );
+    harness.shell.workspace().close_tab(page.id());
+    wait_until("a fresh chooser", || {
+        harness
+            .shell
+            .workspace()
+            .selected()
+            .is_some_and(|selected| selected.id() != page.id())
+    });
+    assert_eq!(harness.shell.workspace().tab_count(), 1);
+    assert!(!harness.selected().is_workspace());
+}
+
+#[gtk4::test]
+#[ignore = "requires a graphical display"]
+fn restored_workspace_reconnects_drafts_without_running_sql() {
+    let directory = directory();
+    std::fs::write(
+        directory.0.join("gtk-workspace.json"),
+        r#"{"version":1,"tabs":[{"profile":"fixture","draft":"SELECT restored"},{"draft":"scratch"}],"selected":1}"#,
+    )
+    .unwrap();
+    let harness = harness_in(directory);
+    wait_until("both restored tabs", || {
+        harness.shell.workspace().tab_count() == 2
+    });
+    let restored = harness
+        .shell
+        .workspace()
+        .pages()
+        .into_iter()
+        .find(|page| page.editor().text() == "SELECT restored")
+        .unwrap();
+    wait_until("the restored connection", || restored.is_ready());
+    wait_until("the restored selection", || {
+        harness.selected().editor().text() == "scratch"
+    });
+    assert_eq!(harness.fixture.executions.load(Ordering::SeqCst), 0);
+    assert!(harness.directory.0.join("gtk-workspace.json").exists());
+}
+
+#[gtk4::test]
+#[ignore = "requires a graphical display"]
+fn escape_closes_the_row_preview_before_canceling_a_running_query() {
+    let harness = harness();
+    let page = harness.connect("fixture");
+    harness.run(&page, "rows");
+    harness.finished(&page);
+    wait_until("streamed rows", || page.results().available_rows() == 3);
+    assert!(page.results().focus());
+    assert!(page.results().show_row_preview());
+    assert!(page.results().inspector_visible());
+    assert_eq!(
+        harness
+            .shell
+            .press(gdk::Key::Escape, gdk::ModifierType::empty()),
+        glib::Propagation::Stop
+    );
+    assert!(!page.results().inspector_visible());
+
+    harness.run(&page, "wait");
+    wait_until("the stop action", || {
+        harness.shell.run_button().tooltip_text().as_deref() == Some("Stop query (Escape)")
+    });
+    assert_eq!(
+        harness
+            .shell
+            .press(gdk::Key::Escape, gdk::ModifierType::empty()),
+        glib::Propagation::Stop
+    );
+    harness.shell.release(gdk::Key::Escape);
+    harness.finished(&page);
+    assert_eq!(
+        page.document().unwrap().feedback.status,
+        ResultStatusReason::Canceled
+    );
+    wait_until("the run action", || {
+        harness.shell.app().context().tabs.controls().primary_action == PrimaryAction::Run
+    });
+}
+
+#[gtk4::test]
+#[ignore = "requires a graphical display"]
+fn copying_selected_rows_publishes_complete_markdown() {
+    let harness = harness();
+    let page = harness.connect("fixture");
+    harness.run(&page, "rows");
+    harness.finished(&page);
+    wait_until("streamed rows", || page.results().available_rows() == 3);
+    page.results().focus();
+    page.results().copy_selection();
+    wait_until("the copy to finish", || !page.results().is_copying());
+    let clipboard = page.results().widget().clipboard();
+    let text = glib::MainContext::default()
+        .block_on(clipboard.read_text_future())
+        .unwrap()
+        .unwrap();
+    assert!(text.starts_with("| id | value |"), "{text}");
+    assert!(text.contains("row 0"), "{text}");
+}
+
+#[gtk4::test]
+#[ignore = "requires a graphical display"]
+fn a_selected_row_survives_its_page_loading() {
+    let harness = harness();
+    let page = harness.connect("fixture");
+    harness.run(&page, "wide");
+    harness.finished(&page);
+    wait_until("streamed rows", || page.results().available_rows() == 500);
+    let table = page.results().table().unwrap();
+    gtk4::test_widget_wait_for_draw(&table);
+    wait_until("the first page", || !page.results().is_loading());
+    table.model().unwrap().select_item(450, true);
+    let vertical = table.vadjustment().unwrap();
+    vertical.set_value(vertical.upper());
+    gtk4::test_widget_wait_for_draw(&table);
+    wait_until("the selected page", || !page.results().is_loading());
+    assert_eq!(page.results().selected(), Some(450));
+}
+
+#[gtk4::test]
+#[ignore = "requires a graphical display"]
+fn rerunning_the_same_query_returns_to_the_scrolled_view() {
+    let harness = harness();
+    let page = harness.connect("fixture");
+    harness.run(&page, "wide slowly");
+    harness.finished(&page);
+    wait_until("streamed rows", || page.results().available_rows() == 500);
+    let table = page.results().table().unwrap();
+    let (horizontal, vertical) = (table.hadjustment().unwrap(), table.vadjustment().unwrap());
+    wait_until("a scrollable table", || {
+        horizontal.upper() > 2000.0 && vertical.upper() > 10000.0
+    });
+    horizontal.set_value(horizontal.upper() - horizontal.page_size() - 100.0);
+    vertical.set_value(vertical.upper() - vertical.page_size() - 100.0);
+    gtk4::test_widget_wait_for_draw(&table);
+    let before = (horizontal.value(), vertical.value());
+    harness.run(&page, "wide slowly");
+    harness.finished(&page);
+    wait_until("the scrolled view", || {
+        page.results().table().is_some_and(|current| {
+            current != table
+                && (current.hadjustment().unwrap().value() - before.0).abs() < 1.0
+                && (current.vadjustment().unwrap().value() - before.1).abs() < 1.0
+        })
+    });
+}
+
+#[gtk4::test]
+#[ignore = "requires a graphical display"]
+fn toggling_history_keeps_the_header_controls_in_place() {
+    let harness = harness();
+    harness.connect("fixture");
+    gtk4::test_widget_wait_for_draw(&harness.window);
+    let position = |widget: &gtk4::Widget| {
+        widget
+            .compute_point(&harness.window, &gtk4::graphene::Point::new(0.0, 0.0))
+            .map(|point| (point.x(), point.y()))
+            .unwrap()
+    };
+    let toggle = harness
+        .shell
+        .history_button()
+        .clone()
+        .upcast::<gtk4::Widget>();
+    let search = harness
+        .shell
+        .search()
+        .widget()
+        .clone()
+        .upcast::<gtk4::Widget>();
+    let before = (position(&toggle), position(&search));
+    harness.shell.execute(ShortcutAction::ToggleHistory);
+    gtk4::test_widget_wait_for_draw(&harness.window);
+    let after = (position(&toggle), position(&search));
+    assert!(harness.selected().history_visible());
+    assert!((before.0.0 - after.0.0).abs() < 1.0 && (before.0.1 - after.0.1).abs() < 1.0);
+    assert!((before.1.0 - after.1.0).abs() < 1.0 && (before.1.1 - after.1.1).abs() < 1.0);
+}
+
+#[gtk4::test]
+#[ignore = "requires a graphical display"]
+fn history_restore_shows_the_saved_sample_without_executing() {
+    let harness = harness();
+    let page = harness.connect("fixture");
+    harness.run(&page, "rows");
+    harness.finished(&page);
+    harness.shell.execute(ShortcutAction::FocusHistory);
+    page.refresh_history();
+    wait_until("the saved query", || page.history().entry_count() == 1);
+    page.editor().set_text("draft");
+    let executions = harness.fixture.executions.load(Ordering::SeqCst);
+    page.history().activate(0);
+    wait_until("the saved output", || {
+        page.document()
+            .is_some_and(|document| document.history == Some(true))
+    });
+    assert_eq!(page.editor().text(), "rows");
+    assert_eq!(
+        harness.fixture.executions.load(Ordering::SeqCst),
+        executions
+    );
+    wait_until("saved rows", || page.results().available_rows() == 3);
+}
+
+#[gtk4::test]
+#[ignore = "requires a graphical display"]
+fn plan_chord_estimates_then_pins_through_the_shared_input() {
+    let harness = harness();
+    let page = harness.connect("fixture");
+    page.editor().set_text("rows");
+    page.editor().focus();
+    let control = gdk::ModifierType::CONTROL_MASK;
+    let shift = gdk::ModifierType::SHIFT_MASK;
+    harness
+        .shell
+        .press(gdk::Key::Control_L, gdk::ModifierType::empty());
+    harness.shell.press(gdk::Key::Shift_L, control);
+    wait_until("the estimate", || {
+        page.interaction().is_some_and(|interaction| {
+            matches!(interaction.input.hint, InputHint::EstimateReady { .. })
+        })
+    });
+    assert_eq!(
+        harness.shell.press(gdk::Key::space, control | shift),
+        glib::Propagation::Stop
+    );
+    harness.shell.release(gdk::Key::space);
+    harness.shell.release(gdk::Key::Shift_L);
+    harness.shell.release(gdk::Key::Control_L);
+    wait_until("the pinned plan", || {
+        harness.shell.plan().is_visible() && harness.shell.plan().is_pinned()
+    });
+    assert_eq!(harness.fixture.executions.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        harness
+            .shell
+            .press(gdk::Key::Escape, gdk::ModifierType::empty()),
+        glib::Propagation::Stop
+    );
+    assert!(!harness.shell.plan().is_visible());
+}
+
+#[gtk4::test]
+#[ignore = "requires a graphical display"]
+fn closing_the_last_unconnected_chooser_saves_and_shuts_down() {
+    let harness = harness();
+    harness.selected().editor().set_text("unsent");
+    harness.shell.execute(ShortcutAction::CloseTab);
+    wait_until("the shared shutdown", || {
+        *harness.shell.app().context().subscribe_phase().borrow()
+            == dzban_core::application::ApplicationPhase::Closed
+    });
+    let saved = std::fs::read_to_string(harness.directory.0.join("gtk-workspace.json")).unwrap();
+    assert!(saved.contains("unsent"), "{saved}");
+}
+
+#[gtk4::test]
+#[ignore = "requires a graphical display"]
+fn vim_letters_navigate_lists_but_still_type_in_the_editor() {
+    let harness = harness();
+    let none = gdk::ModifierType::empty();
+    let chooser = harness.selected().chooser().clone();
+    assert!(chooser.focus());
+    assert_eq!(chooser.selected_index(), Some(0));
+    assert_eq!(
+        harness.shell.press(gdk::Key::j, none),
+        glib::Propagation::Stop
+    );
+    assert_eq!(chooser.selected_index(), Some(1));
+    assert_eq!(
+        harness.shell.press(gdk::Key::k, none),
+        glib::Propagation::Stop
+    );
+    assert_eq!(chooser.selected_index(), Some(0));
+
+    let page = harness.connect("fixture");
+    harness.run(&page, "rows");
+    harness.finished(&page);
+    wait_until("streamed rows", || page.results().available_rows() == 3);
+    assert!(page.results().focus());
+    wait_until("focus in the results", || page.results().focused());
+    assert_eq!(page.results().selected(), Some(0));
+    assert_eq!(page.results().column(), 0);
+    assert_eq!(
+        harness.shell.press(gdk::Key::j, none),
+        glib::Propagation::Stop
+    );
+    wait_until("the next row", || page.results().selected() == Some(1));
+    assert_eq!(
+        harness.shell.press(gdk::Key::l, none),
+        glib::Propagation::Stop
+    );
+    assert_eq!(page.results().column(), 1);
+    assert!(page.results().show_row_preview());
+    assert_eq!(
+        harness.shell.press(gdk::Key::l, none),
+        glib::Propagation::Stop
+    );
+    wait_until("the previewed row to move", || {
+        page.results().selected() == Some(2)
+    });
+    assert!(page.results().close_inspector());
+
+    assert!(page.editor().focus());
+    assert_eq!(
+        harness.shell.press(gdk::Key::j, none),
+        glib::Propagation::Proceed
+    );
+}
+
+fn descendant(root: &gtk4::Widget, css: &str) -> Option<gtk4::Widget> {
+    let mut child = root.first_child();
+    while let Some(widget) = child {
+        if widget.css_name() == css && widget.height() > 0 {
+            return Some(widget);
+        }
+        if let Some(found) = descendant(&widget, css) {
+            return Some(found);
+        }
+        child = widget.next_sibling();
+    }
+    None
+}
+
+#[gtk4::test]
+#[ignore = "requires a graphical display"]
+fn layout_follows_the_native_mac_constants() {
+    super::window::install_styles();
+    let harness = harness();
+    let page = harness.connect("fixture");
+    harness.run(&page, "rows");
+    harness.finished(&page);
+    wait_until("streamed rows", || page.results().available_rows() == 3);
+    harness.shell.execute(ShortcutAction::ToggleHistory);
+    assert!(page.results().focus());
+    assert!(page.results().show_row_preview());
+    harness.shell.execute(ShortcutAction::OpenPlan);
+    wait_until("the plan", || harness.shell.plan().is_visible());
+    gtk4::test_widget_wait_for_draw(&harness.window);
+
+    let window = harness.window.default_size();
+    let search = harness.shell.search().widget().width();
+    let history = page.history().widget().width();
+    let tabs = harness.shell.workspace().bar().height();
+    let footer = harness.shell.footer().widget().height();
+    let editor = page.editor().widget().height();
+    let results = page.results().widget().height();
+    let plan = harness.shell.plan().widget();
+    let plan = (plan.width(), plan.height());
+    let inspector = page.results().inspector().widget();
+    let inspector = (inspector.width(), inspector.height());
+    let row = page
+        .results()
+        .table()
+        .and_then(|table| descendant(table.upcast_ref(), "row"))
+        .map_or(0, |row| row.height());
+    let bounds = |widget: &gtk4::Widget| {
+        widget
+            .compute_bounds(&harness.window)
+            .map_or(0, |bounds| bounds.height().round() as i32)
+    };
+    let buttons = [
+        bounds(harness.shell.history_button().upcast_ref()),
+        bounds(harness.shell.plan_button().upcast_ref()),
+        bounds(harness.shell.run_button().upcast_ref()),
+    ];
+    let report = format!(
+        "| Element | Mac | GTK |\n| --- | --- | --- |\n\
+         | Default window | 1150x760 | {}x{} |\n\
+         | Action search width | 380-600 | {search} |\n\
+         | History pane width | 240-320 | {history} |\n\
+         | Tab strip height | 40 | {tabs} |\n\
+         | Footer height | 30 | {footer} |\n\
+         | Editor min height | 120 | {editor} |\n\
+         | Results min height | 160 | {results} |\n\
+         | Result row height | 24 | {row} |\n\
+         | Plan preview | 620x400 | {}x{} |\n\
+         | Row preview | 640x460 | {}x{} |\n\
+         | Toolbar buttons | 28 | {buttons:?} |\n",
+        window.0, window.1, plan.0, plan.1, inspector.0, inspector.1,
+    );
+    if let Some(path) = std::env::var_os("DZBAN_LAYOUT_REPORT") {
+        std::fs::write(path, &report).unwrap();
+    }
+    assert_eq!(window, (1150, 760), "{report}");
+    assert!((380..=600).contains(&search), "{report}");
+    assert!((240..=320).contains(&history), "{report}");
+    assert!((30..=34).contains(&footer), "{report}");
+    assert!(
+        buttons.iter().all(|height| (28..=36).contains(height)),
+        "{report}"
+    );
+    assert!(editor >= 120 && results >= 160, "{report}");
+    assert!((24..=28).contains(&row), "{report}");
+    assert_eq!(plan, (620, 400), "{report}");
+    assert_eq!(inspector, (640, 460), "{report}");
+}

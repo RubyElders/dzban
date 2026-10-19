@@ -80,7 +80,7 @@ The native application's feature models use `ApplicationClient` for managed `edi
 | `probe_session`, `probe_profile` | `HealthService` | Direct probe results; native retained status uses shared check/observation methods |
 | `history` | Shared profile history store | Raw persisted-entry compatibility; native history uses typed `history_list` and `restore_history` |
 
-GTK's existing `ConnectionSelection` and `QueryDocuments` consumers and CLI session-only consumers remain supported. Their later migration must adopt shared application workflows explicitly; this refactor does not claim they already use the desktop tab facade. No compatibility route retains a separate bridge engine/document inventory.
+GTK uses the shared desktop tab facade. `ConnectionSelection`, `QueryDocuments` and CLI session-only consumers remain supported; CLI migration must adopt shared application workflows explicitly. No compatibility route retains a separate bridge engine/document inventory.
 
 Document snapshots carry session/document/query UUIDs, output generation, draft revision, title/draft, execution state, result phase and availability, captured/received row counts, capture bytes, cutoff, termination, capture diagnostics, command acknowledgments, retained error, and optional `execution_seconds` from the result duration (including restored history). Result pages and cell chunks carry their source document and generation. Reject stale generations before and after asynchronous storage reads. SQL null is encoded as JSON null; the text `NULL` remains text.
 

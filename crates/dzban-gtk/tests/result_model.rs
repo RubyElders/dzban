@@ -3,8 +3,8 @@ use std::time::{Duration, Instant};
 use dzban_core::result_store::ResultLimits;
 use dzban_core::result_stream::{ResultHandle, start_results};
 use dzban_core::{ResultCell, ResultColumn};
-use dzban_gtk::database::RuntimeBridge;
-use dzban_gtk::result_model::{ResultListModel, ResultModelPhase};
+use dzban_gtk::result_model::{PageReader, ResultListModel, ResultModelPhase};
+use dzban_gtk::runtime::RuntimeBridge;
 use gtk4::prelude::*;
 
 fn capture(rows: usize) -> ResultHandle {
@@ -62,17 +62,17 @@ async fn escaped_wide_rows_respect_projection_budget_without_skipping_rows() {
     let mut pages = 0;
     while position < 10 {
         let rows = bridge
-            .read_result_rows(result.clone(), position)
+            .run(PageReader::from_handle(result.clone()).preview_rows(position))
             .await
             .unwrap()
             .unwrap();
         assert!(!rows.is_empty());
         assert!(rows.iter().map(String::len).sum::<usize>() <= 2 * 1024 * 1024);
         for (offset, row) in rows.iter().enumerate() {
-            let values: Vec<String> = serde_json::from_str(row).unwrap();
+            let values: Vec<Option<String>> = serde_json::from_str(row).unwrap();
             assert_eq!(values.len(), 1000);
-            assert_eq!(values[0], (position + offset).to_string());
-            assert_eq!(values[999], "\u{1f}".repeat(100));
+            assert_eq!(values[0], Some((position + offset).to_string()));
+            assert_eq!(values[999], Some("\u{1f}".repeat(100)));
         }
         position += rows.len();
         pages += 1;
@@ -80,7 +80,7 @@ async fn escaped_wide_rows_respect_projection_budget_without_skipping_rows() {
     assert!(pages > 1);
     assert!(
         bridge
-            .read_result_rows(result, position)
+            .run(PageReader::from_handle(result).preview_rows(position))
             .await
             .unwrap()
             .unwrap()
@@ -118,7 +118,12 @@ fn contains_label(root: &gtk4::Widget, text: &str) -> bool {
 #[gtk4::test]
 #[ignore = "requires a GTK display"]
 fn rows_load_lazily_and_cache_remains_bounded_at_both_ends() {
-    let model = ResultListModel::new(capture(10_000), RuntimeBridge::new().unwrap(), 1, 10_000);
+    let model = ResultListModel::new(
+        PageReader::from_handle(capture(10_000)),
+        RuntimeBridge::new().unwrap(),
+        1,
+        10_000,
+    );
     assert_eq!(model.n_items(), 10_000);
     assert_eq!(model.cached_rows(), 0);
     assert!(model.item(10_000).is_none());
@@ -158,7 +163,12 @@ fn rows_load_lazily_and_cache_remains_bounded_at_both_ends() {
 #[gtk4::test]
 #[ignore = "requires a GTK display"]
 fn growing_and_shrinking_model_reports_valid_ranges_without_stale_reads() {
-    let model = ResultListModel::new(capture(500), RuntimeBridge::new().unwrap(), 1, 1);
+    let model = ResultListModel::new(
+        PageReader::from_handle(capture(500)),
+        RuntimeBridge::new().unwrap(),
+        1,
+        1,
+    );
     let changes = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let observed = changes.clone();
     model.connect_items_changed(move |_, start, removed, added| {
@@ -184,7 +194,12 @@ fn growing_and_shrinking_model_reports_valid_ranges_without_stale_reads() {
 #[gtk4::test]
 #[ignore = "requires a GTK display"]
 fn native_column_view_pages_large_results_without_resetting_scroll() {
-    let model = ResultListModel::new(capture(10_000), RuntimeBridge::new().unwrap(), 1, 10_000);
+    let model = ResultListModel::new(
+        PageReader::from_handle(capture(10_000)),
+        RuntimeBridge::new().unwrap(),
+        1,
+        10_000,
+    );
     let selection = gtk4::SingleSelection::new(Some(model.clone()));
     let view = gtk4::ColumnView::new(Some(selection));
     let factory = gtk4::SignalListItemFactory::new();
@@ -205,12 +220,12 @@ fn native_column_view_pages_large_results_without_resetting_scroll() {
             .unwrap()
             .downcast::<gtk4::StringObject>()
             .unwrap();
-        let values: Vec<String> = serde_json::from_str(&row.string()).unwrap();
+        let values = dzban_gtk::result_model::decode_row(&row.string());
         item.child()
             .unwrap()
             .downcast::<gtk4::Label>()
             .unwrap()
-            .set_text(&values[0]);
+            .set_text(values[0].as_deref().unwrap_or_default());
     });
     let column = gtk4::ColumnViewColumn::new(Some("value"), Some(factory));
     column.set_fixed_width(200);
@@ -255,4 +270,16 @@ fn native_column_view_pages_large_results_without_resetting_scroll() {
         );
     }
     window.close();
+}
+
+#[test]
+fn previews_keep_sql_null_distinct_from_null_text() {
+    let row = dzban_gtk::result_model::encode_row(
+        &[ResultCell::Null, ResultCell::Text("NULL".into())],
+        512,
+    );
+    assert_eq!(
+        dzban_gtk::result_model::decode_row(&row),
+        vec![None, Some("NULL".to_string())]
+    );
 }

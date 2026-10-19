@@ -1,12 +1,14 @@
 use std::sync::Once;
 
-use dzban_gtk::database::DatabaseBackend;
+use dzban_core::DatabaseBackend;
 
 pub const POSTGRESQL: &str = "dzban-postgresql";
 pub const CLICKHOUSE: &str = "dzban-clickhouse";
 pub const QUERY_TIME: &str = "dzban-query-time-symbolic";
 pub const RESULT_ROWS: &str = "dzban-result-rows-symbolic";
 pub const PING: &str = "dzban-ping-symbolic";
+pub const UNSEEN_RESULT: &str = "media-record-symbolic";
+pub const PLAN: &str = "dzban-plan-symbolic";
 
 static REGISTER_RESOURCES: Once = Once::new();
 
@@ -55,7 +57,7 @@ mod tests {
         let display = gtk4::gdk::Display::default().unwrap();
         let theme = gtk4::IconTheme::for_display(&display);
 
-        for name in [POSTGRESQL, CLICKHOUSE, QUERY_TIME, RESULT_ROWS, PING] {
+        for name in [POSTGRESQL, CLICKHOUSE, QUERY_TIME, RESULT_ROWS, PING, PLAN] {
             assert!(theme.has_icon(name), "missing embedded icon {name}");
             let paintable = theme.lookup_icon(
                 name,
@@ -72,7 +74,7 @@ mod tests {
         }
 
         let icons = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
-        for name in [POSTGRESQL, CLICKHOUSE, QUERY_TIME, RESULT_ROWS, PING] {
+        for name in [POSTGRESQL, CLICKHOUSE, QUERY_TIME, RESULT_ROWS, PING, PLAN] {
             let image = gtk4::Image::from_icon_name(name);
             image.set_pixel_size(16);
             icons.append(&image);

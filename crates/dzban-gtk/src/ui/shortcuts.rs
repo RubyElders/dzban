@@ -1,40 +1,39 @@
 use adw::prelude::*;
-use gtk4::prelude::*;
-use gtk4::{EventControllerKey, gdk};
+use gtk4::gdk;
 use libadwaita as adw;
 use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ShortcutAction {
     FocusSearch,
+    FocusEditor,
+    FocusResults,
+    CycleFocus,
+    FocusHistory,
+    FocusTabs,
+    ToggleHistory,
     ShowConnections,
     TestAllConnections,
-    FocusDatabaseTabs,
-    NextDatabaseTab,
-    PreviousDatabaseTab,
-    LocateDatabaseTab,
-    ToggleSidebar,
-    NewQueryTab,
-    CloseQueryTab,
-    NextQueryTab,
-    PreviousQueryTab,
-    RenameQueryTab,
-    LocateQueryTab,
-    FocusQueryTabs,
-    FocusQueryEditor,
-    FocusQueryResults,
-    PreviewResultRow,
-    FocusQueryHistory,
+    NewTab,
+    CloseTab,
+    NextTab,
+    PreviousTab,
+    RenameTab,
+    Disconnect,
     RunQuery,
+    EstimateAndRun,
+    Estimate,
+    OpenPlan,
     StopQuery,
-    PreviewQuery,
-    PeekPlan,
-    ClosePlan,
+    PreviewRow,
+    CopyResults,
     ShowShortcuts,
+    Fullscreen,
+    Quit,
 }
 
 #[derive(Debug, Clone)]
-enum ShortcutTrigger {
+enum Trigger {
     Key {
         key: gdk::Key,
         modifiers: gdk::ModifierType,
@@ -48,7 +47,7 @@ pub struct Shortcut {
     pub name: &'static str,
     pub description: &'static str,
     pub group: &'static str,
-    triggers: Vec<ShortcutTrigger>,
+    triggers: Vec<Trigger>,
     pub keywords: &'static [&'static str],
 }
 
@@ -57,48 +56,59 @@ impl Shortcut {
         let id = match self.action {
             ShortcutAction::RunQuery => "query.submit",
             ShortcutAction::StopQuery => "query.cancel",
-            ShortcutAction::PreviewQuery => "query.plan",
+            ShortcutAction::Estimate => "query.plan",
             _ => return None,
         };
         dzban_core::action::ActionRegistry::shared_portable().get(id)
     }
 
-    fn matches(&self, key: gdk::Key, modifiers: gdk::ModifierType) -> bool {
+    pub fn matches(&self, key: gdk::Key, modifiers: gdk::ModifierType) -> bool {
         self.triggers.iter().any(|trigger| {
             matches!(
                 trigger,
-                ShortcutTrigger::Key {
-                    key: expected_key,
+                Trigger::Key {
+                    key: expected,
                     modifiers: expected_modifiers,
-                } if key == *expected_key && modifiers == *expected_modifiers
+                } if key.to_lower() == expected.to_lower() && modifiers == *expected_modifiers
             )
         })
+    }
+
+    pub fn has_trigger(&self) -> bool {
+        !self.triggers.is_empty()
     }
 
     pub fn accelerator(&self) -> String {
         self.triggers
             .iter()
             .map(|trigger| match trigger {
-                ShortcutTrigger::Chord(label) => label.to_string(),
-                ShortcutTrigger::Key { key, modifiers } => {
+                Trigger::Chord(label) => label.to_string(),
+                Trigger::Key { key, modifiers } => {
                     let mut parts = Vec::new();
                     if modifiers.contains(gdk::ModifierType::CONTROL_MASK) {
                         parts.push("Ctrl".to_string());
                     }
-                    if modifiers.contains(gdk::ModifierType::SHIFT_MASK) {
+                    if modifiers.contains(gdk::ModifierType::SHIFT_MASK)
+                        && *key != gdk::Key::question
+                    {
                         parts.push("Shift".to_string());
                     }
                     if modifiers.contains(gdk::ModifierType::ALT_MASK) {
                         parts.push("Alt".to_string());
                     }
-                    let key = match *key {
-                        gdk::Key::Return | gdk::Key::KP_Enter => "Enter".to_string(),
-                        gdk::Key::space => "Space".to_string(),
-                        gdk::Key::period => ".".to_string(),
-                        gdk::Key::question => "?".to_string(),
-                        _ => key.name().unwrap_or_default().to_string(),
-                    };
-                    parts.push(key);
+                    parts.push(match *key {
+                        gdk::Key::Return | gdk::Key::KP_Enter => "Enter".into(),
+                        gdk::Key::space => "Space".into(),
+                        gdk::Key::question => "?".into(),
+                        gdk::Key::Page_Up => "Page Up".into(),
+                        gdk::Key::Page_Down => "Page Down".into(),
+                        gdk::Key::ISO_Left_Tab => "Tab".into(),
+                        key => key
+                            .to_upper()
+                            .name()
+                            .map(|name| name.to_string())
+                            .unwrap_or_default(),
+                    });
                     parts.join("+")
                 }
             })
@@ -107,75 +117,24 @@ impl Shortcut {
     }
 
     pub fn tooltip(&self) -> String {
-        format!("{} ({})", self.name, self.accelerator())
+        if self.triggers.is_empty() {
+            self.name.to_string()
+        } else {
+            format!("{} ({})", self.name, self.accelerator())
+        }
     }
 }
 
-static SHORTCUTS: OnceLock<Vec<Shortcut>> = OnceLock::new();
+const CONTROL: gdk::ModifierType = gdk::ModifierType::CONTROL_MASK;
+const SHIFT: gdk::ModifierType = gdk::ModifierType::SHIFT_MASK;
+const NONE: gdk::ModifierType = gdk::ModifierType::empty();
 
-fn key(
-    action: ShortcutAction,
-    key: gdk::Key,
-    modifiers: gdk::ModifierType,
-    name: &'static str,
-    description: &'static str,
-    group: &'static str,
-) -> Shortcut {
-    Shortcut {
-        action,
-        name,
-        description,
-        group,
-        triggers: vec![ShortcutTrigger::Key { key, modifiers }],
-        keywords: &[],
-    }
-}
-
-fn keys(
-    action: ShortcutAction,
-    triggers: &[(gdk::Key, gdk::ModifierType)],
-    name: &'static str,
-    description: &'static str,
-    group: &'static str,
-) -> Shortcut {
-    Shortcut {
-        action,
-        name,
-        description,
-        group,
-        triggers: triggers
-            .iter()
-            .map(|(key, modifiers)| ShortcutTrigger::Key {
-                key: *key,
-                modifiers: *modifiers,
-            })
-            .collect(),
-        keywords: &[],
-    }
-}
-
-fn chord(
-    action: ShortcutAction,
-    accelerator: &'static str,
-    name: &'static str,
-    description: &'static str,
-    group: &'static str,
-) -> Shortcut {
-    Shortcut {
-        action,
-        name,
-        description,
-        group,
-        triggers: vec![ShortcutTrigger::Chord(accelerator)],
-        keywords: &[],
-    }
-}
-
-fn action(
+fn entry(
     action: ShortcutAction,
     name: &'static str,
     description: &'static str,
     group: &'static str,
+    triggers: Vec<Trigger>,
     keywords: &'static [&'static str],
 ) -> Shortcut {
     Shortcut {
@@ -183,208 +142,235 @@ fn action(
         name,
         description,
         group,
-        triggers: Vec::new(),
+        triggers,
         keywords,
     }
 }
 
-fn init_shortcuts() -> Vec<Shortcut> {
-    let control = gdk::ModifierType::CONTROL_MASK;
-    let shift = gdk::ModifierType::SHIFT_MASK;
+fn key(key: gdk::Key, modifiers: gdk::ModifierType) -> Trigger {
+    Trigger::Key { key, modifiers }
+}
+
+fn init() -> Vec<Shortcut> {
+    use ShortcutAction as Action;
+    use Trigger::Chord;
     vec![
-        key(
-            ShortcutAction::FocusSearch,
-            gdk::Key::k,
-            control,
-            "Open Action Menu",
-            "Search commands, databases, and open tabs",
-            "Navigation",
-        ),
-        action(
-            ShortcutAction::ShowConnections,
-            "Show Connections",
-            "Open the connection list and focus the selected database",
-            "Connections",
-            &["database", "open", "manage"],
-        ),
-        action(
-            ShortcutAction::TestAllConnections,
-            "Test All Connections",
-            "Test every configured database connection",
-            "Connections",
-            &["database", "health", "ping"],
-        ),
-        action(
-            ShortcutAction::FocusDatabaseTabs,
-            "Focus Database Tabs",
-            "Move keyboard focus to the database tab strip",
-            "Database Tabs",
-            &["jump", "workspace"],
-        ),
-        action(
-            ShortcutAction::PreviousDatabaseTab,
-            "Previous Database Tab",
-            "Select the database workspace to the left",
-            "Database Tabs",
-            &["left", "previous"],
-        ),
-        action(
-            ShortcutAction::NextDatabaseTab,
-            "Next Database Tab",
-            "Select the database workspace to the right",
-            "Database Tabs",
-            &["right", "next"],
-        ),
-        action(
-            ShortcutAction::LocateDatabaseTab,
-            "Locate Database Tab",
-            "Find and select an open database workspace",
-            "Database Tabs",
-            &["find", "switch", "workspace"],
-        ),
-        key(
-            ShortcutAction::ToggleSidebar,
-            gdk::Key::b,
-            control,
-            "Toggle Query History",
-            "Show or hide query history for the current database",
-            "Navigation",
-        ),
-        key(
-            ShortcutAction::NewQueryTab,
-            gdk::Key::t,
-            control,
-            "New Query Tab",
-            "Open a query tab in the current database",
-            "Navigation",
-        ),
-        key(
-            ShortcutAction::CloseQueryTab,
-            gdk::Key::w,
-            control,
-            "Close Query Tab",
-            "Close the selected query tab",
-            "Navigation",
-        ),
-        key(
-            ShortcutAction::PreviousQueryTab,
-            gdk::Key::Page_Up,
-            control,
-            "Previous Query Tab",
-            "Select the query tab to the left",
-            "Query Tabs",
-        ),
-        key(
-            ShortcutAction::NextQueryTab,
-            gdk::Key::Page_Down,
-            control,
-            "Next Query Tab",
-            "Select the query tab to the right",
-            "Query Tabs",
-        ),
-        action(
-            ShortcutAction::RenameQueryTab,
-            "Rename Query Tab",
-            "Rename the selected query tab",
-            "Query Tabs",
-            &["title", "name"],
-        ),
-        action(
-            ShortcutAction::LocateQueryTab,
-            "Locate Query Tab",
-            "Find and select a query tab",
-            "Query Tabs",
-            &["find", "switch"],
-        ),
-        action(
-            ShortcutAction::FocusQueryTabs,
-            "Focus Query Tabs",
-            "Move keyboard focus to the query tab strip",
-            "Query Tabs",
-            &["jump", "list"],
-        ),
-        action(
-            ShortcutAction::FocusQueryEditor,
-            "Focus Query Editor",
-            "Move keyboard focus to the selected query editor",
-            "Query",
-            &["jump", "sql", "input"],
-        ),
-        action(
-            ShortcutAction::FocusQueryResults,
-            "Focus Query Results",
-            "Move keyboard focus to the selected query output",
-            "Query",
-            &["jump", "output", "error"],
-        ),
-        chord(
-            ShortcutAction::PreviewResultRow,
-            "Tap or hold Space",
-            "Preview Result Row",
-            "Tap to keep the selected row open, or hold to peek until release",
-            "Query",
-        ),
-        action(
-            ShortcutAction::FocusQueryHistory,
-            "Focus Query History",
-            "Show query history and move keyboard focus to it",
-            "Query",
-            &["jump", "saved", "list"],
-        ),
-        chord(
-            ShortcutAction::PreviewQuery,
-            "Hold Ctrl+Shift",
-            "Estimate Query",
-            "",
-            "Query",
-        ),
-        chord(
-            ShortcutAction::PeekPlan,
-            "Ctrl+Shift+Space",
-            "Show Query Plan",
-            "Tap Space to keep the plan open, or hold Space to preview until release",
-            "Query",
-        ),
-        keys(
-            ShortcutAction::RunQuery,
-            &[
-                (gdk::Key::Return, control),
-                (gdk::Key::Return, control | shift),
-            ],
+        entry(
+            Action::RunQuery,
             "Run Query",
             "",
             "Query",
+            vec![key(gdk::Key::Return, CONTROL)],
+            &["execute", "stop"],
         ),
-        key(
-            ShortcutAction::StopQuery,
-            gdk::Key::period,
-            control,
+        entry(
+            Action::EstimateAndRun,
+            "Estimate and Run",
+            "Estimate the query, then run it",
+            "Query",
+            vec![key(gdk::Key::Return, CONTROL | SHIFT)],
+            &["plan", "execute"],
+        ),
+        entry(
+            Action::Estimate,
+            "Estimate Query",
+            "",
+            "Query",
+            vec![Chord("Hold Ctrl+Shift")],
+            &["estimate", "plan"],
+        ),
+        entry(
+            Action::OpenPlan,
+            "Preview Query Plan",
+            "Open the plan; tap Space to keep it open or hold to peek",
+            "Query",
+            vec![key(gdk::Key::space, CONTROL | SHIFT)],
+            &["explain", "plan", "estimate"],
+        ),
+        entry(
+            Action::StopQuery,
             "Stop Query",
             "",
             "Query",
+            vec![Chord("Escape")],
+            &["cancel"],
         ),
-        key(
-            ShortcutAction::ClosePlan,
-            gdk::Key::Escape,
-            gdk::ModifierType::empty(),
-            "Cancel Query or Close Preview",
-            "Cancel an active query, otherwise close the plan or result preview",
-            "Query",
+        entry(
+            Action::PreviewRow,
+            "Preview Result Row",
+            "Tap Space to keep the row open, or hold to peek; arrows move between rows and columns",
+            "Results",
+            vec![Chord("Space")],
+            &["row", "inspect", "peek"],
         ),
-        key(
-            ShortcutAction::ShowShortcuts,
-            gdk::Key::F1,
-            gdk::ModifierType::empty(),
+        entry(
+            Action::CopyResults,
+            "Copy Results",
+            "Copy the selected rows as Markdown",
+            "Results",
+            vec![key(gdk::Key::c, CONTROL)],
+            &["clipboard", "markdown", "export"],
+        ),
+        entry(
+            Action::CycleFocus,
+            "Toggle Editor and Results",
+            "Move focus between the SQL editor and its results",
+            "Navigation",
+            vec![key(gdk::Key::k, CONTROL)],
+            &["focus", "switch"],
+        ),
+        entry(
+            Action::FocusSearch,
+            "Search Actions",
+            "Search commands, connections and open tabs",
+            "Navigation",
+            vec![key(gdk::Key::l, CONTROL)],
+            &["command", "palette", "find"],
+        ),
+        entry(
+            Action::ToggleHistory,
+            "Query History",
+            "Show or hide saved queries on the left",
+            "Navigation",
+            vec![key(gdk::Key::b, CONTROL)],
+            &["sidebar", "saved"],
+        ),
+        entry(
+            Action::NewTab,
+            "New Query Tab",
+            "Choose a connection for a new query",
+            "Tabs",
+            vec![key(gdk::Key::t, CONTROL)],
+            &["open", "connection"],
+        ),
+        entry(
+            Action::CloseTab,
+            "Close Query Tab",
+            "Close the selected tab",
+            "Tabs",
+            vec![key(gdk::Key::w, CONTROL)],
+            &["close"],
+        ),
+        entry(
+            Action::NextTab,
+            "Next Query Tab",
+            "Select the next tab",
+            "Tabs",
+            vec![
+                key(gdk::Key::Tab, CONTROL),
+                key(gdk::Key::Page_Down, CONTROL),
+            ],
+            &["right", "switch"],
+        ),
+        entry(
+            Action::PreviousTab,
+            "Previous Query Tab",
+            "Select the previous tab",
+            "Tabs",
+            vec![
+                key(gdk::Key::ISO_Left_Tab, CONTROL | SHIFT),
+                key(gdk::Key::Page_Up, CONTROL),
+            ],
+            &["left", "switch"],
+        ),
+        entry(
+            Action::RenameTab,
+            "Rename Query Tab",
+            "Rename the selected query",
+            "Tabs",
+            Vec::new(),
+            &["title", "name"],
+        ),
+        entry(
+            Action::FocusEditor,
+            "Focus Query Editor",
+            "Return to SQL at the current cursor position",
+            "Navigation",
+            Vec::new(),
+            &["jump", "sql"],
+        ),
+        entry(
+            Action::FocusResults,
+            "Focus Results",
+            "Navigate result rows and cells",
+            "Navigation",
+            Vec::new(),
+            &["jump", "output", "table"],
+        ),
+        entry(
+            Action::FocusHistory,
+            "Focus Query History",
+            "Show query history and move keyboard focus to it",
+            "Navigation",
+            Vec::new(),
+            &["jump", "saved"],
+        ),
+        entry(
+            Action::FocusTabs,
+            "Focus Query Tabs",
+            "Move keyboard focus to the tab strip",
+            "Navigation",
+            Vec::new(),
+            &["jump"],
+        ),
+        entry(
+            Action::ShowConnections,
+            "Show Connections",
+            "Choose a database connection",
+            "Connections",
+            Vec::new(),
+            &["database", "open", "chooser"],
+        ),
+        entry(
+            Action::TestAllConnections,
+            "Test All Connections",
+            "Probe configured servers and measure delay",
+            "Connections",
+            Vec::new(),
+            &["health", "ping", "probe"],
+        ),
+        entry(
+            Action::Disconnect,
+            "Disconnect",
+            "Close the current workspace",
+            "Connections",
+            Vec::new(),
+            &["close", "session"],
+        ),
+        entry(
+            Action::ShowShortcuts,
             "Keyboard Shortcuts",
-            "Show this shortcut reference",
+            "Show the keyboard reference",
             "Help",
+            vec![
+                key(gdk::Key::question, CONTROL | SHIFT),
+                key(gdk::Key::F1, NONE),
+            ],
+            &["help", "keys"],
+        ),
+        entry(
+            Action::Fullscreen,
+            "Fullscreen",
+            "Toggle fullscreen",
+            "Help",
+            vec![key(gdk::Key::F11, NONE)],
+            &["window", "maximize"],
+        ),
+        entry(
+            Action::Quit,
+            "Quit",
+            "Save open tabs and close Dzban",
+            "Help",
+            vec![key(gdk::Key::q, CONTROL)],
+            &["exit", "close"],
         ),
     ]
 }
 
 pub fn shortcuts() -> &'static [Shortcut] {
+    static SHORTCUTS: OnceLock<Vec<Shortcut>> = OnceLock::new();
     SHORTCUTS.get_or_init(|| {
-        let mut shortcuts = init_shortcuts();
+        let mut shortcuts = init();
         for shortcut in &mut shortcuts {
             if let Some(action) = shortcut.domain_action() {
                 shortcut.description = &action.description;
@@ -401,88 +387,63 @@ pub fn shortcut(action: ShortcutAction) -> &'static Shortcut {
         .expect("every shortcut action is registered")
 }
 
-pub fn create_controller<F>(callback: F) -> EventControllerKey
-where
-    F: Fn(ShortcutAction) -> bool + 'static,
-{
-    let controller = EventControllerKey::new();
-    controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
-    controller.connect_key_pressed(move |_, key, _, modifiers| {
-        let modifiers = modifiers
-            & (gdk::ModifierType::CONTROL_MASK
-                | gdk::ModifierType::SHIFT_MASK
-                | gdk::ModifierType::ALT_MASK);
-        for shortcut in shortcuts() {
-            if shortcut.matches(key, modifiers) && callback(shortcut.action) {
-                return glib::Propagation::Stop;
-            }
-        }
-        glib::Propagation::Proceed
-    });
-    controller
+pub fn matching(key: gdk::Key, modifiers: gdk::ModifierType) -> Option<ShortcutAction> {
+    let modifiers = modifiers & (CONTROL | SHIFT | gdk::ModifierType::ALT_MASK);
+    shortcuts()
+        .iter()
+        .find(|shortcut| shortcut.matches(key, modifiers))
+        .map(|shortcut| shortcut.action)
 }
 
-pub fn create_shortcuts_window() -> adw::Dialog {
-    use gtk4::{Box, Label, ListBox, Orientation, ScrolledWindow};
-
-    let content = Box::new(Orientation::Vertical, 12);
-    content.set_margin_top(24);
+pub fn create_dialog() -> adw::Dialog {
+    let content = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+    content.set_margin_top(12);
     content.set_margin_bottom(24);
     content.set_margin_start(24);
     content.set_margin_end(24);
 
-    let title = Label::new(Some("Keyboard Shortcuts"));
-    title.add_css_class("title-1");
-    title.set_halign(gtk4::Align::Start);
-    content.append(&title);
-
-    let mut current_group = None;
+    let mut group = None;
     let mut list = None;
     for shortcut in shortcuts() {
-        if shortcut.triggers.is_empty() {
+        if !shortcut.has_trigger() {
             continue;
         }
-        if current_group != Some(shortcut.group) {
-            let group_title = Label::new(Some(shortcut.group));
-            group_title.add_css_class("title-4");
-            group_title.set_halign(gtk4::Align::Start);
-            group_title.set_margin_top(12);
-            content.append(&group_title);
-
-            let group_list = ListBox::new();
-            group_list.add_css_class("boxed-list");
-            content.append(&group_list);
-            list = Some(group_list);
-            current_group = Some(shortcut.group);
+        if group != Some(shortcut.group) {
+            let title = gtk4::Label::new(Some(shortcut.group));
+            title.add_css_class("heading");
+            title.set_halign(gtk4::Align::Start);
+            title.set_margin_top(12);
+            content.append(&title);
+            let rows = gtk4::ListBox::new();
+            rows.add_css_class("boxed-list");
+            rows.set_selection_mode(gtk4::SelectionMode::None);
+            content.append(&rows);
+            list = Some(rows);
+            group = Some(shortcut.group);
         }
-
         let row = adw::ActionRow::new();
         row.set_title(shortcut.name);
         row.set_subtitle(shortcut.description);
-        let accelerator = Label::new(Some(&shortcut.accelerator()));
+        let accelerator = gtk4::Label::new(Some(&shortcut.accelerator()));
         accelerator.add_css_class("dim-label");
         accelerator.add_css_class("monospace");
         row.add_suffix(&accelerator);
         list.as_ref().unwrap().append(&row);
     }
 
-    let scrolled = ScrolledWindow::new();
-    scrolled.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
-    scrolled.set_max_content_height(650);
-    scrolled.set_propagate_natural_height(true);
-    scrolled.set_child(Some(&content));
+    let scroll = gtk4::ScrolledWindow::new();
+    scroll.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+    scroll.set_propagate_natural_height(true);
+    scroll.set_max_content_height(578);
+    scroll.set_child(Some(&content));
 
     let toolbar = adw::ToolbarView::new();
-    let header = adw::HeaderBar::new();
-    header.set_show_end_title_buttons(true);
-    header.set_show_start_title_buttons(false);
-    toolbar.add_top_bar(&header);
-    toolbar.set_content(Some(&scrolled));
-
+    toolbar.add_top_bar(&adw::HeaderBar::new());
+    toolbar.set_content(Some(&scroll));
     let dialog = adw::Dialog::new();
     dialog.set_title("Keyboard Shortcuts");
-    dialog.set_content_width(560);
-    dialog.set_content_height(680);
+    dialog.set_content_width(720);
+    dialog.set_content_height(578);
     dialog.set_child(Some(&toolbar));
     dialog
 }
@@ -498,7 +459,7 @@ mod tests {
         for shortcut in shortcuts() {
             assert!(actions.insert(shortcut.action));
             assert!(!shortcut.name.is_empty());
-            assert!(!shortcut.description.is_empty());
+            assert!(!shortcut.description.is_empty(), "{}", shortcut.name);
         }
     }
 
@@ -507,48 +468,65 @@ mod tests {
         for (action, id) in [
             (ShortcutAction::RunQuery, "query.submit"),
             (ShortcutAction::StopQuery, "query.cancel"),
-            (ShortcutAction::PreviewQuery, "query.plan"),
+            (ShortcutAction::Estimate, "query.plan"),
         ] {
             let shortcut = shortcut(action);
             let descriptor = shortcut.domain_action().unwrap();
             assert_eq!(descriptor.id, id);
             assert_eq!(shortcut.description, descriptor.description);
         }
-        assert!(shortcut(ShortcutAction::PeekPlan).domain_action().is_none());
     }
 
     #[test]
-    fn plan_chords_are_registered_with_user_facing_labels() {
+    fn the_native_mac_bindings_map_command_to_control() {
+        for (action, accelerator) in [
+            (ShortcutAction::RunQuery, "Ctrl+Enter"),
+            (ShortcutAction::EstimateAndRun, "Ctrl+Shift+Enter"),
+            (ShortcutAction::OpenPlan, "Ctrl+Shift+Space"),
+            (ShortcutAction::CycleFocus, "Ctrl+K"),
+            (ShortcutAction::FocusSearch, "Ctrl+L"),
+            (ShortcutAction::ToggleHistory, "Ctrl+B"),
+            (ShortcutAction::NewTab, "Ctrl+T"),
+            (ShortcutAction::CloseTab, "Ctrl+W"),
+            (ShortcutAction::ShowShortcuts, "Ctrl+? / F1"),
+        ] {
+            assert_eq!(shortcut(action).accelerator(), accelerator);
+        }
         assert_eq!(
-            shortcut(ShortcutAction::PreviewQuery).accelerator(),
+            shortcut(ShortcutAction::Estimate).accelerator(),
             "Hold Ctrl+Shift"
         );
-        assert_eq!(
-            shortcut(ShortcutAction::PeekPlan).accelerator(),
-            "Ctrl+Shift+Space"
-        );
     }
 
     #[test]
-    fn run_query_supports_direct_and_plan_chord_execution() {
-        let run = shortcut(ShortcutAction::RunQuery);
-        assert!(run.matches(
-            gdk::Key::Return,
-            gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK
-        ));
-        assert!(run.matches(gdk::Key::Return, gdk::ModifierType::CONTROL_MASK));
-        assert_eq!(run.accelerator(), "Ctrl+Enter / Ctrl+Shift+Enter");
+    fn shifted_letters_and_tab_aliases_match_their_actions() {
+        assert_eq!(
+            matching(gdk::Key::L, CONTROL),
+            Some(ShortcutAction::FocusSearch)
+        );
+        assert_eq!(
+            matching(gdk::Key::ISO_Left_Tab, CONTROL | SHIFT),
+            Some(ShortcutAction::PreviousTab)
+        );
+        assert_eq!(
+            matching(gdk::Key::Tab, CONTROL),
+            Some(ShortcutAction::NextTab)
+        );
+        assert_eq!(
+            matching(gdk::Key::question, CONTROL | SHIFT),
+            Some(ShortcutAction::ShowShortcuts)
+        );
     }
 
     #[test]
     fn navigation_actions_live_in_the_action_menu_without_hidden_shortcuts() {
         for action in [
             ShortcutAction::ShowConnections,
-            ShortcutAction::FocusDatabaseTabs,
-            ShortcutAction::FocusQueryTabs,
-            ShortcutAction::FocusQueryEditor,
-            ShortcutAction::FocusQueryResults,
-            ShortcutAction::FocusQueryHistory,
+            ShortcutAction::FocusTabs,
+            ShortcutAction::FocusEditor,
+            ShortcutAction::FocusResults,
+            ShortcutAction::FocusHistory,
+            ShortcutAction::Disconnect,
         ] {
             assert!(shortcut(action).accelerator().is_empty());
         }
