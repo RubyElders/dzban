@@ -35,7 +35,7 @@
             outputPaths = ("$(DZBAN_RUST_TARGET_DIR)/$(DZBAN_RUST_PROFILE)/libdzban_macos_bridge.a", "$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/Dzban.icns");
             runOnlyForDeploymentPostprocessing = 0;
             shellPath = /bin/bash;
-            shellScript = "set -euo pipefail\nexport PATH=\"${CARGO_HOME:-$HOME/.cargo}/bin:$PATH\"\nif [[ \"${DZBAN_MACOS_FIXTURES:-NO}\" == YES ]]; then\n    bash \"$SRCROOT/../scripts/build-macos-bridge.sh\" --fixtures\nelse\n    bash \"$SRCROOT/../scripts/build-macos-bridge.sh\"\nfi\nbash \"$SRCROOT/../scripts/build-macos-resources.sh\" \"$DERIVED_FILE_DIR\" \"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH\"\n";
+            shellScript = "set -euo pipefail\nexport PATH=\"${CARGO_HOME:-$HOME/.cargo}/bin:$PATH\"\nif [[ \"${DZBAN_MACOS_FIXTURES:-NO}\" == YES ]]; then\n    bash \"$SRCROOT/../scripts/macos.sh\" bridge --fixtures\nelse\n    bash \"$SRCROOT/../scripts/macos.sh\" bridge\nfi\nbash \"$SRCROOT/../scripts/macos.sh\" resources \"$DERIVED_FILE_DIR\" \"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH\"\n";
         };
         A50000000000000000000001 = {
             isa = PBXNativeTarget;

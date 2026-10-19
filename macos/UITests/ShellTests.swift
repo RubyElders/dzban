@@ -1745,7 +1745,7 @@ final class ShellTests: XCTestCase {
 
     private func liveWorkflow(postgres: Bool) throws {
         guard ProcessInfo.processInfo.environment["DZBAN_TEST_DATABASES"] == "1" else {
-            throw XCTSkip("Requires disposable services from scripts/test-macos-live.sh")
+            throw XCTSkip("Requires disposable services from scripts/macos.sh test-live")
         }
         let configuration = fixtureDirectory.appendingPathComponent("live.toml")
         let profile = postgres ? "native-pg" : "native-ch"

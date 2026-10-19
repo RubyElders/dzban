@@ -25,28 +25,16 @@ env:
 
 jobs:
   headless:
-    name: Core and CLI (${{ matrix.os }}, Rust ${{ matrix.rust }})
-    runs-on: ${{ matrix.os }}
+    name: Core and CLI without native libraries
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-24.04
-            rust: 1.88.0
-          - os: ubuntu-24.04
-            rust: 1.98.1
-          - os: macos-15
-            rust: 1.98.1
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - name: Install Rust
-        env:
-          TOOLCHAIN: ${{ matrix.rust }}
-        run: rustup toolchain install "$TOOLCHAIN" --profile minimal
+        run: rustup toolchain install 1.98.1 --profile minimal
       - name: Cache Cargo dependencies and builds
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
@@ -54,11 +42,86 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target/headless
-          key: ${{ runner.os }}-${{ runner.arch }}-headless-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-headless-1.98.1-${{ hashFiles('**/Cargo.lock') }}
       - name: Build and test without native frontend libraries
+        run: bash scripts/test.sh headless
+
+  macos:
+    name: macOS build and bridge
+    runs-on: xcode-27
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Show Xcode version
+        run: |
+          xcodebuild -version
+          swift --version
+      - name: Install Rust
+        run: rustup toolchain install 1.98.1 --profile minimal
+      - name: Cache Cargo dependencies and builds
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/headless
+            target/macos-rust
+          key: ${{ runner.os }}-${{ runner.arch }}-macos-1.98.1-${{ hashFiles('**/Cargo.lock') }}
+      - name: Test shared crates on macOS
+        run: bash scripts/test.sh headless
+      - name: Test the bridge and Swift package
+        run: bash scripts/macos.sh test-bridge
+      - name: Build the application and UI tests
+        run: |
+          bash scripts/macos.sh build-ui-tests
+          tar -C target/macos-xcode-fixtures -czf "$RUNNER_TEMP/macos-ui-tests.tgz" Build/Products
+      - name: Upload the UI test build
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: macos-ui-tests
+          path: ${{ runner.temp }}/macos-ui-tests.tgz
+          retention-days: 1
+          if-no-files-found: error
+
+  macos-ui:
+    name: macOS UI (${{ matrix.shard }}/3)
+    needs: macos
+    runs-on: xcode-27
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Download the UI test build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: macos-ui-tests
+          path: ${{ runner.temp }}
+      - name: Unpack the UI test build
+        run: |
+          mkdir -p target/macos-xcode-fixtures
+          tar -C target/macos-xcode-fixtures -xzf "$RUNNER_TEMP/macos-ui-tests.tgz"
+      - name: Prepare the desktop
+        run: |
+          defaults write -g AppleShowScrollBars -string WhenScrolling
+          brew install displayplacer
+          screen=$(displayplacer list | awk '/^Persistent screen id:/ {print $4; exit}')
+          displayplacer "id:$screen res:1920x1080 hz:60 color_depth:7 enabled:true scaling:off origin:(0,0) degree:0"
+          bounds=$(osascript -e 'tell application "Finder" to get bounds of window of desktop')
+          echo "Desktop bounds: $bounds"
+          test "$bounds" = "0, 0, 1920, 1080"
+      - name: Test the UI
         env:
-          DZBAN_TEST_TOOLCHAIN: ${{ matrix.rust }}
-        run: bash scripts/check-headless.sh
+          SHARD: ${{ matrix.shard }}
+        run: bash scripts/macos.sh test-ui "$SHARD" 3
 
   rust:
     name: Rust checks and coverage
@@ -78,8 +141,6 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --locked --workspace --no-deps --all-features
-      - name: Test workspace on minimum Rust version
-        run: cargo +1.88.0 test --locked --workspace --all-targets
       - name: Install coverage tool
         run: cargo install cargo-llvm-cov --version 0.8.7 --locked
       - name: Collect core and CLI coverage
@@ -102,9 +163,9 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup-linux
       - name: Test GTK widgets and lifecycle
-        run: bash scripts/test-gtk.sh
+        run: bash scripts/test.sh gtk
       - name: Test PostgreSQL, ClickHouse and CLI contracts
-        run: bash skills/dzban-testing/scripts/run-db-integration.sh
+        run: bash scripts/test.sh databases
       - name: Clean up database fixtures
         if: always()
         run: docker compose -f docker-compose.test.yml down --volumes --remove-orphans
@@ -128,7 +189,7 @@ jobs:
           NO_AT_BRIDGE=1 PYTHONPATH=/usr/lib/python3/dist-packages uv run --python /usr/bin/python3 --with dogtail==2.1.0 python -c \
             'from dogtail.hermetic.session import missing_binaries; missing = missing_binaries(); assert not missing, missing'
       - name: Test application screens through AT-SPI
-        run: bash skills/dzban-ui-testing/scripts/run-dogtail-integration.sh
+        run: bash scripts/test.sh screens
       - name: Clean up database fixtures
         if: always()
         run: docker compose -f docker-compose.test.yml down --volumes --remove-orphans

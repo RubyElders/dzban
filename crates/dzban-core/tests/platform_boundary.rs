@@ -5,9 +5,9 @@ fn check(tree: &str) -> std::process::Output {
     let mut child = Command::new("bash")
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../scripts/check-portable.sh"
+            "/../../scripts/test.sh"
         ))
-        .arg("--check-tree")
+        .args(["portable", "--check-tree"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
