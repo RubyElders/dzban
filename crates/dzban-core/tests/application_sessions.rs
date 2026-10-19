@@ -296,7 +296,7 @@ async fn busy_close_retains_the_registered_session_and_query() {
 }
 
 #[tokio::test]
-async fn shutdown_drains_pending_connections_even_when_its_waiter_is_dropped() {
+async fn shutdown_aborts_pending_connections_even_when_its_waiter_is_dropped() {
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     let mut registry = AdapterRegistry::default();
@@ -322,10 +322,11 @@ async fn shutdown_drains_pending_connections_even_when_its_waiter_is_dropped() {
         context.start_connect(profile.clone()).wait().await,
         Err(ApplicationError::Operation(ExecutionError::Busy))
     ));
-    assert_eq!(context.subscribe_pending_connections().borrow().len(), 1);
     drop(shutdown);
-    release.notify_one();
-    let engine = connection.wait().await.unwrap();
+    assert!(matches!(
+        connection.wait().await,
+        Err(ApplicationError::Operation(ExecutionError::Closed))
+    ));
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
         while *phase.borrow_and_update() != ApplicationPhase::Closed {
             phase.changed().await.unwrap();
@@ -335,7 +336,7 @@ async fn shutdown_drains_pending_connections_even_when_its_waiter_is_dropped() {
     .unwrap();
     assert!(context.session_ids().await.is_empty());
     assert!(context.subscribe_pending_connections().borrow().is_empty());
-    assert_eq!(*engine.subscribe_session().borrow(), SessionPhase::Closed);
+    release.notify_one();
     assert!(matches!(
         context.start_connect(profile).wait().await,
         Err(ApplicationError::Operation(ExecutionError::Closed))
