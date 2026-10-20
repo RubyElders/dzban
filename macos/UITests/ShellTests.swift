@@ -1870,13 +1870,14 @@ final class ShellTests: XCTestCase {
             waitForValue("Complete - 500 rows", in: app.staticTexts["results.status"])
             let window = app.windows.firstMatch
             if window.frame.width < 1000 {
-                let corner = window.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 1)).withOffset(CGVector(dx: -2, dy: -2))
-                corner.press(forDuration: 0.1, thenDragTo: corner.withOffset(CGVector(dx: 240, dy: 0)))
+                let edge = window.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 0.5)).withOffset(CGVector(dx: -1, dy: 0))
+                edge.press(forDuration: 0.1, thenDragTo: edge.withOffset(CGVector(dx: 240, dy: 0)))
             }
             let before = window.frame
-            let corner = window.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 1)).withOffset(CGVector(dx: -2, dy: -2))
-            corner.press(forDuration: 0.1, thenDragTo: corner.withOffset(CGVector(dx: -120, dy: -60)))
-            XCTAssertLessThan(window.frame.width, before.width)
+            let edge = window.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 0.5)).withOffset(CGVector(dx: -1, dy: 0))
+            edge.press(forDuration: 0.1, thenDragTo: edge.withOffset(CGVector(dx: -120, dy: 0)))
+            let resized = expectation(for: NSPredicate { _, _ in window.frame.width <= before.width - 100 }, evaluatedWith: nil)
+            wait(for: [resized], timeout: 5)
             print("Native \(appearance) window points: \(window.frame.size); main display backing scale: \(NSScreen.main?.backingScaleFactor ?? 0)")
             XCTAssertTrue(app.textViews["query.editor"].isHittable)
             let first = app.descendants(matching: .any)["result.cell.0.0"]

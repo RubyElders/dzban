@@ -122,6 +122,14 @@ jobs:
         env:
           SHARD: ${{ matrix.shard }}
         run: bash scripts/macos.sh test-ui "$SHARD" 3
+      - name: Upload failed UI test results
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: macos-ui-results-${{ matrix.shard }}
+          path: target/macos-ui-results.*/Shell.xcresult
+          retention-days: 7
+          if-no-files-found: warn
 
   rust:
     name: Rust checks and coverage
