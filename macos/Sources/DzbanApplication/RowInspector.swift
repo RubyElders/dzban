@@ -121,6 +121,11 @@ final class RowInspectorModel: ObservableObject {
 }
 
 struct RowInspectorView: View {
+    private struct PositionRequest: Hashable {
+        let address: ResultAddress?
+        let loadedColumns: Int
+    }
+
     @ObservedObject var model: RowInspectorModel
     let columns: [Column]
     let cell: CellInspectorModel
@@ -141,6 +146,7 @@ struct RowInspectorView: View {
         .frame(width: 640, height: 460)
         .onChange(of: model.address) { old, new in
             positionedColumn = nil
+            focusedColumn = nil
             if old?.scope != new?.scope { selectedColumn = nil }
         }
         .onChange(of: model.inspectedCell) { _, address in if address == nil { positionedColumn = nil } }
@@ -203,7 +209,7 @@ struct RowInspectorView: View {
                     }
                 }
                 .accessibilityIdentifier("row.columns")
-                .task(id: model.values.count) {
+                .task(id: PositionRequest(address: model.address, loadedColumns: model.values.count)) {
                     guard let address = model.address, !columns.isEmpty else { return }
                     let target = selectedColumn ?? min(address.column, columns.count - 1)
                     if selectedColumn == nil { selectedColumn = target }

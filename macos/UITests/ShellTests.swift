@@ -124,13 +124,17 @@ final class ShellTests: XCTestCase {
         waitForValue("žluť\nNULL😀", in: app.staticTexts["row.value.1"])
         XCTAssertEqual(app.popovers.firstMatch.frame, previewFrame)
         XCTAssertEqual(app.windows.firstMatch.frame, windowFrame)
-        for (key, title, value) in [(XCUIKeyboardKey.rightArrow, "Row 2", "1"), (XCUIKeyboardKey(rawValue: "l"), "Row 3", "2"),
-                                    (.rightArrow, "Row 3", "2"), (XCUIKeyboardKey(rawValue: "h"), "Row 2", "1"),
-                                    (.leftArrow, "Row 1", "0"), (.leftArrow, "Row 1", "0")] {
-            app.typeKey(key, modifierFlags: [])
-            waitForValue(title, in: app.staticTexts["row.title"])
-            waitForValue(value, in: app.staticTexts["row.value.0"])
-            XCTAssertEqual(app.popovers.firstMatch.frame, previewFrame)
+        for _ in 0..<2 {
+            for (key, title, value) in [(XCUIKeyboardKey.rightArrow, "Row 2", "1"), (XCUIKeyboardKey(rawValue: "l"), "Row 3", "2"),
+                                        (.rightArrow, "Row 3", "2"), (XCUIKeyboardKey(rawValue: "h"), "Row 2", "1"),
+                                        (.leftArrow, "Row 1", "0"), (.leftArrow, "Row 1", "0")] {
+                app.typeKey(key, modifierFlags: [])
+                waitForValue(title, in: app.staticTexts["row.title"])
+                waitForValue(value, in: app.staticTexts["row.value.0"])
+                let positioned = expectation(for: NSPredicate { _, _ in !self.app.progressIndicators["row.loading"].exists }, evaluatedWith: nil)
+                wait(for: [positioned], timeout: 5)
+                XCTAssertEqual(app.popovers.firstMatch.frame, previewFrame)
+            }
         }
         capture("Stable row preview with horizontal row navigation")
         app.typeKey(.return, modifierFlags: [])
