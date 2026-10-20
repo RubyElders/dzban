@@ -98,6 +98,7 @@ struct ResultTable: NSViewRepresentable {
         coordinator.applying = true
         if coordinator.columns != model.columns {
             coordinator.columns = model.columns
+            table.columnAutoresizingStyle = .noColumnAutoresizing
             for column in table.tableColumns { table.removeTableColumn(column) }
             for (index, column) in model.columns.enumerated() {
                 let native = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("result.column.\(index)"))
@@ -110,7 +111,10 @@ struct ResultTable: NSViewRepresentable {
                 native.maxWidth = .greatestFiniteMagnitude
                 table.addTableColumn(native)
             }
-            if table.tableColumns.reduce(0, { $0 + $1.width }) < table.bounds.width { table.sizeLastColumnToFit() }
+            if table.tableColumns.reduce(0, { $0 + $1.width }) < table.bounds.width {
+                table.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
+                table.sizeLastColumnToFit()
+            }
         }
         let selectedRows = table.selectedRowIndexes.intersection(IndexSet(integersIn: 0..<model.availableRows))
         table.reloadData()

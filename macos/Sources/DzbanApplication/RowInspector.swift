@@ -219,10 +219,7 @@ struct RowInspectorView: View {
                     focusedColumn = target
                 }
                 .onChange(of: focusedColumn) { _, column in
-                    if let column {
-                        positionedColumn = column
-                        selectedColumn = column
-                    }
+                    if let column { selectedColumn = column }
                 }
                 .onChange(of: selectedColumn) { _, column in
                     guard positionedColumn != nil else { return }

@@ -231,8 +231,7 @@ final class ShellTests: XCTestCase {
             XCTAssertTrue(app.staticTexts["results.cost-estimate"].waitForExistence(timeout: 5))
             waitForValue("Cost 0.00..12.50", in: app.staticTexts["results.cost-estimate"])
             let window = app.windows.firstMatch
-            let corner = window.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 1)).withOffset(CGVector(dx: -2, dy: -2))
-            corner.press(forDuration: 0.1, thenDragTo: corner.withOffset(CGVector(dx: 960 - window.frame.width, dy: 620 - window.frame.height)))
+            resizeWindow(to: 960)
             let status = app.staticTexts["results.status"]
             let close = window.buttons["_XCUI:CloseWindow"]
             XCTAssertEqual(app.descendants(matching: .any)["connection.status"].frame.minX, close.frame.minX, accuracy: 1)
@@ -523,9 +522,7 @@ final class ShellTests: XCTestCase {
         app.typeKey(.escape, modifierFlags: [])
         app.typeKey(.return, modifierFlags: [])
         XCTAssertTrue(queryTab("Query 2").waitForExistence(timeout: 5))
-        let window = app.windows.firstMatch
-        let corner = window.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 1)).withOffset(CGVector(dx: -2, dy: -2))
-        corner.press(forDuration: 0.1, thenDragTo: corner.withOffset(CGVector(dx: 900 - window.frame.width, dy: 560 - window.frame.height)))
+        resizeWindow(to: 900)
         search.click()
         XCTAssertTrue(app.buttons["action.new"].waitForExistence(timeout: 5))
         capture("Action suggestions at minimum window width")
@@ -644,8 +641,7 @@ final class ShellTests: XCTestCase {
         launchApp()
         waitForValue("Running", in: app.buttons["query.primary"])
         let window = app.windows.firstMatch
-        let corner = window.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 1)).withOffset(CGVector(dx: -2, dy: -2))
-        corner.press(forDuration: 0.1, thenDragTo: corner.withOffset(CGVector(dx: 960 - window.frame.width, dy: 620 - window.frame.height)))
+        resizeWindow(to: 960)
         let field = app.toolbars.searchFields["actions.search"]
         let history = app.toolbars.buttons["history.open"]
         let progress = app.progressIndicators["query.progress"]
@@ -692,8 +688,7 @@ final class ShellTests: XCTestCase {
         waitForValue("Complete - 500 rows", in: app.staticTexts["results.status"])
         let window = app.windows.firstMatch
         for width in [1150.0, 960.0] {
-            let corner = window.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 1)).withOffset(CGVector(dx: -2, dy: -2))
-            corner.press(forDuration: 0.1, thenDragTo: corner.withOffset(CGVector(dx: width - window.frame.width, dy: 0)))
+            resizeWindow(to: Int(width))
             let toggle = app.toolbars.buttons["history.open"]
             let origin = toggle.frame
             for visible in [true, false, true, false, true] {
@@ -1015,13 +1010,11 @@ final class ShellTests: XCTestCase {
         app.launchArguments = ["--fixture-query", "single"]
         launchApp()
         waitForValue("Complete - 3 rows", in: app.staticTexts["results.status"])
-        let window = app.windows.firstMatch
         let table = app.tables["results.table"]
         for sql in ["single", "few"] {
             if sql == "few" { submitResultQuery(sql); waitForValue("Complete - 3 rows", in: app.staticTexts["results.status"]) }
             for width in [960.0, 1200.0] {
-                let corner = window.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 1)).withOffset(CGVector(dx: -2, dy: -2))
-                corner.press(forDuration: 0.1, thenDragTo: corner.withOffset(CGVector(dx: width - window.frame.width, dy: 0)))
+                resizeWindow(to: Int(width))
                 let columns = table.descendants(matching: .tableColumn)
                 XCTAssertEqual(columns.count, sql == "single" ? 1 : 2)
                 XCTAssertEqual(columns.firstMatch.frame.minX, app.buttons["result.row-number.0"].frame.maxX, accuracy: 2)
@@ -1313,8 +1306,7 @@ final class ShellTests: XCTestCase {
             app.typeKey(.return, modifierFlags: [])
             waitForValue("Ready to query", in: app.staticTexts["results.state-title"])
             let window = app.windows.firstMatch
-            let corner = window.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 1)).withOffset(CGVector(dx: -2, dy: -2))
-            corner.press(forDuration: 0.1, thenDragTo: corner.withOffset(CGVector(dx: 1150 - window.frame.width, dy: 760 - window.frame.height)))
+            resizeWindow(to: 1150)
             XCTAssertEqual(window.frame.width, 1150, accuracy: 2)
             XCTAssertEqual(window.frame.height, 760, accuracy: 2)
             let editor = app.textViews["query.editor"]
@@ -1552,11 +1544,13 @@ final class ShellTests: XCTestCase {
         XCTAssertFalse(app.buttons["Previous Columns"].exists)
         XCTAssertFalse(app.buttons["Next Columns"].exists)
         let last = app.buttons["row.inspect.127"]
+        let scroll = app.scrollViews["row.columns"]
         for _ in 0..<35 {
-            if last.exists && last.isHittable { break }
-            app.scrollViews["row.columns"].scroll(byDeltaX: 0, deltaY: -450)
+            if last.exists && last.isHittable && scroll.frame.contains(last.frame) { break }
+            scroll.scroll(byDeltaX: 0, deltaY: -450)
         }
         XCTAssertTrue(last.isHittable)
+        XCTAssertTrue(scroll.frame.contains(last.frame))
         capture("Row inspector scrolled to final column")
         last.click()
         waitForValue("r0c127", in: app.textViews["cell.value"])
@@ -1869,15 +1863,8 @@ final class ShellTests: XCTestCase {
             launchApp()
             waitForValue("Complete - 500 rows", in: app.staticTexts["results.status"])
             let window = app.windows.firstMatch
-            if window.frame.width < 1000 {
-                let edge = window.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 0.5)).withOffset(CGVector(dx: -1, dy: 0))
-                edge.press(forDuration: 0.1, thenDragTo: edge.withOffset(CGVector(dx: 240, dy: 0)))
-            }
-            let before = window.frame
-            let edge = window.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 0.5)).withOffset(CGVector(dx: -1, dy: 0))
-            edge.press(forDuration: 0.1, thenDragTo: edge.withOffset(CGVector(dx: -120, dy: 0)))
-            let resized = expectation(for: NSPredicate { _, _ in window.frame.width <= before.width - 100 }, evaluatedWith: nil)
-            wait(for: [resized], timeout: 5)
+            resizeWindow(to: 1150)
+            resizeWindow(to: 1030)
             print("Native \(appearance) window points: \(window.frame.size); main display backing scale: \(NSScreen.main?.backingScaleFactor ?? 0)")
             XCTAssertTrue(app.textViews["query.editor"].isHittable)
             let first = app.descendants(matching: .any)["result.cell.0.0"]
@@ -1901,6 +1888,14 @@ final class ShellTests: XCTestCase {
             app.typeKey("q", modifierFlags: .command)
             XCTAssertTrue(app.wait(for: .notRunning, timeout: 10))
         }
+    }
+
+    private func resizeWindow(to width: Int) {
+        let window = app.windows.firstMatch
+        app.menuBars.menuBarItems["Testing"].click()
+        app.menuItems["Resize Window to \(width)"].click()
+        let resized = expectation(for: NSPredicate { _, _ in abs(window.frame.width - Double(width)) < 2 }, evaluatedWith: nil)
+        wait(for: [resized], timeout: 5)
     }
 
     private func submitResultQuery(_ sql: String) {
