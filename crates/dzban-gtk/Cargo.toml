@@ -13,7 +13,7 @@ path = "src/main.rs"
 gtk4 = { version = "0.10", features = ["gnome_48"] }
 libadwaita = { version = "0.8", package = "libadwaita", features = ["v1_7"] }
 sourceview5 = { version = "0.10", package = "sourceview5" }
-cairo-rs = "0.21"
+cairo-rs = "0.22"
 gdk-pixbuf = "0.21"
 
 # Database layer (our workspace library)
