@@ -6,6 +6,43 @@ import SwiftUI
 
 @MainActor
 final class NavigationTests: XCTestCase {
+    func testRowPreviewRoutesKeysWithoutAFocusedCellOnlyInItsOwnWindow() throws {
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 460), styleMask: [.titled], backing: .buffered, defer: false)
+        let other = NSWindow(contentRect: .zero, styleMask: [.titled], backing: .buffered, defer: false)
+        let view = NSView()
+        window.contentView = view
+        let coordinator = RowInspectorKeyboard.Coordinator()
+        var keys: [String] = []
+        coordinator.attach(view) { event in
+            keys.append(event.charactersIgnoringModifiers ?? "")
+            return true
+        }
+        defer { coordinator.detach() }
+        func event(_ text: String, window: NSWindow, modifiers: NSEvent.ModifierFlags = [], type: NSEvent.EventType = .keyDown) throws -> NSEvent {
+            try XCTUnwrap(NSEvent.keyEvent(with: type, location: .zero, modifierFlags: modifiers,
+                timestamp: 0, windowNumber: window.windowNumber, context: nil,
+                characters: text, charactersIgnoringModifiers: text, isARepeat: false, keyCode: 0))
+        }
+        window.makeFirstResponder(nil)
+        for text in ["l", "h", "\r", " "] {
+            XCTAssertNil(coordinator.route(try event(text, window: window)))
+        }
+        XCTAssertEqual(keys, ["l", "h", "\r", " "])
+        for input in [try event("h", window: other), try event("h", window: window, modifiers: .command),
+                      try event("h", window: window, type: .keyUp)] {
+            XCTAssertTrue(coordinator.route(input) === input)
+        }
+        XCTAssertEqual(keys.count, 4)
+        coordinator.owner = other
+        XCTAssertNil(coordinator.route(try event("h", window: other)))
+        XCTAssertEqual(keys.count, 5)
+        coordinator.handle = { _ in false }
+        let input = try event("h", window: window)
+        XCTAssertTrue(coordinator.route(input) === input)
+        coordinator.detach()
+        XCTAssertTrue(coordinator.route(input) === input)
+    }
+
     private func connected() async throws -> (Bridge, ApplicationStore, UUID) {
         let bridge = try Bridge.fixture()
         let store = ApplicationStore(bridge: bridge)
