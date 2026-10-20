@@ -12,7 +12,7 @@ jobs:
     env:
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install pinned Rust and archive tools
         run: rustup toolchain install 1.98.1 --profile minimal --component llvm-tools
       - name: Check the native dependency boundary
