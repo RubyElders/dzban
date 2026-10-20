@@ -412,6 +412,41 @@ final class ResultViewportTests: XCTestCase {
 }
 
 @MainActor
+final class NativeResultPreviewTests: XCTestCase {
+    func testPreviewKeysMeasureTapsAndHoldsAndResetBetweenPresses() throws {
+        let table = NativeResultTable()
+        table.canPeek = true
+        var previews = 0
+        var releases: [UInt64] = []
+        table.peekRow = { previews += 1 }
+        table.releaseRow = { releases.append($0) }
+        func event(_ type: NSEvent.EventType, timestamp: TimeInterval, repeatKey: Bool = false, code: UInt16 = 49) throws -> NSEvent {
+            try XCTUnwrap(NSEvent.keyEvent(with: type, location: .zero, modifierFlags: [], timestamp: timestamp, windowNumber: 0, context: nil, characters: " ", charactersIgnoringModifiers: " ", isARepeat: repeatKey, keyCode: code))
+        }
+        table.keyDown(with: try event(.keyDown, timestamp: 1))
+        XCTAssertNil(table.routePeekEvent(try event(.keyDown, timestamp: 1.01, repeatKey: true)))
+        XCTAssertNil(table.routePeekEvent(try event(.keyUp, timestamp: 1.02)))
+        XCTAssertEqual(previews, 1)
+        XCTAssertEqual(releases.count, 1)
+        XCTAssertEqual(Double(try XCTUnwrap(releases.last)), 20, accuracy: 1)
+        table.keyDown(with: try event(.keyDown, timestamp: 2))
+        XCTAssertNotNil(table.routePeekEvent(try event(.keyUp, timestamp: 2.1, code: 48)))
+        XCTAssertNil(table.routePeekEvent(try event(.keyUp, timestamp: 2.5)))
+        XCTAssertEqual(releases, [20, 500])
+        table.keyDown(with: try event(.keyDown, timestamp: 3))
+        table.resetPeek()
+        XCTAssertNotNil(table.routePeekEvent(try event(.keyUp, timestamp: 3.1)))
+        XCTAssertEqual(releases.count, 2)
+        table.keyDown(with: try event(.keyDown, timestamp: 4))
+        XCTAssertNil(table.routePeekEvent(try event(.keyUp, timestamp: 4.01)))
+        XCTAssertEqual(previews, 4)
+        XCTAssertEqual(releases.count, 3)
+        XCTAssertEqual(Double(try XCTUnwrap(releases.last)), 10, accuracy: 1)
+    }
+
+}
+
+@MainActor
 final class ResultMarkdownTests: XCTestCase {
     func testSelectAllAndCopyUseNativeTableSelection() {
         final class Rows: NSObject, NSTableViewDataSource {
