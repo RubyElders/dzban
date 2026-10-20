@@ -396,13 +396,18 @@ final class NativeResultTable: NSTableView {
         peekRow?()
         peekMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp]) { [weak self] event in
             MainActor.assumeIsolated {
-                guard let self, event.keyCode == 49, let start = self.peekStarted else { return PeekEventResult(event: event) }
-                if event.type == .keyDown { return PeekEventResult(event: nil) }
-                self.releaseRow?(UInt64(max(0, event.timestamp - start) * 1000))
-                self.resetPeek()
-                return PeekEventResult(event: nil)
+                guard let self else { return PeekEventResult(event: event) }
+                return PeekEventResult(event: self.routePeekEvent(event))
             }.event
         }
+    }
+
+    func routePeekEvent(_ event: NSEvent) -> NSEvent? {
+        guard [.keyDown, .keyUp].contains(event.type), event.keyCode == 49, let start = peekStarted else { return event }
+        if event.type == .keyDown { return nil }
+        releaseRow?(UInt64(max(0, event.timestamp - start) * 1000))
+        resetPeek()
+        return nil
     }
     var dataVisibleRect: NSRect {
         var rect = visibleRect
