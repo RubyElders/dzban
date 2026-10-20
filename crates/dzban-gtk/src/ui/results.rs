@@ -50,6 +50,7 @@ struct Table {
     model: ResultListModel,
     view: gtk4::ColumnView,
     selection: gtk4::MultiSelection,
+    widths: Rc<RefCell<Vec<ColumnWidth>>>,
 }
 
 struct Restore {
@@ -58,6 +59,84 @@ struct Restore {
     column: usize,
     horizontal: f64,
     vertical: f64,
+}
+
+#[derive(Clone, Copy)]
+struct ScrollRestore {
+    target: (f64, f64),
+}
+
+enum ColumnWidth {
+    Automatic { preferred: i32, assigned: i32 },
+    Manual(i32),
+}
+
+fn size_columns(view: &gtk4::ColumnView, widths: &RefCell<Vec<ColumnWidth>>) {
+    let Some(adjustment) = view.hadjustment() else {
+        return;
+    };
+    let columns = view.columns();
+    let Ok(mut widths) = widths.try_borrow_mut() else {
+        return;
+    };
+    let mut base = Vec::new();
+    let mut preferred = Vec::new();
+    for (index, width) in widths.iter_mut().enumerate() {
+        let Some(column) = columns
+            .item(index as u32 + 1)
+            .and_downcast::<gtk4::ColumnViewColumn>()
+        else {
+            return;
+        };
+        if let ColumnWidth::Automatic { assigned, .. } = width
+            && column.fixed_width() != *assigned
+        {
+            *width = ColumnWidth::Manual(column.fixed_width());
+        }
+        match *width {
+            ColumnWidth::Automatic {
+                preferred: natural, ..
+            } => {
+                base.push(natural.min(MAX_COLUMN_WIDTH));
+                preferred.push(natural);
+            }
+            ColumnWidth::Manual(manual) => {
+                base.push(manual);
+                preferred.push(manual);
+            }
+        }
+    }
+    let assigned = fit_widths(
+        &base,
+        &preferred,
+        (adjustment.page_size() as i32 - 56).max(0),
+    );
+    for (index, (width, assigned)) in widths.iter_mut().zip(assigned).enumerate() {
+        if let ColumnWidth::Automatic {
+            assigned: previous, ..
+        } = width
+        {
+            *previous = assigned;
+            if let Some(column) = columns
+                .item(index as u32 + 1)
+                .and_downcast::<gtk4::ColumnViewColumn>()
+                && column.fixed_width() != assigned
+            {
+                column.set_fixed_width(assigned);
+            }
+        }
+    }
+}
+
+fn fit_widths(base: &[i32], preferred: &[i32], available: i32) -> Vec<i32> {
+    let mut widths = base.to_vec();
+    let mut spare = (available - widths.iter().sum::<i32>()).max(0);
+    for (width, preferred) in widths.iter_mut().zip(preferred) {
+        let extra = (preferred - *width).max(0).min(spare);
+        *width += extra;
+        spare -= extra;
+    }
+    widths
 }
 
 struct Inner {
@@ -84,8 +163,7 @@ struct Inner {
     copy_error: RefCell<Option<String>>,
     copying: RefCell<Option<Arc<AtomicBool>>>,
     restore: RefCell<Option<Restore>>,
-    pending_scroll: Cell<Option<(f64, f64)>>,
-    scroll_scheduled: Cell<bool>,
+    pending_scroll: Cell<Option<ScrollRestore>>,
     column: Cell<usize>,
     cells: RefCell<Vec<CellEntry>>,
     space: Cell<Option<Instant>>,
@@ -208,7 +286,6 @@ impl ResultPanel {
             copying: RefCell::new(None),
             restore: RefCell::new(None),
             pending_scroll: Cell::new(None),
-            scroll_scheduled: Cell::new(false),
             column: Cell::new(0),
             cells: RefCell::new(Vec::new()),
             space: Cell::new(None),
@@ -249,13 +326,50 @@ impl ResultPanel {
                 ResultPanel(inner).open_inspected_cell(column);
             }
         });
-        for adjustment in [panel.0.scroll.hadjustment(), panel.0.scroll.vadjustment()] {
-            let weak = Rc::downgrade(&panel.0);
-            adjustment.connect_changed(move |_| {
-                if let Some(inner) = weak.upgrade() {
-                    ResultPanel(inner).schedule_pending_scroll();
-                }
-            });
+        let frames = glib::SignalGroup::new::<gdk::FrameClock>();
+        frames.connect_local("paint", true, move |values| {
+            if let Ok(clock) = values[0].get::<gdk::FrameClock>() {
+                clock.request_phase(gdk::FrameClockPhase::AFTER_PAINT);
+            }
+            None
+        });
+        let weak = Rc::downgrade(&panel.0);
+        frames.connect_local("after-paint", false, move |_| {
+            if let Some(inner) = weak.upgrade() {
+                ResultPanel(inner).apply_pending_scroll();
+            }
+            None
+        });
+        let realized = frames.clone();
+        panel.0.scroll.connect_map(move |scroll| {
+            realized.set_target(scroll.frame_clock().as_ref());
+        });
+        panel.0.scroll.connect_unmap(move |_| {
+            frames.set_target(None::<&gdk::FrameClock>);
+        });
+        for property in ["hadjustment", "vadjustment"] {
+            let signals = glib::SignalGroup::new::<gtk4::Adjustment>();
+            for signal in ["changed", "value-changed"] {
+                let weak = Rc::downgrade(&panel.0);
+                signals.connect_local(signal, false, move |_| {
+                    if let Some(inner) = weak.upgrade() {
+                        if signal == "changed"
+                            && let Some(table) = inner.table.borrow().as_ref()
+                        {
+                            size_columns(&table.view, &table.widths);
+                        }
+                        ResultPanel(inner).schedule_pending_scroll();
+                    }
+                    None
+                });
+            }
+            signals.set_target(Some(&panel.0.scroll.property::<gtk4::Adjustment>(property)));
+            panel
+                .0
+                .scroll
+                .connect_notify_local(Some(property), move |scroll, _| {
+                    signals.set_target(Some(&scroll.property::<gtk4::Adjustment>(property)));
+                });
         }
         let wheel = gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::BOTH_AXES);
         let click = gtk4::GestureClick::new();
@@ -487,11 +601,20 @@ impl ResultPanel {
         );
         let selection = gtk4::MultiSelection::new(Some(model.clone()));
         keep_selection_across_page_loads(&selection);
-        let view = self.create_view(&selection, &model, &columns);
+        let widths = Rc::new(RefCell::new(Vec::new()));
+        let view = self.create_view(&selection, &model, &columns, &widths);
         let weak = Rc::downgrade(&self.0);
         model.connect_local("load-error", false, move |values| {
             let error = values[1].get::<String>().unwrap_or_default();
             if let Some(inner) = weak.upgrade() {
+                if inner
+                    .table
+                    .borrow()
+                    .as_ref()
+                    .is_none_or(|table| table.scope != scope)
+                {
+                    return None;
+                }
                 let panel = ResultPanel(inner);
                 panel.0.load_error.replace(Some(error));
                 panel.render_state();
@@ -515,6 +638,7 @@ impl ResultPanel {
             model,
             view,
             selection,
+            widths,
         }));
     }
 
@@ -523,6 +647,7 @@ impl ResultPanel {
         selection: &gtk4::MultiSelection,
         model: &ResultListModel,
         columns: &[ResultColumn],
+        widths: &Rc<RefCell<Vec<ColumnWidth>>>,
     ) -> gtk4::ColumnView {
         let view = gtk4::ColumnView::new(Some(selection.clone()));
         view.add_css_class("result-table");
@@ -655,10 +780,13 @@ impl ResultPanel {
             let title = column.name.replace('_', "__");
             let view_column = gtk4::ColumnViewColumn::new(Some(&title), Some(factory));
             view_column.set_resizable(true);
-            view_column.set_fixed_width(column_width(&view, &column.name, &[], index));
+            view_column.set_fixed_width(
+                column_width(&view, &column.name, &[], index).min(MAX_COLUMN_WIDTH),
+            );
             view.append_column(&view_column);
         }
 
+        let widths = widths.clone();
         let weak_view = view.downgrade();
         let weak_model = model.downgrade();
         let sized = Rc::new(Cell::new(false));
@@ -683,10 +811,12 @@ impl ResultPanel {
                     &rows,
                     index as usize - 1,
                 );
-                if width > column.fixed_width() {
-                    column.set_fixed_width(width);
-                }
+                widths.borrow_mut().push(ColumnWidth::Automatic {
+                    preferred: width,
+                    assigned: column.fixed_width(),
+                });
             }
+            size_columns(&view, &widths);
             None
         });
 
@@ -919,12 +1049,29 @@ impl ResultPanel {
         let Some(table) = table.as_ref() else {
             return;
         };
-        let (horizontal, vertical) = self.0.pending_scroll.take().unwrap_or_else(|| {
-            (
-                self.0.scroll.hadjustment().value(),
-                self.0.scroll.vadjustment().value(),
-            )
-        });
+        let (mut horizontal, mut vertical) = self
+            .0
+            .pending_scroll
+            .take()
+            .map(|scroll| scroll.target)
+            .unwrap_or_else(|| {
+                (
+                    self.0.scroll.hadjustment().value(),
+                    self.0.scroll.vadjustment().value(),
+                )
+            });
+        if self
+            .0
+            .document
+            .borrow()
+            .as_ref()
+            .is_some_and(|document| document.feedback.progress.is_none())
+            && !self.is_loading()
+        {
+            let (h, v) = (self.0.scroll.hadjustment(), self.0.scroll.vadjustment());
+            horizontal = horizontal.min((h.upper() - h.page_size()).max(0.0));
+            vertical = vertical.min((v.upper() - v.page_size()).max(0.0));
+        }
         self.0.restore.replace(Some(Restore {
             columns: table.columns.clone(),
             row: first_selected(&table.selection),
@@ -975,9 +1122,9 @@ impl ResultPanel {
                     self.0.column.set(position.column);
                     table.selection.select_item(position.row as u32, true);
                 }
-                self.0
-                    .pending_scroll
-                    .set(Some((restore.horizontal, restore.vertical)));
+                self.0.pending_scroll.set(Some(ScrollRestore {
+                    target: (restore.horizontal, restore.vertical),
+                }));
                 self.schedule_pending_scroll();
             }
             Some(RestorationState::SchemaChanged) => {}
@@ -990,31 +1137,36 @@ impl ResultPanel {
     }
 
     fn schedule_pending_scroll(&self) {
-        if self.0.pending_scroll.get().is_none() || self.0.scroll_scheduled.replace(true) {
-            return;
+        if self.0.pending_scroll.get().is_some() {
+            self.0.scroll.queue_draw();
         }
-        let weak = Rc::downgrade(&self.0);
-        glib::idle_add_local_once(move || {
-            if let Some(inner) = weak.upgrade() {
-                inner.scroll_scheduled.set(false);
-                ResultPanel(inner).apply_pending_scroll();
-            }
-        });
     }
 
     fn apply_pending_scroll(&self) {
-        let Some((horizontal, vertical)) = self.0.pending_scroll.get() else {
+        let Some(pending) = self.0.pending_scroll.get() else {
             return;
         };
+        if self.0.retired.get() || self.0.load_error.borrow().is_some() {
+            return;
+        }
         let (h, v) = (self.0.scroll.hadjustment(), self.0.scroll.vadjustment());
+        let terminal = self
+            .0
+            .document
+            .borrow()
+            .as_ref()
+            .is_some_and(|document| document.feedback.progress.is_none());
+        let (mut horizontal, mut vertical) = pending.target;
+        if terminal {
+            horizontal = horizontal.min((h.upper() - h.page_size()).max(0.0));
+            vertical = vertical.min((v.upper() - v.page_size()).max(0.0));
+        }
         h.set_value(horizontal);
         v.set_value(vertical);
-        if (h.value() - horizontal).abs() < 0.5 && (v.value() - vertical).abs() < 0.5 {
-            self.0.pending_scroll.set(None);
-        }
     }
 
     pub fn focus(&self) -> bool {
+        self.0.pending_scroll.set(None);
         let view = self
             .0
             .table
@@ -1326,6 +1478,7 @@ impl ResultPanel {
     }
 
     fn move_inspected_row(&self, direction: i64) {
+        self.0.pending_scroll.set(None);
         let table = self.0.table.borrow();
         let Some(table) = table.as_ref() else {
             return;
@@ -1783,5 +1936,18 @@ fn column_width(
         let (_, natural, _, _) = measure.measure(gtk4::Orientation::Horizontal, -1);
         width = width.max(natural + CELL_SPACE);
     }
-    width.clamp(48, MAX_COLUMN_WIDTH)
+    width.max(48)
+}
+
+#[cfg(test)]
+mod width_tests {
+    use super::fit_widths;
+
+    #[test]
+    fn spare_width_only_expands_columns_with_clipped_content() {
+        assert_eq!(fit_widths(&[56, 360], &[56, 720], 1000), [56, 720]);
+        assert_eq!(fit_widths(&[56, 360], &[56, 720], 600), [56, 544]);
+        assert_eq!(fit_widths(&[56, 360], &[56, 720], 300), [56, 360]);
+        assert_eq!(fit_widths(&[56, 120], &[56, 120], 1000), [56, 120]);
+    }
 }

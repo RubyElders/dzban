@@ -109,7 +109,9 @@ impl DatabaseSession for Session {
             for id in 0..3 {
                 sink.row(vec![
                     ResultCell::Text(id.to_string()),
-                    if id == 1 {
+                    if sql == "long value" {
+                        ResultCell::Text("x".repeat(80))
+                    } else if id == 1 {
                         ResultCell::Null
                     } else {
                         ResultCell::Text(format!("row {id}"))
@@ -262,6 +264,28 @@ fn wait_until(what: &str, mut predicate: impl FnMut() -> bool) {
 }
 
 impl Harness {
+    fn capture(&self, name: &str) {
+        let Some(directory) = std::env::var_os("DZBAN_TEST_SCREENSHOTS") else {
+            return;
+        };
+        let directory = std::path::PathBuf::from(directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let paintable = gtk4::WidgetPaintable::new(Some(&self.window));
+        let snapshot = gtk4::Snapshot::new();
+        paintable.snapshot(
+            &snapshot,
+            self.window.width() as f64,
+            self.window.height() as f64,
+        );
+        let node = snapshot.to_node().unwrap();
+        self.window
+            .renderer()
+            .unwrap()
+            .render_texture(&node, None)
+            .save_to_png(directory.join(format!("{name}.png")))
+            .unwrap();
+    }
+
     fn selected(&self) -> TabPage {
         self.shell.workspace().selected().unwrap()
     }
@@ -513,6 +537,167 @@ fn rerunning_the_same_query_returns_to_the_scrolled_view() {
                 && (current.vadjustment().unwrap().value() - before.1).abs() < 1.0
         })
     });
+}
+
+#[gtk4::test]
+#[ignore = "requires a graphical display"]
+fn repeated_fast_queries_keep_the_viewport_after_layout_settles() {
+    let harness = harness();
+    let page = harness.connect("fixture");
+    harness.run(&page, "wide");
+    harness.finished(&page);
+    wait_until("streamed rows", || page.results().available_rows() == 500);
+    let table = page.results().table().unwrap();
+    let stack = table
+        .ancestor(gtk4::Stack::static_type())
+        .and_downcast::<gtk4::Stack>()
+        .unwrap();
+    wait_until("the workspace transition", || {
+        !stack.is_transition_running()
+    });
+    wait_until("the first page", || !page.results().is_loading());
+    let (horizontal, vertical) = (table.hadjustment().unwrap(), table.vadjustment().unwrap());
+    wait_until("a scrollable table", || {
+        horizontal.upper() > 2000.0 && vertical.upper() > 10000.0
+    });
+    horizontal.set_value(1700.0);
+    vertical.set_value(8000.0);
+    gtk4::test_widget_wait_for_draw(&table);
+    wait_until("the visible page", || !page.results().is_loading());
+    for _ in 0..3 {
+        gtk4::test_widget_wait_for_draw(&table);
+    }
+    let before = (horizontal.value(), vertical.value());
+    harness.capture("scroll-before");
+    for repeat in 0..6 {
+        harness.run(&page, "wide");
+        harness.finished(&page);
+        wait_until("the replacement table", || {
+            page.results().available_rows() == 500
+                && page
+                    .results()
+                    .table()
+                    .is_some_and(|current| current != table)
+        });
+        let current = page.results().table().unwrap();
+        assert!(
+            page.results().issues().is_empty(),
+            "a retired result reader reported an error in the new result"
+        );
+        let mut stable_since = None;
+        let started = Instant::now();
+        wait_until("the restored viewport", || {
+            assert!(
+                started.elapsed() < Duration::from_secs(4),
+                "expected {before:?}, current {:?}, extent {:?}",
+                (
+                    current.hadjustment().unwrap().value(),
+                    current.vadjustment().unwrap().value()
+                ),
+                (
+                    current.hadjustment().unwrap().upper(),
+                    current.vadjustment().unwrap().upper()
+                )
+            );
+            let restored = (current.hadjustment().unwrap().value() - before.0).abs() < 1.0
+                && (current.vadjustment().unwrap().value() - before.1).abs() < 1.0
+                && !page.results().is_loading();
+            if !restored {
+                stable_since = None;
+                return false;
+            }
+            stable_since.get_or_insert_with(Instant::now).elapsed() >= Duration::from_millis(200)
+        });
+        for frame in 0..12 {
+            gtk4::test_widget_wait_for_draw(&current);
+            assert!(
+                (current.hadjustment().unwrap().value() - before.0).abs() <= 2.0
+                    && (current.vadjustment().unwrap().value() - before.1).abs() <= 2.0,
+                "repeat {repeat}, frame {frame}: expected {before:?}, got {:?}",
+                (
+                    current.hadjustment().unwrap().value(),
+                    current.vadjustment().unwrap().value()
+                )
+            );
+        }
+    }
+    harness.capture("scroll-after");
+    let current = page.results().table().unwrap();
+    let scroll = current
+        .ancestor(gtk4::ScrolledWindow::static_type())
+        .and_downcast::<gtk4::ScrolledWindow>()
+        .unwrap();
+    let controllers = scroll.observe_controllers();
+    let wheel = (0..controllers.n_items())
+        .find_map(|index| {
+            controllers
+                .item(index)
+                .and_downcast::<gtk4::EventControllerScroll>()
+        })
+        .unwrap();
+    wheel.emit_by_name::<bool>("scroll", &[&0.0_f64, &1.0_f64]);
+    current.vadjustment().unwrap().set_value(4000.0);
+    for _ in 0..12 {
+        gtk4::test_widget_wait_for_draw(&current);
+        assert!(
+            current.vadjustment().unwrap().value() < 4500.0,
+            "saved scroll overrode a user scroll"
+        );
+    }
+}
+
+#[gtk4::test]
+#[ignore = "requires a graphical display"]
+fn long_values_use_spare_table_width_without_stretching_short_columns() {
+    let harness = harness();
+    let page = harness.connect("fixture");
+    harness.run(&page, "long value");
+    harness.finished(&page);
+    wait_until("streamed rows", || page.results().available_rows() == 3);
+    let table = page.results().table().unwrap();
+    gtk4::test_widget_wait_for_draw(&table);
+    wait_until("loaded values", || !page.results().is_loading());
+    for _ in 0..3 {
+        gtk4::test_widget_wait_for_draw(&table);
+    }
+    let columns = table.columns();
+    let id = columns
+        .item(1)
+        .and_downcast::<gtk4::ColumnViewColumn>()
+        .unwrap();
+    let value = columns
+        .item(2)
+        .and_downcast::<gtk4::ColumnViewColumn>()
+        .unwrap();
+    assert!(id.fixed_width() < 100);
+    assert!(
+        value.fixed_width() > 600,
+        "long value width: {}",
+        value.fixed_width()
+    );
+    assert!(table.hadjustment().unwrap().upper() <= table.hadjustment().unwrap().page_size() + 1.0);
+    let stack = table
+        .ancestor(gtk4::Stack::static_type())
+        .and_downcast::<gtk4::Stack>()
+        .unwrap();
+    wait_until("the workspace transition", || {
+        !stack.is_transition_running()
+    });
+    gtk4::test_widget_wait_for_draw(&table);
+    harness.capture("columns-wide");
+    let wide = value.fixed_width();
+    harness.window.set_default_size(700, 760);
+    wait_until("columns fitting a smaller window", || {
+        value.fixed_width() < wide
+    });
+    harness.window.set_default_size(1150, 760);
+    wait_until("columns using the larger window", || {
+        value.fixed_width() == wide
+    });
+    value.set_fixed_width(420);
+    harness.window.set_default_size(900, 760);
+    gtk4::test_widget_wait_for_draw(&table);
+    assert_eq!(value.fixed_width(), 420);
 }
 
 #[gtk4::test]
