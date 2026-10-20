@@ -505,6 +505,8 @@ final class ShellTests: XCTestCase {
         app.typeKey("l", modifierFlags: .command)
         app.typeText("Next Query Tab")
         waitForValue("Next Query Tab", in: search)
+        XCTAssertEqual(app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH 'connection.close.'")).count, 1)
+        XCTAssertFalse(app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH 'tab.close.'")).firstMatch.exists)
         XCTAssertFalse(app.buttons["action.next-query"].isEnabled)
         app.typeKey(.return, modifierFlags: [])
         XCTAssertTrue(app.buttons["action.next-query"].exists)

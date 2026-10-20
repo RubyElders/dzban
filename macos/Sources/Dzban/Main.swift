@@ -67,7 +67,7 @@ struct DzbanApp: App {
                         #if DZBAN_TEST_FIXTURES
                         let arguments = ProcessInfo.processInfo.arguments
                         if let index = arguments.firstIndex(of: "--fixture-query"), arguments.indices.contains(index + 1) {
-                            await store.loadProfiles()
+                            await store.start()
                             if await store.connect(profile: "fixture"), let session = store.selectedSession, let document = store.document {
                                 do {
                                     let _: Submission = try await store.bridge.request(.submit(session: session, document: document.document, sql: arguments[index + 1]), as: Submission.self)
