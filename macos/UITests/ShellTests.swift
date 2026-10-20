@@ -200,7 +200,7 @@ final class ShellTests: XCTestCase {
         waitForValue("0", in: app.textViews["cell.value"])
         app.typeKey(.escape, modifierFlags: [])
         app.typeKey(.escape, modifierFlags: [])
-        table.scroll(byDeltaX: -25000, deltaY: 0)
+        scrollInSteps(table, dx: -25000, dy: 0)
         waitForValue("r0c127", in: app.descendants(matching: .any)["result.cell.0.127"])
         XCTAssertEqual(number.frame.minX, left, accuracy: 1)
         XCTAssertTrue(header.isHittable)
@@ -208,7 +208,7 @@ final class ShellTests: XCTestCase {
         XCTAssertEqual(number.value as? String, "1")
         number.click()
         capture("Fixed row numbers and full row selection during horizontal scrolling")
-        table.scroll(byDeltaX: 0, deltaY: -13000)
+        scrollInSteps(table, dx: 0, dy: -13000)
         let last = app.buttons["result.row-number.499"]
         XCTAssertTrue(last.waitForExistence(timeout: 5))
         XCTAssertEqual(last.value as? String, "500")
@@ -1030,8 +1030,8 @@ final class ShellTests: XCTestCase {
         }
         submitResultQuery("wide")
         waitForValue("Complete - 500 rows", in: app.staticTexts["results.status"])
-        table.scroll(byDeltaX: -25000, deltaY: 0)
-        table.scroll(byDeltaX: 0, deltaY: -13000)
+        scrollInSteps(table, dx: -25000, dy: 0)
+        scrollInSteps(table, dx: 0, dy: -13000)
         waitForValue("r499c127", in: app.descendants(matching: .any)["result.cell.499.127"])
         let lastColumn = table.descendants(matching: .tableColumn).matching(NSPredicate(format: "label == %@", "column_127")).firstMatch
         XCTAssertGreaterThanOrEqual(lastColumn.frame.width, 160)
@@ -1129,8 +1129,8 @@ final class ShellTests: XCTestCase {
         app.typeKey(.return, modifierFlags: .command)
         waitForValue("Complete - 500 rows", in: app.staticTexts["results.status"])
         waitForValue("r0c2", in: app.descendants(matching: .any)["result.cell.0.2"])
-        app.tables["results.table"].scroll(byDeltaX: -25000, deltaY: 0)
-        app.tables["results.table"].scroll(byDeltaX: 0, deltaY: -13000)
+        scrollInSteps(app.tables["results.table"], dx: -25000, dy: 0)
+        scrollInSteps(app.tables["results.table"], dx: 0, dy: -13000)
         waitForValue("r499c127", in: app.descendants(matching: .any)["result.cell.499.127"])
         try recordViewportMetrics("Huge cell and wide replacement measurements")
         app.typeKey("q", modifierFlags: .command)
@@ -1144,11 +1144,11 @@ final class ShellTests: XCTestCase {
         app.menuBars.menuBarItems["Testing"].click()
         app.menuItems["Reset Viewport Metrics"].click()
         let table = app.tables["results.table"]
-        table.scroll(byDeltaX: -25000, deltaY: 0)
-        table.scroll(byDeltaX: 0, deltaY: -13000)
+        scrollInSteps(table, dx: -25000, dy: 0)
+        scrollInSteps(table, dx: 0, dy: -13000)
         waitForValue("r499c127", in: app.descendants(matching: .any)["result.cell.499.127"])
-        table.scroll(byDeltaX: 25000, deltaY: 0)
-        table.scroll(byDeltaX: 0, deltaY: 13000)
+        scrollInSteps(table, dx: 25000, dy: 0)
+        scrollInSteps(table, dx: 0, dy: 13000)
         waitForValue("r0c2", in: app.descendants(matching: .any)["result.cell.0.2"])
         try recordViewportMetrics("Wide result resource measurements")
         app.typeKey("q", modifierFlags: .command)
@@ -1193,8 +1193,8 @@ final class ShellTests: XCTestCase {
         app.typeText("wide")
         waitForValue("wide", in: editor)
         let table = app.tables["results.table"]
-        table.scroll(byDeltaX: -25000, deltaY: 0)
-        table.scroll(byDeltaX: 0, deltaY: -13000)
+        scrollInSteps(table, dx: -25000, dy: 0)
+        scrollInSteps(table, dx: 0, dy: -13000)
         let last = app.descendants(matching: .any)["result.cell.499.127"]
         waitForValue("r499c127", in: last)
         last.click()
@@ -1524,7 +1524,7 @@ final class ShellTests: XCTestCase {
         wait(for: [centered], timeout: 5)
         capture("Row preview centered on selected column")
         app.buttons["row.close"].click()
-        table.scroll(byDeltaX: -25000, deltaY: 0)
+        scrollInSteps(table, dx: -25000, dy: 0)
         let lastCell = app.descendants(matching: .any)["result.cell.0.127"]
         XCTAssertTrue(lastCell.waitForExistence(timeout: 5))
         lastCell.click()
@@ -1927,6 +1927,13 @@ final class ShellTests: XCTestCase {
         app.launchArguments += ["-ApplePersistenceIgnoreState", "YES", "--metrics-output", fixtureDirectory.appendingPathComponent("viewport.json").path]
         app.launchArguments += ["--test-pasteboard", fixtureDirectory.lastPathComponent]
         app.launch()
+    }
+
+    private func scrollInSteps(_ element: XCUIElement, dx: CGFloat, dy: CGFloat) {
+        let steps = max(1, Int((max(abs(dx), abs(dy)) / 2000).rounded(.up)))
+        for _ in 0..<steps {
+            element.scroll(byDeltaX: dx / CGFloat(steps), deltaY: dy / CGFloat(steps))
+        }
     }
 
     private func waitForValue(_ value: String, in element: XCUIElement) {

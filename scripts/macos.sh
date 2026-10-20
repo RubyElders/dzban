@@ -125,6 +125,8 @@ test_ui() {
     result_root=$(mktemp -d "$repo_root/target/macos-ui-results.XXXXXX")
     xcodebuild -xctestrun "$run" -destination 'platform=macOS,arch=arm64' \
         -resultBundlePath "$result_root/Shell.xcresult" -parallel-testing-enabled NO \
+        -test-timeouts-enabled YES -default-test-execution-time-allowance 180 \
+        -maximum-test-execution-time-allowance 300 \
         "${tests[@]}" test-without-building
 }
 
