@@ -35,7 +35,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [build-dependencies]
-glib-build-tools = "0.21"
+glib-build-tools = "0.22"
 
 [dev-dependencies]
 async-trait.workspace = true
