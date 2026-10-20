@@ -90,7 +90,7 @@ public final class ApplicationStore: ObservableObject, QueryInteractionHost {
     let responsiveness = MainThreadProbe()
     #endif
     private let workspaceLocation: WorkspaceLocation?
-    private var started = false
+    private var startup: Task<Void, Never>?
     private var restoring = false
     private var controlRevision: UInt64 = 0
     private var navigationRevision: UInt64 = 0
@@ -137,8 +137,13 @@ public final class ApplicationStore: ObservableObject, QueryInteractionHost {
     }
 
     public func start() async {
-        guard !started else { return }
-        started = true
+        if let startup { await startup.value; return }
+        let startup = Task { await self.restoreWorkspace() }
+        self.startup = startup
+        await startup.value
+    }
+
+    private func restoreWorkspace() async {
         restoring = true
         reportAttentionLifecycle()
         defer { restoring = false; reportAttentionLifecycle() }

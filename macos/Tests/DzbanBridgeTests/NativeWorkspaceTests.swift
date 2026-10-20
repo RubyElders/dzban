@@ -4,6 +4,28 @@ import XCTest
 
 @MainActor
 final class NativeWorkspaceTests: XCTestCase {
+    func testConcurrentStartupWaitsForTheSameRestoredWorkspace() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("workspace.json")
+        try Data(#"{"version":1,"tabs":[{"profile":"fixture-slow","draft":"keep draft"}],"selected":0}"#.utf8).write(to: url)
+        let store = ApplicationStore(bridge: try Bridge.fixture(), restorationURL: url)
+        let starting = Task { await store.start() }
+        let deadline = ContinuousClock.now + .seconds(5)
+        while store.pages.first?.phase != .connecting {
+            if ContinuousClock.now >= deadline { throw ViewportFailure("Restoration was not admitted") }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        await store.start()
+        XCTAssertNotNil(store.selectedSession)
+        XCTAssertEqual(store.pages.count, 1)
+        XCTAssertEqual(store.document?.draft, "keep draft")
+        await starting.value
+        try await assertSharedInventory(store)
+        try await store.shutdown()
+    }
+
     func testSharedRestoreConnectionCanBeCanceledAndRetriedFromTheNativeChooser() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
