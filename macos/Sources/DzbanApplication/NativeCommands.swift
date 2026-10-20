@@ -56,6 +56,15 @@ public struct NativeCommands: Commands {
             CommandMenu("Testing") {
                 Button("Reset Viewport Metrics") { store.resetResultMetrics() }
                 Button("Record Viewport Metrics") { Task { await store.recordResultMetrics() } }
+                ForEach([900, 960, 1030, 1150, 1200], id: \.self) { width in
+                    Button("Resize Window to \(String(width))") {
+                        guard let window = NSApp.keyWindow else { return }
+                        let height = width == 900 ? 560 : width == 960 ? 620 : width == 1030 ? 700 : 760
+                        var frame = window.frame
+                        frame.size = NSSize(width: width, height: height)
+                        window.setFrame(frame, display: true)
+                    }
+                }
             }
         }
         #endif

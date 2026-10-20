@@ -99,6 +99,35 @@ final class ViewPublicationTests: XCTestCase {
         try await bridge.shutdown()
     }
 
+    func testWideSchemaKeepsColumnWidthsAfterNarrowResultsAndWindowResize() async throws {
+        let store = ApplicationStore(bridge: try Bridge.fixture())
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1200, height: 760), styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+        window.contentView = NSHostingView(rootView: RootView(store: store))
+        window.makeKeyAndOrderFront(nil)
+        defer { window.contentView = NSView(); window.orderOut(nil) }
+        await store.start()
+        let connected = await store.connect(profile: "fixture")
+        XCTAssertTrue(connected)
+        for (sql, count) in [("single", 1), ("few", 2), ("wide", 128)] {
+            let document = try XCTUnwrap(store.document)
+            store.editor(for: document).restore(text: sql)
+            await store.performEditorIntent(.submit)
+            try await until {
+                (store.document?.generation ?? 0) > document.generation
+                    && store.document?.execution == .finished && store.results.columns.count == count
+                    && self.resultTable(in: window.contentView)?.numberOfColumns == count
+            }
+        }
+        let table = try XCTUnwrap(resultTable(in: window.contentView))
+        for width in [1200.0, 960.0, 1150.0] {
+            window.setContentSize(NSSize(width: width, height: 760))
+            window.contentView?.layoutSubtreeIfNeeded()
+            await Task.yield()
+            XCTAssertEqual(table.tableColumns.last?.width ?? 0, 170, accuracy: 1)
+        }
+        try await store.shutdown()
+    }
+
     func testRerunAndInspectorDoNotPublishDuringNativeViewUpdates() async throws {
         ViewUpdateDiagnostics.reset()
         ViewUpdateDiagnostics.enabled = true
