@@ -144,6 +144,7 @@ struct RowInspectorView: View {
             }
         }
         .frame(width: 640, height: 460)
+        .background(RowInspectorKeyboard(owner: model.anchorView?.window, handle: handleKey))
         .onChange(of: model.address) { old, new in
             positionedColumn = nil
             focusedColumn = nil
@@ -186,12 +187,6 @@ struct RowInspectorView: View {
                             .onTapGesture { select(index) }
                             .focusable().focusEffectDisabled()
                             .focused($focusedColumn, equals: index)
-                            .onKeyPress(.upArrow) { move(-1); return .handled }
-                            .onKeyPress(.downArrow) { move(1); return .handled }
-                            .onKeyPress(.leftArrow) { Task { @MainActor in moveRow(-1) }; return .handled }
-                            .onKeyPress(.rightArrow) { Task { @MainActor in moveRow(1) }; return .handled }
-                            .onKeyPress(.return) { Task { @MainActor in openSelectedCell() }; return .handled }
-                            .onKeyPress(.space, phases: .down) { _ in Task { @MainActor in openSelectedCell() }; return .handled }
                             .background(selectedColumn == index ? Color.accentColor.opacity(0.12) : Color.clear, in: RoundedRectangle(cornerRadius: 4))
                             .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(selectedColumn == index ? Color.accentColor : Color.clear, lineWidth: 1.5))
                             .accessibilityElement(children: .contain)
@@ -246,6 +241,27 @@ struct RowInspectorView: View {
         focusedColumn = column
     }
 
+    private func handleKey(_ event: NSEvent) -> Bool {
+        guard model.address != nil, model.inspectedCell == nil else { return false }
+        switch event.keyCode {
+        case 123: Task { @MainActor in moveRow(-1) }
+        case 124: Task { @MainActor in moveRow(1) }
+        case 125: move(1)
+        case 126: move(-1)
+        case 36, 76, 49:
+            if !event.isARepeat { Task { @MainActor in openSelectedCell() } }
+        default:
+            switch event.charactersIgnoringModifiers {
+            case "h": Task { @MainActor in moveRow(-1) }
+            case "l": Task { @MainActor in moveRow(1) }
+            case "j": move(1)
+            case "k": move(-1)
+            default: return false
+            }
+        }
+        return true
+    }
+
     private func move(_ direction: Int) {
         guard !columns.isEmpty else { return }
         selectedColumn = min(max(0, (selectedColumn ?? 0) + direction), columns.count - 1)
@@ -266,6 +282,57 @@ struct RowInspectorView: View {
         model.inspectedCell = ResultAddress(scope: address.scope, row: address.row, column: column)
     }
 
+}
+
+struct RowInspectorKeyboard: NSViewRepresentable {
+    let owner: NSWindow?
+    let handle: (NSEvent) -> Bool
+    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        context.coordinator.attach(view, owner: owner, handle: handle)
+        return view
+    }
+    func updateNSView(_ view: NSView, context: Context) {
+        context.coordinator.owner = owner
+        context.coordinator.handle = handle
+    }
+    static func dismantleNSView(_ view: NSView, coordinator: Coordinator) { coordinator.detach() }
+
+    @MainActor
+    final class Coordinator {
+        weak var view: NSView?
+        weak var owner: NSWindow?
+        var handle: ((NSEvent) -> Bool)?
+        private var monitor: Any?
+        private struct EventResult: @unchecked Sendable { let event: NSEvent? }
+        func attach(_ view: NSView, owner: NSWindow? = nil, handle: @escaping (NSEvent) -> Bool) {
+            detach()
+            self.view = view
+            self.owner = owner
+            self.handle = handle
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                MainActor.assumeIsolated {
+                    guard let self else { return EventResult(event: event) }
+                    return EventResult(event: self.route(event))
+                }.event
+            }
+        }
+        func route(_ event: NSEvent) -> NSEvent? {
+            guard event.type == .keyDown, let window = view?.window,
+                  event.window === window || (owner != nil && event.window === owner),
+                  event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty,
+                  handle?(event) == true else { return event }
+            return nil
+        }
+        func detach() {
+            if let monitor { NSEvent.removeMonitor(monitor) }
+            monitor = nil
+            view = nil
+            owner = nil
+            handle = nil
+        }
+    }
 }
 
 struct RowPopover: NSViewRepresentable {

@@ -127,7 +127,8 @@ final class ShellTests: XCTestCase {
         for _ in 0..<2 {
             for (key, title, value) in [(XCUIKeyboardKey.rightArrow, "Row 2", "1"), (XCUIKeyboardKey(rawValue: "l"), "Row 3", "2"),
                                         (.rightArrow, "Row 3", "2"), (XCUIKeyboardKey(rawValue: "h"), "Row 2", "1"),
-                                        (.leftArrow, "Row 1", "0"), (.leftArrow, "Row 1", "0")] {
+                                        (.leftArrow, "Row 1", "0"), (XCUIKeyboardKey(rawValue: "h"), "Row 1", "0"),
+                                        (XCUIKeyboardKey(rawValue: "l"), "Row 2", "1"), (.leftArrow, "Row 1", "0")] {
                 app.typeKey(key, modifierFlags: [])
                 waitForValue(title, in: app.staticTexts["row.title"])
                 waitForValue(value, in: app.staticTexts["row.value.0"])
