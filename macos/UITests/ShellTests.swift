@@ -768,7 +768,7 @@ final class ShellTests: XCTestCase {
         app.typeKey("q", modifierFlags: .command)
         let acknowledgment = app.windows.buttons["OK"]
         XCTAssertTrue(acknowledgment.waitForExistence(timeout: 5))
-        XCTAssertTrue(app.staticTexts["Fixture cleanup rejected once"].exists)
+        XCTAssertTrue(app.staticTexts["Fixture cleanup rejected once"].waitForExistence(timeout: 5), app.debugDescription)
         acknowledgment.click()
         XCTAssertTrue(app.windows.firstMatch.exists)
         app.typeKey("q", modifierFlags: .command)
