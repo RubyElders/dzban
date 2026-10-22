@@ -295,6 +295,11 @@ impl TabPage {
         self.0.stack.visible_child_name().as_deref() == Some("workspace")
     }
 
+    #[cfg(test)]
+    pub fn is_transitioning(&self) -> bool {
+        self.0.stack.is_transition_running()
+    }
+
     pub fn is_ready(&self) -> bool {
         let tab = self.0.tab.borrow();
         tab.phase == TabPhase::Ready && tab.engine.is_some()

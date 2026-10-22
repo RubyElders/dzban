@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use dzban_core::adapter::{AdapterFactory, AdapterRegistry, DatabaseSession};
 use dzban_core::application::ApplicationContext;
 use dzban_core::error::ExecutionError;
-use dzban_core::health::ProbeState;
+use dzban_core::health::{ProbeState, RecoveryPhase};
 use dzban_core::{DatabaseBackend, DatabaseConfig, QueryPlan, ResultSet};
 use tokio::sync::Notify;
 
@@ -26,13 +26,16 @@ struct Session {
     closes: AtomicUsize,
     pings: AtomicUsize,
     versions: AtomicUsize,
+    reject_version: AtomicBool,
     ping_entered: Notify,
     ping_release: Notify,
     block_ping: AtomicBool,
     reject_ping: AtomicBool,
+    disconnected: AtomicBool,
     query_entered: Notify,
     query_release: Notify,
     block_query: AtomicBool,
+    executions: AtomicUsize,
 }
 
 #[async_trait]
@@ -46,8 +49,20 @@ impl DatabaseSession for Session {
         if self.reject_connect.swap(false, Ordering::SeqCst) {
             Err("connection rejected once".into())
         } else {
+            self.disconnected.store(false, Ordering::SeqCst);
             Ok(())
         }
+    }
+    async fn reconnect_if_needed(
+        &self,
+        started: &(dyn Fn() + Send + Sync),
+    ) -> Result<bool, ExecutionError> {
+        if !self.disconnected.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        started();
+        self.connect().await.map_err(ExecutionError::from)?;
+        Ok(true)
     }
     async fn disconnect(&self) -> Result<(), ExecutionError> {
         self.closes.fetch_add(1, Ordering::SeqCst);
@@ -67,7 +82,9 @@ impl DatabaseSession for Session {
         if self.block_ping.load(Ordering::SeqCst) {
             self.ping_release.notified().await;
         }
-        if self.reject_ping.swap(false, Ordering::SeqCst) {
+        if self.disconnected.load(Ordering::SeqCst) {
+            Err("transport closed".into())
+        } else if self.reject_ping.swap(false, Ordering::SeqCst) {
             Err("probe failed once".into())
         } else {
             Ok(u64::MAX)
@@ -82,6 +99,9 @@ impl DatabaseSession for Session {
     }
     async fn version(&self) -> Result<String, String> {
         self.versions.fetch_add(1, Ordering::SeqCst);
+        if self.reject_version.swap(false, Ordering::SeqCst) {
+            return Err("version failed once".into());
+        }
         Ok("fixture".into())
     }
     async fn explain(&self, _: &str) -> Result<QueryPlan, String> {
@@ -96,6 +116,7 @@ impl DatabaseSession for Session {
         _: &str,
         sink: &mut dzban_core::result_stream::ResultSink,
     ) -> Result<Option<dzban_core::CommandAcknowledgment>, ExecutionError> {
+        self.executions.fetch_add(1, Ordering::SeqCst);
         sink.schema(vec![dzban_core::ResultColumn {
             name: "value".into(),
             type_name: "text".into(),
@@ -156,6 +177,10 @@ async fn session_probe_waiters_share_work_without_canceling_the_owner() {
         .unwrap();
     assert_eq!(overlapping.state, ProbeState::Busy);
     assert!(context.health.snapshot().sessions[0].status.probing);
+    assert_eq!(
+        context.health.snapshot().sessions[0].status.recovery,
+        RecoveryPhase::Idle
+    );
     drop(first);
     assert_eq!(session.pings.load(Ordering::SeqCst), 1);
     session.block_ping.store(false, Ordering::SeqCst);
@@ -214,6 +239,205 @@ async fn session_probe_respects_admission_and_can_retry_a_transport_failure() {
         .await
         .unwrap();
     assert_eq!(recovered.state, ProbeState::Connected);
+    context.start_shutdown().unwrap().wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn recovery_keeps_tab_document_and_results_and_owns_connection_admission() {
+    let (context, session, profile) = fixture();
+    let engine = context.start_connect_tab(profile).wait().await.unwrap();
+    let tab = context.tabs.session(engine.id()).unwrap();
+    tab.submit("SELECT original".into(), Default::default(), None)
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    let generation = tab.document.snapshot().output_generation;
+    tab.document.set_draft("SELECT preserved".into());
+    session.disconnected.store(true, Ordering::SeqCst);
+    session.block_connect.store(true, Ordering::SeqCst);
+    let recovery = context.health.check_tab(&context, tab.id);
+    reached(&session.connect_entered).await;
+    wait_for_connects(&session, 2).await;
+    assert!(context.health.snapshot().sessions[0].status.probing);
+    assert_eq!(
+        context.health.snapshot().sessions[0].status.recovery,
+        RecoveryPhase::Reconnecting
+    );
+    assert!(matches!(engine.start_ping(), Err(ExecutionError::Busy)));
+    let joined = context.health.check_tab(&context, tab.id);
+    drop(recovery);
+    session.block_connect.store(false, Ordering::SeqCst);
+    session.connect_release.notify_one();
+    let result = joined.wait().await.unwrap();
+    assert_eq!(result.state, ProbeState::Connected);
+    assert!(result.reconnected);
+    assert_eq!(context.health.snapshot().sessions[0].status.recoveries, 1);
+    assert_eq!(
+        context.health.snapshot().sessions[0].status.recovery,
+        RecoveryPhase::Idle
+    );
+    let current = context.tabs.find(tab.id).unwrap();
+    assert_eq!(current.engine.unwrap().id(), engine.id());
+    assert_eq!(current.document.id(), tab.document.id());
+    assert_eq!(current.document.draft(), "SELECT preserved");
+    assert_eq!(current.document.snapshot().output_generation, generation);
+    assert_eq!(session.executions.load(Ordering::SeqCst), 1);
+    assert_eq!(context.tabs.snapshot().selected, Some(tab.id));
+    assert_eq!(session.connects.load(Ordering::SeqCst), 2);
+    context.start_shutdown().unwrap().wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn recovery_survives_failed_version_lookup_and_invalidates_cached_metadata() {
+    let (context, session, profile) = fixture();
+    let engine = context.start_connect_tab(profile).wait().await.unwrap();
+    let tab = context.tabs.session(engine.id()).unwrap();
+    context
+        .health
+        .check_tab(&context, tab.id)
+        .wait()
+        .await
+        .unwrap();
+    assert_eq!(
+        context.health.snapshot().sessions[0]
+            .status
+            .version
+            .as_deref(),
+        Some("fixture")
+    );
+    session.disconnected.store(true, Ordering::SeqCst);
+    session.reject_version.store(true, Ordering::SeqCst);
+    let result = context
+        .health
+        .check_tab(&context, tab.id)
+        .wait()
+        .await
+        .unwrap();
+    assert_eq!(result.state, ProbeState::Error);
+    assert!(result.reconnected);
+    let status = &context.health.snapshot().sessions[0].status;
+    assert_eq!(status.recoveries, 1);
+    assert!(status.version.is_none());
+    let result = context
+        .health
+        .check_tab(&context, tab.id)
+        .wait()
+        .await
+        .unwrap();
+    assert_eq!(result.state, ProbeState::Connected);
+    assert!(!result.reconnected);
+    let status = &context.health.snapshot().sessions[0].status;
+    assert_eq!(status.recoveries, 1);
+    assert_eq!(status.version.as_deref(), Some("fixture"));
+    context.start_shutdown().unwrap().wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn recovery_survives_failed_post_connect_ping() {
+    let (context, session, profile) = fixture();
+    let engine = context.start_connect_tab(profile).wait().await.unwrap();
+    let tab = context.tabs.session(engine.id()).unwrap();
+    context
+        .health
+        .check_tab(&context, tab.id)
+        .wait()
+        .await
+        .unwrap();
+    session.disconnected.store(true, Ordering::SeqCst);
+    session.reject_ping.store(true, Ordering::SeqCst);
+    let result = context
+        .health
+        .check_tab(&context, tab.id)
+        .wait()
+        .await
+        .unwrap();
+    assert_eq!(result.state, ProbeState::Error);
+    assert!(result.reconnected);
+    let status = &context.health.snapshot().sessions[0].status;
+    assert_eq!(status.recoveries, 1);
+    assert!(status.version.is_none());
+    let result = context
+        .health
+        .check_tab(&context, tab.id)
+        .wait()
+        .await
+        .unwrap();
+    assert_eq!(result.state, ProbeState::Connected);
+    assert!(!result.reconnected);
+    assert_eq!(context.health.snapshot().sessions[0].status.recoveries, 1);
+    context.start_shutdown().unwrap().wait().await.unwrap();
+}
+
+async fn wait_for_connects(session: &Session, count: usize) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while session.connects.load(Ordering::SeqCst) != count {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn periodic_checks_retry_failed_recovery_and_stop_after_shutdown() {
+    use dzban_core::health::{HEALTH_INTERVAL, HealthState};
+    let (context, session, profile) = fixture();
+    let engine = context.start_connect_tab(profile).wait().await.unwrap();
+    let tab = context.tabs.session(engine.id()).unwrap();
+    context.health.track_tab(&context, tab.id).unwrap();
+    session.disconnected.store(true, Ordering::SeqCst);
+    session.reject_connect.store(true, Ordering::SeqCst);
+    tokio::task::yield_now().await;
+    tokio::time::advance(HEALTH_INTERVAL).await;
+    let failed = health_until(&context, |snapshot| {
+        snapshot.sessions[0].status.state == HealthState::Error
+    })
+    .await;
+    assert_eq!(
+        failed.sessions[0].status.recovery,
+        RecoveryPhase::RetryWaiting
+    );
+    assert_eq!(session.connects.load(Ordering::SeqCst), 2);
+    tokio::task::yield_now().await;
+    tokio::time::advance(HEALTH_INTERVAL).await;
+    let recovered = health_until(&context, |snapshot| {
+        snapshot.sessions[0].status.recoveries == 1
+    })
+    .await;
+    assert_eq!(recovered.sessions[0].status.state, HealthState::Connected);
+    assert_eq!(recovered.sessions[0].status.recovery, RecoveryPhase::Idle);
+    assert!(recovered.sessions[0].status.error.is_none());
+    assert_eq!(session.connects.load(Ordering::SeqCst), 3);
+    context.start_shutdown().unwrap().wait().await.unwrap();
+    tokio::time::advance(HEALTH_INTERVAL * 3).await;
+    assert_eq!(session.connects.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn recovery_timeout_releases_admission_and_can_be_retried() {
+    let (context, session, profile) = fixture();
+    let engine = context.start_connect_tab(profile).wait().await.unwrap();
+    let tab = context.tabs.session(engine.id()).unwrap();
+    session.disconnected.store(true, Ordering::SeqCst);
+    session.block_connect.store(true, Ordering::SeqCst);
+    let recovery = context.health.check_tab(&context, tab.id);
+    wait_for_connects(&session, 2).await;
+    let result = recovery.wait().await.unwrap();
+    assert_eq!(result.state, ProbeState::Error);
+    assert!(result.error.unwrap().contains("timed out"));
+    assert_eq!(
+        context.health.snapshot().sessions[0].status.recovery,
+        RecoveryPhase::RetryWaiting
+    );
+    session.block_connect.store(false, Ordering::SeqCst);
+    let retry = context
+        .health
+        .check_tab(&context, tab.id)
+        .wait()
+        .await
+        .unwrap();
+    assert!(retry.reconnected);
     context.start_shutdown().unwrap().wait().await.unwrap();
 }
 

@@ -284,6 +284,8 @@
       {
         "session": "00000000-0000-0000-0000-000000000002",
         "status": {
+          "recoveries": 2,
+          "recovery": "idle",
           "state": "connected",
           "probing": false,
           "latency_micros": 18446744073709551614,
@@ -297,6 +299,8 @@
       {
         "profile": "fixture",
         "status": {
+          "recoveries": 2,
+          "recovery": "idle",
           "state": "connected",
           "probing": false,
           "latency_micros": 18446744073709551614,
@@ -308,6 +312,8 @@
       {
         "profile": "failed",
         "status": {
+          "recoveries": 0,
+          "recovery": "idle",
           "state": "error",
           "probing": false,
           "latency_micros": null,
@@ -319,6 +325,8 @@
       {
         "profile": "unprobed",
         "status": {
+          "recoveries": 0,
+          "recovery": "idle",
           "state": "unknown",
           "probing": true,
           "latency_micros": null,

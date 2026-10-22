@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use dzban_core::DatabaseBackend;
-use dzban_core::health::{HealthState, HealthStatus};
+use dzban_core::health::{HealthState, HealthStatus, RecoveryPhase};
 use dzban_core::presentation::DocumentPresentation;
 use gtk4::prelude::*;
 
@@ -13,6 +13,8 @@ use super::icons;
 pub enum ConnectionDisplay {
     Disconnected,
     Connecting,
+    Reconnecting,
+    RetryWaiting,
     Connected,
     Error,
 }
@@ -22,6 +24,8 @@ impl ConnectionDisplay {
         match self {
             Self::Disconnected => "Disconnected",
             Self::Connecting => "Connecting",
+            Self::Reconnecting => "Reconnecting",
+            Self::RetryWaiting => "Disconnected - retrying automatically",
             Self::Connected => "Connected",
             Self::Error => "Error",
         }
@@ -30,9 +34,9 @@ impl ConnectionDisplay {
     fn class(self) -> &'static str {
         match self {
             Self::Disconnected => "status-disconnected",
-            Self::Connecting => "status-connecting",
+            Self::Connecting | Self::Reconnecting => "status-connecting",
             Self::Connected => "status-connected",
-            Self::Error => "status-error",
+            Self::Error | Self::RetryWaiting => "status-error",
         }
     }
 }
@@ -58,6 +62,11 @@ impl FooterState {
         if self.failure.is_some() {
             return ConnectionDisplay::Error;
         }
+        match self.health.as_ref().map(|health| health.recovery) {
+            Some(RecoveryPhase::Reconnecting) => return ConnectionDisplay::Reconnecting,
+            Some(RecoveryPhase::RetryWaiting) => return ConnectionDisplay::RetryWaiting,
+            _ => (),
+        }
         match self.health.as_ref().map(|health| health.state) {
             Some(HealthState::Connected) => ConnectionDisplay::Connected,
             Some(HealthState::Error) => ConnectionDisplay::Error,
@@ -67,17 +76,7 @@ impl FooterState {
     }
 
     pub fn connection_text(&self) -> String {
-        let name = self.profile.clone().unwrap_or_else(|| "No database".into());
-        if self.connection() == ConnectionDisplay::Error {
-            let cause = self
-                .failure
-                .clone()
-                .or_else(|| self.health.as_ref().and_then(|health| health.error.clone()))
-                .unwrap_or_else(|| "connection failed".into());
-            format!("{name}: {cause}")
-        } else {
-            name
-        }
+        self.profile.clone().unwrap_or_else(|| "No database".into())
     }
 }
 
@@ -221,7 +220,9 @@ impl Statusbar {
 
         let ping = gtk4::Button::new();
         ping.add_css_class("flat");
-        ping.set_tooltip_text(Some("Database ping latency. Click to probe now."));
+        ping.set_tooltip_text(Some(
+            "Database ping latency. Click to check and reconnect a lost connection. Lost connections are retried automatically.",
+        ));
         ping.update_property(&[gtk4::accessible::Property::Label("Database ping latency")]);
         let ping_content = gtk4::Box::new(gtk4::Orientation::Horizontal, 5);
         let ping_spinner = gtk4::Spinner::new();
@@ -315,14 +316,48 @@ impl Statusbar {
             self.0.dot.remove_css_class(display.class());
         }
         self.0.dot.add_css_class(connection.class());
+        let animated =
+            gtk4::Settings::default().is_some_and(|settings| settings.is_gtk_enable_animations());
+        if animated
+            && matches!(
+                connection,
+                ConnectionDisplay::Connecting | ConnectionDisplay::Reconnecting
+            )
+        {
+            self.0.dot.add_css_class("connection-pulsing");
+        } else {
+            self.0.dot.remove_css_class("connection-pulsing");
+        }
         self.0
             .dot
             .update_property(&[gtk4::accessible::Property::Label(connection.label())]);
         let text = state.connection_text();
         self.0.connection.set_text(&text);
+        let error = state
+            .failure
+            .as_deref()
+            .or_else(|| {
+                state
+                    .health
+                    .as_ref()
+                    .and_then(|health| health.error.as_deref())
+            })
+            .map(|error| format!("\n{error}"))
+            .unwrap_or_default();
+        let reset = if state
+            .health
+            .as_ref()
+            .is_some_and(|health| health.recoveries > 0)
+        {
+            "\nSession settings and open transactions were reset. Queries were not replayed."
+        } else {
+            ""
+        };
+        let detail = format!("{}: {text}{error}{reset}", connection.label());
+        self.0.connection.set_tooltip_text(Some(&detail));
         self.0
-            .connection
-            .set_tooltip_text(Some(&format!("{}: {text}", connection.label())));
+            .dot
+            .update_property(&[gtk4::accessible::Property::Description(&detail)]);
 
         let document = state.document.as_ref();
         self.0.duration.set_text(
@@ -416,6 +451,11 @@ impl Statusbar {
     }
 
     #[cfg(test)]
+    pub fn indicator_has_class(&self, class: &str) -> bool {
+        self.0.dot.has_css_class(class)
+    }
+
+    #[cfg(test)]
     pub fn connection_text(&self) -> String {
         self.0.connection.text().to_string()
     }
@@ -426,17 +466,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn connection_errors_include_the_database_and_cause() {
+    fn connection_errors_keep_the_database_name() {
         let state = FooterState {
             profile: Some("reporting".into()),
             failure: Some("password authentication failed".into()),
             ..Default::default()
         };
         assert_eq!(state.connection(), ConnectionDisplay::Error);
-        assert_eq!(
-            state.connection_text(),
-            "reporting: password authentication failed"
-        );
+        assert_eq!(state.connection_text(), "reporting");
     }
 
     #[test]
@@ -451,6 +488,93 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(state.connection(), ConnectionDisplay::Connecting);
+    }
+
+    #[test]
+    fn recovered_connection_keeps_the_database_name() {
+        let state = FooterState {
+            profile: Some("reporting".into()),
+            health: Some(HealthStatus {
+                state: HealthState::Connected,
+                recoveries: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(state.connection(), ConnectionDisplay::Connected);
+        assert_eq!(state.connection_text(), "reporting");
+    }
+
+    #[gtk4::test]
+    #[ignore = "requires a graphical display"]
+    fn indicator_tracks_recovery_but_not_routine_probes_and_respects_reduced_motion() {
+        let statusbar = Statusbar::new();
+        let settings = gtk4::Settings::default().unwrap();
+        let animations = settings.is_gtk_enable_animations();
+        settings.set_gtk_enable_animations(true);
+        let mut state = FooterState {
+            profile: Some("fixture".into()),
+            health: Some(HealthStatus {
+                state: HealthState::Connected,
+                probing: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        statusbar.update(&state);
+        assert!(statusbar.0.dot.has_css_class("status-connected"));
+        assert!(!statusbar.0.dot.has_css_class("connection-pulsing"));
+        state.health.as_mut().unwrap().recovery = RecoveryPhase::Reconnecting;
+        statusbar.update(&state);
+        assert!(statusbar.0.dot.has_css_class("status-connecting"));
+        assert!(statusbar.0.dot.has_css_class("connection-pulsing"));
+        assert_eq!(statusbar.connection_text(), "fixture");
+        settings.set_gtk_enable_animations(false);
+        statusbar.update(&state);
+        assert!(statusbar.0.dot.has_css_class("status-connecting"));
+        assert!(!statusbar.0.dot.has_css_class("connection-pulsing"));
+        state.health.as_mut().unwrap().recovery = RecoveryPhase::RetryWaiting;
+        state.health.as_mut().unwrap().error = Some("Connection refused".into());
+        statusbar.update(&state);
+        assert!(statusbar.0.dot.has_css_class("status-error"));
+        assert!(!statusbar.0.dot.has_css_class("connection-pulsing"));
+        assert!(
+            statusbar
+                .0
+                .connection
+                .tooltip_text()
+                .unwrap()
+                .contains("Connection refused")
+        );
+        assert_eq!(statusbar.connection_text(), "fixture");
+        state.failure = Some("Authentication failed".into());
+        statusbar.update(&state);
+        assert_eq!(statusbar.connection_text(), "fixture");
+        assert!(
+            statusbar
+                .0
+                .connection
+                .tooltip_text()
+                .unwrap()
+                .contains("Authentication failed")
+        );
+        state.failure = None;
+        state.health.as_mut().unwrap().recovery = RecoveryPhase::Idle;
+        state.health.as_mut().unwrap().recoveries = 1;
+        statusbar.update(&state);
+        assert_eq!(statusbar.connection_text(), "fixture");
+        assert!(
+            statusbar
+                .0
+                .connection
+                .tooltip_text()
+                .unwrap()
+                .contains("transactions were reset")
+        );
+        statusbar.update(&FooterState::default());
+        assert!(statusbar.0.dot.has_css_class("status-disconnected"));
+        assert!(!statusbar.0.dot.has_css_class("status-error"));
+        settings.set_gtk_enable_animations(animations);
     }
 
     #[gtk4::test]

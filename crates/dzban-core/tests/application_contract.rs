@@ -49,6 +49,7 @@ fn shared_protocol_fixture_keeps_types_nulls_and_full_integer_precision() {
         raw["interaction"]
     );
     assert_eq!(fixture.health.revision, u64::MAX - 2);
+    assert_eq!(fixture.health.sessions[0].status.recoveries, 2);
     assert_eq!(
         fixture.health.sessions[0].status.latency_micros,
         Some(u64::MAX - 1)

@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -25,12 +26,25 @@ pub enum HealthState {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthStatus {
+    #[serde(default)]
+    pub recovery: RecoveryPhase,
+    #[serde(default)]
+    pub recoveries: u64,
     pub state: HealthState,
     pub probing: bool,
     pub latency_micros: Option<u64>,
     pub version: Option<String>,
     pub error: Option<String>,
     pub checked_at_millis: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryPhase {
+    #[default]
+    Idle,
+    Reconnecting,
+    RetryWaiting,
 }
 
 impl HealthStatus {
@@ -44,7 +58,17 @@ impl HealthStatus {
                     ProbeState::Error => HealthState::Error,
                     ProbeState::Busy => unreachable!(),
                 };
+                self.recovery =
+                    if result.state == ProbeState::Error && self.recovery != RecoveryPhase::Idle {
+                        RecoveryPhase::RetryWaiting
+                    } else {
+                        RecoveryPhase::Idle
+                    };
                 self.latency_micros = result.latency_micros;
+                if result.reconnected {
+                    self.recoveries = self.recoveries.saturating_add(1);
+                    self.version = None;
+                }
                 if let Some(version) = &result.version {
                     self.version = Some(version.clone());
                 }
@@ -55,6 +79,9 @@ impl HealthStatus {
                     .and_then(|duration| u64::try_from(duration.as_millis()).ok());
             }
             Err(error) => {
+                if self.recovery != RecoveryPhase::Idle {
+                    self.recovery = RecoveryPhase::RetryWaiting;
+                }
                 self.state = HealthState::Error;
                 self.latency_micros = None;
                 self.error = Some(error.to_string());
@@ -92,6 +119,7 @@ pub enum ProbeState {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectionProbe {
+    pub reconnected: bool,
     pub state: ProbeState,
     pub latency_micros: Option<u64>,
     pub version: Option<String>,
@@ -101,6 +129,7 @@ pub struct ConnectionProbe {
 impl ConnectionProbe {
     fn busy() -> Self {
         Self {
+            reconnected: false,
             state: ProbeState::Busy,
             latency_micros: None,
             version: None,
@@ -115,6 +144,7 @@ impl ConnectionProbe {
     }
     fn failed(error: impl std::fmt::Display) -> Self {
         Self {
+            reconnected: false,
             state: ProbeState::Error,
             latency_micros: None,
             version: None,
@@ -383,10 +413,31 @@ impl HealthService {
     }
 
     pub fn start_session(&self, engine: Arc<QueryEngine>, include_version: bool) -> ProbeHandle {
+        let service = self.clone();
+        let session = engine.id();
         self.start(
             ProbeTarget::Session(engine.id(), include_version),
-            async move { Ok(probe(&engine, include_version).await) },
+            async move {
+                Ok(probe(&engine, include_version, move || {
+                    service.reconnecting(session);
+                })
+                .await)
+            },
         )
+    }
+
+    fn reconnecting(&self, session: SessionId) {
+        let mut data = self.data.lock().unwrap();
+        let Some(status) = data.sessions.get_mut(&session.0) else {
+            return;
+        };
+        status.recovery = RecoveryPhase::Reconnecting;
+        status.latency_micros = None;
+        let status = status.clone();
+        if let Some(profile) = data.profiles_by_session.get(&session).cloned() {
+            data.profiles.insert(profile.0, status);
+        }
+        self.publish(&mut data);
     }
 
     pub fn start_profile(
@@ -408,7 +459,7 @@ impl HealthService {
                         return Ok(ConnectionProbe::timed_out());
                     }
                 };
-                let result = tokio::time::timeout_at(deadline, probe(&engine, true))
+                let result = tokio::time::timeout_at(deadline, probe(&engine, true, || {}))
                     .await
                     .unwrap_or_else(|_| ConnectionProbe::timed_out());
                 context.close(engine.id()).await?;
@@ -474,29 +525,56 @@ impl HealthService {
     }
 }
 
-async fn probe(engine: &QueryEngine, include_version: bool) -> ConnectionProbe {
-    let latency = match engine.ping_detailed().await {
+async fn probe(
+    engine: &QueryEngine,
+    include_version: bool,
+    reconnecting: impl Fn() + Send + Sync + 'static,
+) -> ConnectionProbe {
+    let recovered = Arc::new(AtomicBool::new(false));
+    let observed = recovered.clone();
+    let (latency, reconnected) = match async {
+        engine
+            .start_health_check(reconnecting, move || {
+                observed.store(true, Ordering::SeqCst);
+            })?
+            .wait()
+            .await
+    }
+    .await
+    {
         Ok(latency) => latency,
         Err(ExecutionError::Busy) => {
             return ConnectionProbe {
+                reconnected: false,
                 state: ProbeState::Busy,
                 latency_micros: None,
                 version: None,
                 error: None,
             };
         }
-        Err(error) => return ConnectionProbe::failed(error),
+        Err(error) => {
+            return ConnectionProbe {
+                reconnected: recovered.load(Ordering::SeqCst),
+                ..ConnectionProbe::failed(error)
+            };
+        }
     };
-    let version = if include_version {
+    let version = if include_version || reconnected {
         match engine.version_detailed().await {
             Ok(version) => Some(version),
             Err(ExecutionError::Busy) => None,
-            Err(error) => return ConnectionProbe::failed(error),
+            Err(error) => {
+                return ConnectionProbe {
+                    reconnected,
+                    ..ConnectionProbe::failed(error)
+                };
+            }
         }
     } else {
         None
     };
     ConnectionProbe {
+        reconnected,
         state: ProbeState::Connected,
         latency_micros: Some(latency),
         version,
