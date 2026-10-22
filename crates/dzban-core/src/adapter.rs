@@ -31,6 +31,12 @@ pub trait DatabaseSession: Send + Sync {
     async fn connect_detailed(&self) -> Result<(), crate::error::ExecutionError> {
         self.connect().await.map_err(Into::into)
     }
+    async fn reconnect_if_needed(
+        &self,
+        _started: &(dyn Fn() + Send + Sync),
+    ) -> Result<bool, crate::error::ExecutionError> {
+        Ok(false)
+    }
     async fn disconnect(&self) -> Result<(), crate::error::ExecutionError> {
         Err(crate::error::ExecutionError::Message(
             "Disconnect is not supported".into(),

@@ -33,6 +33,8 @@ struct Fixture {
     active: AtomicUsize,
     peak: AtomicUsize,
     hold_connect: AtomicBool,
+    reject_connect: AtomicBool,
+    disconnected: AtomicBool,
     connect_release: Notify,
     reject_close: AtomicBool,
     release: Notify,
@@ -49,6 +51,9 @@ impl DatabaseSession for Session {
         if self.fixture.hold_connect.load(Ordering::SeqCst) {
             self.fixture.connect_release.notified().await;
         }
+        if self.fixture.reject_connect.swap(false, Ordering::SeqCst) {
+            return Err("Fixture connection refused".into());
+        }
         Ok(())
     }
     async fn disconnect(&self) -> Result<(), ExecutionError> {
@@ -58,7 +63,23 @@ impl DatabaseSession for Session {
         Ok(())
     }
     async fn ping(&self) -> Result<u64, String> {
-        Ok(1)
+        if self.fixture.disconnected.load(Ordering::SeqCst) {
+            Err("Fixture transport closed".into())
+        } else {
+            Ok(1)
+        }
+    }
+    async fn reconnect_if_needed(
+        &self,
+        started: &(dyn Fn() + Send + Sync),
+    ) -> Result<bool, ExecutionError> {
+        if !self.fixture.disconnected.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        started();
+        self.connect().await.map_err(ExecutionError::from)?;
+        self.fixture.disconnected.store(false, Ordering::SeqCst);
+        Ok(true)
     }
     async fn version(&self) -> Result<String, String> {
         Ok("Fixture 1.0 server".into())
@@ -205,9 +226,12 @@ fn directory() -> Directory {
 }
 
 fn harness_in(directory: Directory) -> Harness {
+    harness_with_fixture(directory, Arc::new(Fixture::default()))
+}
+
+fn harness_with_fixture(directory: Directory, fixture: Arc<Fixture>) -> Harness {
     adw::init().unwrap();
     super::icons::register();
-    let fixture = Arc::new(Fixture::default());
     let mut registry = AdapterRegistry::default();
     registry
         .register(Arc::new(Factory(fixture.clone())))
@@ -270,14 +294,48 @@ impl Harness {
         };
         let directory = std::path::PathBuf::from(directory);
         std::fs::create_dir_all(&directory).unwrap();
+        fn settled(widget: &gtk4::Widget) -> bool {
+            if let Some(stack) = widget.downcast_ref::<gtk4::Stack>()
+                && stack.is_transition_running()
+            {
+                return false;
+            }
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                if !settled(&current) {
+                    return false;
+                }
+                child = current.next_sibling();
+            }
+            true
+        }
+        wait_until("completed transitions", || {
+            settled(self.window.upcast_ref())
+        });
+        let frames = std::rc::Rc::new(std::cell::Cell::new(0));
+        let rendered = frames.clone();
+        self.window.add_tick_callback(move |_, _| {
+            rendered.set(rendered.get() + 1);
+            if rendered.get() >= 2 {
+                glib::ControlFlow::Break
+            } else {
+                glib::ControlFlow::Continue
+            }
+        });
+        wait_until("the updated frame", || frames.get() >= 2);
         let paintable = gtk4::WidgetPaintable::new(Some(&self.window));
-        let snapshot = gtk4::Snapshot::new();
-        paintable.snapshot(
-            &snapshot,
-            self.window.width() as f64,
-            self.window.height() as f64,
-        );
-        let node = snapshot.to_node().unwrap();
+        let mut node = None;
+        wait_until("a rendered frame", || {
+            let snapshot = gtk4::Snapshot::new();
+            paintable.snapshot(
+                &snapshot,
+                self.window.width() as f64,
+                self.window.height() as f64,
+            );
+            node = snapshot.to_node();
+            node.is_some()
+        });
+        let node = node.unwrap();
         self.window
             .renderer()
             .unwrap()
@@ -430,6 +488,124 @@ fn restored_workspace_reconnects_drafts_without_running_sql() {
     });
     assert_eq!(harness.fixture.executions.load(Ordering::SeqCst), 0);
     assert!(harness.directory.0.join("gtk-workspace.json").exists());
+}
+
+#[gtk4::test]
+#[ignore = "requires a graphical display"]
+fn restoration_never_exposes_a_temporary_connection_chooser() {
+    let directory = directory();
+    std::fs::write(
+        directory.0.join("gtk-workspace.json"),
+        r#"{"version":1,"tabs":[{"profile":"fixture","draft":"SELECT saved"}],"selected":0}"#,
+    )
+    .unwrap();
+    let fixture = Arc::new(Fixture::default());
+    fixture.hold_connect.store(true, Ordering::SeqCst);
+    let harness = harness_with_fixture(directory, fixture.clone());
+    assert!(harness.shell.workspace().is_restoring());
+    assert!(!harness.selected().is_workspace());
+    assert!(!harness.selected().widget().is_mapped());
+    harness.capture("restoring-workspace");
+    fixture.hold_connect.store(false, Ordering::SeqCst);
+    fixture.connect_release.notify_one();
+    wait_until("restored workspace visibility", || {
+        !harness.shell.workspace().is_restoring()
+    });
+    assert!(harness.selected().is_workspace());
+    assert!(!harness.selected().is_transitioning());
+    assert_eq!(harness.selected().editor().text(), "SELECT saved");
+    assert_eq!(harness.fixture.executions.load(Ordering::SeqCst), 0);
+    harness.capture("restored-workspace");
+}
+
+#[gtk4::test]
+#[ignore = "requires a graphical display"]
+fn restoration_reconciles_pending_connection_updates_before_exposing_tabs() {
+    let harness = harness();
+    let workspace = harness.shell.workspace();
+    let page = harness.selected();
+    wait_until("the mapped chooser", || page.widget().is_mapped());
+    workspace.set_restoring(true);
+    let context = harness.shell.app().context();
+    let _connection = {
+        let _runtime = harness.shell.app().bridge().enter();
+        context.start_connect_in_tab(
+            page.id(),
+            harness.shell.app().resolve_profile("fixture").unwrap(),
+        )
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while context.tabs.find(page.id()).unwrap().engine.is_none() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(!page.is_workspace());
+    workspace.set_restoring(false);
+    assert!(page.is_workspace());
+    assert!(!page.is_transitioning());
+}
+
+#[gtk4::test]
+#[ignore = "requires a graphical display"]
+fn connection_recovery_updates_the_footer_without_replacing_results_or_editor() {
+    let harness = harness();
+    super::window::install_styles();
+    let page = harness.connect("fixture");
+    harness.run(&page, "rows");
+    harness.finished(&page);
+    wait_until("the original results", || {
+        page.results().available_rows() == 3
+    });
+    let document = page.tab().document.id();
+    let generation = page.document().unwrap().generation;
+    page.editor().set_text("SELECT next");
+    harness.fixture.hold_connect.store(true, Ordering::SeqCst);
+    harness.fixture.disconnected.store(true, Ordering::SeqCst);
+    let context = harness.shell.app().context().clone();
+    let check = {
+        let _runtime = harness.shell.app().bridge().enter();
+        context.health.check_tab(&context, page.id())
+    };
+    let completed = harness.shell.app().run(check.wait());
+    glib::spawn_future_local(async move { completed.await.unwrap().unwrap() });
+    wait_until("the reconnecting indicator", || {
+        harness
+            .shell
+            .footer()
+            .indicator_has_class("status-connecting")
+    });
+    harness.capture("reconnecting-indicator");
+    let pulse = Instant::now() + Duration::from_millis(400);
+    wait_until("the next pulse phase", || Instant::now() >= pulse);
+    harness.capture("reconnecting-indicator-pulse");
+    harness.fixture.reject_connect.store(true, Ordering::SeqCst);
+    harness.fixture.hold_connect.store(false, Ordering::SeqCst);
+    harness.fixture.connect_release.notify_one();
+    wait_until("the retry waiting indicator", || {
+        harness.shell.footer().indicator_has_class("status-error")
+    });
+    harness.capture("retry-waiting-indicator");
+    let retry = {
+        let _runtime = harness.shell.app().bridge().enter();
+        context.health.check_tab(&context, page.id())
+    };
+    let completed = harness.shell.app().run(retry.wait());
+    glib::spawn_future_local(async move { completed.await.unwrap().unwrap() });
+    wait_until("the recovery notice", || {
+        harness
+            .shell
+            .footer()
+            .indicator_has_class("status-connected")
+    });
+    assert_eq!(harness.shell.footer().connection_text(), "fixture");
+    assert_eq!(harness.shell.workspace().tab_count(), 1);
+    assert!(page.is_workspace());
+    assert_eq!(page.tab().document.id(), document);
+    assert_eq!(page.document().unwrap().generation, generation);
+    assert_eq!(page.editor().text(), "SELECT next");
+    assert_eq!(page.results().available_rows(), 3);
+    assert_eq!(harness.fixture.executions.load(Ordering::SeqCst), 1);
+    harness.capture("recovered-connection");
 }
 
 #[gtk4::test]

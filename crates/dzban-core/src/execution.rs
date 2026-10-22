@@ -458,6 +458,29 @@ impl QueryEngine {
         })
     }
 
+    pub(crate) fn start_health_check(
+        &self,
+        reconnecting: impl Fn() + Send + Sync + 'static,
+        reconnected: impl Fn() + Send + Sync + 'static,
+    ) -> Result<AuxiliaryHandle<(u64, bool)>, crate::error::ExecutionError> {
+        let session = self.session.clone();
+        self.start_auxiliary(OperationState::Ping, async move {
+            bounded("Connection check", async {
+                match session.ping_detailed().await {
+                    Ok(latency) => Ok((latency, false)),
+                    Err(error) => {
+                        if !session.reconnect_if_needed(&reconnecting).await? {
+                            return Err(error);
+                        }
+                        reconnected();
+                        session.ping_detailed().await.map(|latency| (latency, true))
+                    }
+                }
+            })
+            .await
+        })
+    }
+
     pub async fn version(&self) -> Result<String, String> {
         self.version_detailed()
             .await

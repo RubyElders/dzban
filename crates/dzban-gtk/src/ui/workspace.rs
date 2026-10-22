@@ -38,6 +38,7 @@ struct Inner {
     view: adw::TabView,
     bar: adw::TabBar,
     container: gtk4::Box,
+    stack: gtk4::Stack,
     entries: RefCell<Vec<Entry>>,
     syncing: Cell<bool>,
     removing: RefCell<HashSet<TabId>>,
@@ -76,14 +77,28 @@ impl Workspace {
 
         let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         container.set_vexpand(true);
-        container.append(&bar);
-        container.append(&view);
+        let tabs = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        tabs.append(&bar);
+        tabs.append(&view);
+        let loading = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+        loading.set_halign(gtk4::Align::Center);
+        loading.set_valign(gtk4::Align::Center);
+        let spinner = gtk4::Spinner::new();
+        spinner.set_spinning(true);
+        loading.append(&spinner);
+        loading.append(&gtk4::Label::new(Some("Restoring workspace")));
+        let stack = gtk4::Stack::new();
+        stack.set_vexpand(true);
+        stack.add_named(&loading, Some("restoring"));
+        stack.add_named(&tabs, Some("tabs"));
+        container.append(&stack);
 
         let workspace = Self(Rc::new(Inner {
             app: app.clone(),
             view: view.clone(),
             bar,
             container,
+            stack,
             entries: RefCell::new(Vec::new()),
             syncing: Cell::new(false),
             removing: RefCell::new(HashSet::new()),
@@ -224,6 +239,14 @@ impl Workspace {
         if !restoring {
             self.reconcile();
         }
+        self.0
+            .stack
+            .set_visible_child_name(if restoring { "restoring" } else { "tabs" });
+    }
+
+    #[cfg(test)]
+    pub fn is_restoring(&self) -> bool {
+        self.0.stack.visible_child_name().as_deref() == Some("restoring")
     }
 
     fn page_id(&self, page: &adw::TabPage) -> Option<TabId> {
@@ -454,7 +477,17 @@ impl Workspace {
     }
 
     fn apply_health(&self, snapshot: HealthSnapshot) {
-        self.0.health.replace(snapshot.clone());
+        let previous = self.0.health.replace(snapshot.clone());
+        for session in &snapshot.sessions {
+            let recoveries = previous
+                .sessions
+                .iter()
+                .find(|entry| entry.session == session.session)
+                .map_or(0, |entry| entry.status.recoveries);
+            if session.status.recoveries > recoveries {
+                self.0.app.toast("Connection restored. Session settings and open transactions were reset; queries were not replayed.");
+            }
+        }
         for entry in self.0.entries.borrow().iter() {
             entry.content.chooser().apply_health(&snapshot);
         }

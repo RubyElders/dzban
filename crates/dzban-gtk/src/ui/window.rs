@@ -1462,7 +1462,14 @@ pub fn install_styles() {
             background-color: @success_color;
         }
         .status-dot.status-connecting {
-            background-color: @warning_color;
+            background-color: @orange_4;
+        }
+        @keyframes connection-pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.45; }
+        }
+        .status-dot.connection-pulsing {
+            animation: connection-pulse 1.6s ease-in-out infinite;
         }
         .status-dot.status-error {
             background-color: @error_color;

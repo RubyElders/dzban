@@ -142,6 +142,24 @@ impl DatabaseSession for PostgresSession {
             .map_err(|error| error.to_string())
     }
 
+    async fn reconnect_if_needed(
+        &self,
+        started: &(dyn Fn() + Send + Sync),
+    ) -> Result<bool, dzban_core::error::ExecutionError> {
+        let closed = self
+            .client
+            .read()
+            .await
+            .as_ref()
+            .is_none_or(|client| client.is_closed());
+        if !closed {
+            return Ok(false);
+        }
+        started();
+        self.connect_detailed().await?;
+        Ok(true)
+    }
+
     async fn ping_detailed(&self) -> Result<u64, dzban_core::error::ExecutionError> {
         let client = self
             .client()
