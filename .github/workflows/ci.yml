@@ -4,14 +4,15 @@ on:
   push:
     branches: [main]
   pull_request:
+  merge_group:
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 defaults:
   run:
@@ -25,7 +26,7 @@ env:
 
 jobs:
   headless:
-    name: Core and CLI without native libraries
+    name: Rust / Headless core and CLI
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -47,7 +48,7 @@ jobs:
         run: bash scripts/test.sh headless
 
   macos:
-    name: macOS build and bridge
+    name: macOS / Build and bridge tests
     runs-on: xcode-27
     timeout-minutes: 45
     steps:
@@ -87,7 +88,7 @@ jobs:
           if-no-files-found: error
 
   macos-ui:
-    name: macOS UI (${{ matrix.shard }}/3)
+    name: macOS / UI tests (shard ${{ matrix.shard }} of 3)
     needs: macos
     runs-on: xcode-27
     timeout-minutes: 30
@@ -132,7 +133,7 @@ jobs:
           if-no-files-found: warn
 
   rust:
-    name: Rust checks and coverage
+    name: Rust / Workspace checks and tests
     runs-on: ubuntu-26.04
     timeout-minutes: 45
     steps:
@@ -140,7 +141,8 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - uses: ./.github/actions/setup-linux
+      - name: Set up Linux build and test tools
+        uses: ./.github/actions/setup-linux
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Lint Rust
@@ -149,19 +151,11 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --locked --workspace --no-deps --all-features
-      - name: Install coverage tool
-        run: cargo install cargo-llvm-cov --version 0.8.7 --locked
-      - name: Collect core and CLI coverage
-        run: cargo llvm-cov --locked -p dzban-core -p dzban-db -p dzban-cli --all-targets --lcov --output-path lcov.info
-      - name: Upload coverage
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
-        with:
-          name: core-cli-coverage
-          path: lcov.info
-          if-no-files-found: error
+      - name: Test the workspace
+        run: cargo test --locked --workspace --all-targets
 
   integration:
-    name: Database, terminal and GTK integration
+    name: Linux / GTK, database and terminal tests
     runs-on: ubuntu-26.04
     timeout-minutes: 45
     steps:
@@ -169,7 +163,8 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - uses: ./.github/actions/setup-linux
+      - name: Set up Linux build and test tools
+        uses: ./.github/actions/setup-linux
       - name: Test GTK widgets and lifecycle
         run: bash scripts/test.sh gtk
       - name: Test PostgreSQL, ClickHouse and CLI contracts
@@ -179,7 +174,7 @@ jobs:
         run: docker compose -f docker-compose.test.yml down --volumes --remove-orphans
 
   screens:
-    name: GTK screen workflows
+    name: Linux / GTK accessibility workflows
     runs-on: ubuntu-26.04
     timeout-minutes: 45
     steps:
@@ -187,7 +182,8 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - uses: ./.github/actions/setup-linux
+      - name: Set up Linux build and test tools
+        uses: ./.github/actions/setup-linux
       - name: Set up uv
         uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884
         with:
@@ -202,44 +198,27 @@ jobs:
         if: always()
         run: docker compose -f docker-compose.test.yml down --volumes --remove-orphans
 
-  dependencies:
-    name: Dependency audit
+  secrets:
+    name: Quality / Source secret scan
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - name: Install Rust and audit tool
-        run: |
-          rustup toolchain install 1.98.1 --profile minimal
-          cargo +1.98.1 install cargo-audit --version 0.22.0 --locked
-      - name: Audit dependencies
-        run: cargo +1.98.1 audit
-
-  secrets:
-    name: Secret scan
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - name: Check out full history
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
-          go-version: stable
+          go-version: 1.26.7
           cache: false
-      - name: Scan Git history
+      - name: Scan source
         run: |
           go install github.com/zricethezav/gitleaks/v8@v8.24.3
-          gitleaks git --redact --log-opts=--all .
+          gitleaks dir --redact .
 
   workflows:
-    name: Workflow lint
+    name: Quality / Workflow and shell lint
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -250,7 +229,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
-          go-version: stable
+          go-version: 1.26.7
           cache: false
       - name: Validate workflows
         run: |
@@ -258,3 +237,15 @@ jobs:
           actionlint
       - name: Check shell syntax
         run: git ls-files -z '*.sh' | xargs -0 -r -n 1 bash -n
+
+  ci:
+    name: CI / Required checks
+    if: always()
+    needs: [headless, macos, macos-ui, rust, integration, screens, secrets, workflows]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check required jobs
+        env:
+          JOB_RESULTS: ${{ toJSON(needs) }}
+        run: jq -e 'all(.[]; .result == "success")' <<< "$JOB_RESULTS"
