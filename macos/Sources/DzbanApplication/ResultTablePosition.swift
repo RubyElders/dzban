@@ -7,5 +7,6 @@ struct ResultTablePosition {
     let widths: [CGFloat]
     let row: Int?
     let column: Int
+    var sizing: [ResultColumnSizing]? = nil
     let rowNumberSelected: Bool
 }

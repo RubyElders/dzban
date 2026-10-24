@@ -6,13 +6,20 @@ public enum ConnectionState: String, Codable, Sendable {
 }
 
 public struct ConnectionProbe: Decodable, Sendable {
+    public let reconnected: Bool?
     public let state: ConnectionState
     public let latencyMicros: UInt64?
     public let version: String?
     public let error: String?
 }
 
+public enum RecoveryPhase: String, Decodable, Sendable {
+    case idle, reconnecting, retryWaiting = "retry_waiting"
+}
+
 public struct HealthStatus: Decodable, Sendable {
+    public let recovery: RecoveryPhase?
+    public let recoveries: UInt64?
     public let state: ConnectionState
     public let probing: Bool
     public let latencyMicros: UInt64?

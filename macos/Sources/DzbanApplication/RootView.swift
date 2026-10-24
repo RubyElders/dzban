@@ -20,7 +20,7 @@ public struct RootView: View {
 
     public var body: some View {
         VStack(spacing: 0) {
-            QueryTabStrip(store: store)
+            if !store.restoring { QueryTabStrip(store: store) }
             Divider()
             HSplitView {
                 if store.historyVisible {
@@ -35,7 +35,9 @@ public struct RootView: View {
                     .frame(minWidth: 240, idealWidth: 280, maxWidth: 320, maxHeight: .infinity)
                 }
                 Group {
-                    if let workspace = store.workspace { workspaceView(workspace) }
+                    if store.restoring {
+                        ProgressView("Restoring workspace").accessibilityIdentifier("workspace.restoring")
+                    } else if let workspace = store.workspace { workspaceView(workspace) }
                     else { ConnectionChooser(store: store, focusedProfile: $focusedProfile, selectedProfile: $selectedProfile, focusConnection: focusConnection, moveConnection: moveConnection) }
                 }.frame(maxWidth: .infinity, maxHeight: .infinity)
             }.frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -57,6 +59,14 @@ public struct RootView: View {
                             .padding(.top, 8)
                     }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                 }
+            }
+        }
+        .overlay(alignment: .bottom) {
+            if let notice = store.recoveryNotice {
+                HStack {
+                    Text(notice).accessibilityIdentifier("connection.recovery-notice")
+                    Button("Dismiss") { store.recoveryNotice = nil }.accessibilityIdentifier("connection.recovery-dismiss")
+                }.padding(12).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8)).padding(.horizontal, 20).padding(.bottom, 42)
             }
         }
         .sheet(isPresented: $store.shortcutsVisible, onDismiss: restoreFocus) { NativeShortcutReference() }
@@ -82,7 +92,7 @@ public struct RootView: View {
     }
 
     private func focusConnection() {
-        guard store.connectionsVisible || store.selectedSession == nil else { return }
+        guard !store.restoring, store.connectionsVisible || store.selectedSession == nil else { return }
         selectedProfile = store.workspace?.profile ?? store.profiles.first?.name
         focusedProfile = selectedProfile
     }

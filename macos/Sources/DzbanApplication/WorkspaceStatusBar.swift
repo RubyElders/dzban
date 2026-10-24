@@ -15,16 +15,19 @@ struct WorkspaceStatusBar: View {
     var body: some View {
         let profile = store.workspace?.profile ?? store.pendingProfile
         let status = store.selectedSession.flatMap { store.health[$0] } ?? profile.flatMap { store.profileHealth[$0] }
-        let state: ConnectionState = store.pendingProfile != nil && store.selectedSession == nil ? .connecting : status?.state ?? .disconnected
+        var display = status ?? ConnectionHealth()
+        if status == nil { display.state = .disconnected }
+        if store.pendingProfile != nil && store.selectedSession == nil { display.state = .connecting; display.recovery = .idle }
+        let state = display.displayState
         let name = profile ?? "No database"
-        let connectionText = state == .error ? "\(name): \(status?.failure ?? "connection failed")" : name
+        let label = display.label
+        let detail = display.detail(profile: name)
         return HStack(spacing: 12) {
             HStack(spacing: 4) {
-                Circle().fill(state == .connected ? Color.green : state == .error ? Color.red : state == .connecting ? Color.orange : Color.secondary)
-                    .frame(width: 7, height: 7)
-                    .accessibilityLabel(state.label)
-                Text(connectionText).lineLimit(1).truncationMode(.middle).frame(maxWidth: 200, alignment: .leading).fixedSize(horizontal: true, vertical: false)
-            }.help(state.label + ": " + connectionText).accessibilityElement(children: .combine).accessibilityIdentifier("connection.status")
+                ConnectionIndicator(state: state)
+                    .accessibilityLabel(label)
+                Text(name).lineLimit(1).truncationMode(.middle).frame(maxWidth: 200, alignment: .leading).fixedSize(horizontal: true, vertical: false)
+            }.help(detail).accessibilityElement(children: .combine).accessibilityLabel(label + ": " + name).accessibilityHint(detail).accessibilityIdentifier("connection.status")
             Divider().frame(height: 14)
             HStack(spacing: 5) {
                 FooterArtwork(name: "dzban-query-time-symbolic")
@@ -40,7 +43,7 @@ struct WorkspaceStatusBar: View {
                     Text(ConnectionHealth.latency(status?.latencyMicros)).accessibilityIdentifier("status.latency")
                 }
             }.buttonStyle(.plain).disabled(store.selectedSession == nil || !store.navigationAvailable || status?.probing == true || store.controls?.primaryAction == .stop || plan.loading)
-                .help("Database ping latency. Click to probe now.").accessibilityIdentifier("connection.probe").accessibilityValue(ConnectionHealth.latency(status?.latencyMicros)).frame(width: 86, alignment: .trailing)
+                .help("Database ping latency. Click to check and reconnect a lost connection. Lost connections are retried automatically.").accessibilityIdentifier("connection.probe").accessibilityValue(ConnectionHealth.latency(status?.latencyMicros)).frame(width: 86, alignment: .trailing)
             Divider().frame(height: 14)
             HStack(spacing: 5) {
                 if let profile { DatabaseArtwork(backend: backend(profile)) }
@@ -52,4 +55,17 @@ struct WorkspaceStatusBar: View {
         .accessibilityElement(children: .contain).accessibilityIdentifier("workspace.statusbar")
     }
 
+}
+
+private struct ConnectionIndicator: View {
+    let state: ConnectionState
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var dimmed = false
+    private var pulsing: Bool { state == .connecting && !reduceMotion }
+    var body: some View {
+        Circle().fill(state == .connected ? Color.green : state == .error ? Color.red : state == .connecting ? Color.orange : Color.secondary)
+            .frame(width: 7, height: 7).opacity(dimmed ? 0.45 : 1)
+            .animation(pulsing ? .easeInOut(duration: 0.8).repeatForever(autoreverses: true) : nil, value: dimmed)
+            .onChange(of: pulsing, initial: true) { _, value in dimmed = value }
+    }
 }

@@ -41,6 +41,8 @@ final class ProtocolContractTests: XCTestCase {
         XCTAssertTrue(value.interaction.input.commands.isEmpty)
         XCTAssertEqual(value.interaction.plan?.estimate?.rows, UInt64.max - 1)
         XCTAssertNil(value.interaction.error)
+        XCTAssertEqual(value.health.sessions[0].status.recoveries, 2)
+        XCTAssertEqual(value.health.sessions[0].status.recovery, .idle)
         XCTAssertEqual(value.health.revision, UInt64.max - 2)
         XCTAssertEqual(value.health.sessions[0].status.latencyMicros, UInt64.max - 1)
         XCTAssertEqual(value.health.sessions[0].status.checkedAtMillis, 1_800_000_000_123)

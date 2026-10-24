@@ -801,6 +801,38 @@ final class ShellTests: XCTestCase {
         XCTAssertTrue(app.wait(for: .notRunning, timeout: 10))
     }
 
+    func testNativeTabReorderingPreservesSelectionAndDrafts() throws {
+        launchApp()
+        XCTAssertTrue(app.buttons["connection.fixture"].waitForExistence(timeout: 5))
+        app.buttons["connection.fixture"].click()
+        let editor = app.textViews["query.editor"]
+        XCTAssertTrue(editor.waitForExistence(timeout: 5))
+        editor.click()
+        editor.typeText("SELECT first")
+        openQueryTab()
+        XCTAssertTrue(queryTab("Query 2").waitForExistence(timeout: 5))
+        editor.click()
+        editor.typeText("SELECT second")
+        let first = queryTab("Query 1"), second = queryTab("Query 2")
+        first.click()
+        waitForValue("SELECT first", in: editor)
+        second.rightClick()
+        app.typeKey(.downArrow, modifierFlags: [])
+        app.typeKey(.return, modifierFlags: [])
+        let moved = expectation(for: NSPredicate { _, _ in second.frame.minX < first.frame.minX }, evaluatedWith: nil)
+        wait(for: [moved], timeout: 5)
+        waitForValue("SELECT first", in: editor)
+        second.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).click(forDuration: 1, thenDragTo: first.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)))
+        let dragged = expectation(for: NSPredicate { _, _ in first.frame.minX < second.frame.minX }, evaluatedWith: nil)
+        wait(for: [dragged], timeout: 5)
+        waitForValue("SELECT first", in: editor)
+        second.click()
+        waitForValue("SELECT second", in: editor)
+        capture("Reordered native tabs preserve drafts")
+        app.typeKey("q", modifierFlags: .command)
+        XCTAssertTrue(app.wait(for: .notRunning, timeout: 10))
+    }
+
     func testWorkspaceSelectionRestoresQueryTabs() throws {
         launchApp()
         let connect = app.buttons["connection.fixture"]
@@ -1025,7 +1057,8 @@ final class ShellTests: XCTestCase {
                 let columns = table.descendants(matching: .tableColumn)
                 XCTAssertEqual(columns.count, sql == "single" ? 1 : 2)
                 XCTAssertEqual(columns.firstMatch.frame.minX, app.buttons["result.row-number.0"].frame.maxX, accuracy: 2)
-                XCTAssertEqual(columns.element(boundBy: columns.count - 1).frame.maxX, table.frame.maxX, accuracy: 2)
+                XCTAssertLessThanOrEqual(columns.element(boundBy: columns.count - 1).frame.maxX, table.frame.maxX + 2)
+                XCTAssertLessThan(columns.firstMatch.frame.width, 100)
                 if sql == "few" { try assertMatchingDividerPixels(table: table, column: columns.firstMatch) }
                 capture("Full-height result dividers \(sql) \(Int(width))")
             }
@@ -1036,7 +1069,7 @@ final class ShellTests: XCTestCase {
         scrollInSteps(table, dx: 0, dy: -13000)
         waitForValue("r499c127", in: app.descendants(matching: .any)["result.cell.499.127"])
         let lastColumn = table.descendants(matching: .tableColumn).matching(NSPredicate(format: "label == %@", "column_127")).firstMatch
-        XCTAssertGreaterThanOrEqual(lastColumn.frame.width, 160)
+        XCTAssertGreaterThan(lastColumn.frame.width, 70)
         capture("Full-height dividers with horizontal scrolling")
         app.typeKey("q", modifierFlags: .command)
         XCTAssertTrue(app.wait(for: .notRunning, timeout: 10))
@@ -1201,11 +1234,13 @@ final class ShellTests: XCTestCase {
         waitForValue("r499c127", in: last)
         last.click()
         let before = last.frame
-        app.typeKey(.return, modifierFlags: .command)
-        waitForValue("Complete - 500 rows", in: app.staticTexts["results.status"])
-        waitForValue("r499c127", in: last)
-        XCTAssertEqual(last.frame.minX, before.minX, accuracy: 2)
-        XCTAssertEqual(last.frame.minY, before.minY, accuracy: 2)
+        for _ in 0..<6 {
+            app.typeKey(.return, modifierFlags: .command)
+            waitForValue("Complete - 500 rows", in: app.staticTexts["results.status"])
+            waitForValue("r499c127", in: last)
+            XCTAssertEqual(last.frame.minX, before.minX, accuracy: 2)
+            XCTAssertEqual(last.frame.minY, before.minY, accuracy: 2)
+        }
         capture("Matching query rerun preserves result position")
         app.typeText(" ")
         XCTAssertTrue(app.buttons["row.close"].waitForExistence(timeout: 5))
@@ -1213,6 +1248,9 @@ final class ShellTests: XCTestCase {
         waitForValue("r499c127", in: app.textViews["cell.value"])
         app.typeKey(.escape, modifierFlags: [])
         app.typeKey(.escape, modifierFlags: [])
+        app.typeKey(.pageUp, modifierFlags: [])
+        let scrolled = expectation(for: NSPredicate { _, _ in !last.exists || !last.isHittable }, evaluatedWith: nil)
+        wait(for: [scrolled], timeout: 5)
         editor.click()
         app.typeKey("a", modifierFlags: .command)
         app.typeText("single")

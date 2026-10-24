@@ -13,6 +13,9 @@ extension ApplicationClient {
     public func cycleTabs(_ direction: Int, revision: UInt64) async throws -> TabInventory {
         try await bridge.request(.cycleTabs(direction, revision: revision), as: TabInventory.self)
     }
+    public func moveTab(_ tab: UUID, index: Int) async throws -> TabInventory {
+        try await bridge.request(.moveTab(tab, index: index), as: TabInventory.self)
+    }
     public func closeTab(_ tab: UUID) async throws -> TabInventory {
         try await bridge.request(.closeTab(tab), as: TabInventory.self)
     }

@@ -36,7 +36,7 @@ struct ResultTable: NSViewRepresentable {
         table.headerView = NSTableHeaderView()
         table.style = .plain
         table.usesAlternatingRowBackgroundColors = true
-        table.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
+        table.columnAutoresizingStyle = .noColumnAutoresizing
         table.allowsColumnReordering = false
         table.allowsMultipleSelection = true
         table.rowHeight = 24
@@ -47,6 +47,12 @@ struct ResultTable: NSViewRepresentable {
         table.setAccessibilityLabel("Query results")
         table.setAccessibilityHelp("Copy selected rows as Markdown. Select All selects the full result. Space opens the row preview; double-click opens a full cell value.")
         context.coordinator.table = table
+        table.userNavigated = { [weak coordinator = context.coordinator] in coordinator?.cancelRestoration() }
+        table.didLayout = { [weak coordinator = context.coordinator] in
+            guard let coordinator, !coordinator.applying else { return }
+            coordinator.sizeColumns()
+            coordinator.restorePosition()
+        }
         table.target = context.coordinator
         table.doubleAction = #selector(Coordinator.inspectCell)
         scroll.contentView.postsBoundsChangedNotifications = true
@@ -83,14 +89,16 @@ struct ResultTable: NSViewRepresentable {
         }
         table.releaseRow = releasePeek
         table.selectCell = { [weak coordinator] row, column in
-            coordinator?.pendingPosition = nil
+            coordinator?.cancelRestoration()
             coordinator?.model.select(row: row, column: column)
             coordinator?.rememberPosition()
         }
         if coordinator.scope != model.scope {
             coordinator.rememberPosition()
             coordinator.scope = model.scope
+            coordinator.layoutPosition = nil
             coordinator.pendingPosition = model.scope.flatMap { model.tablePositions[$0.document] }
+            coordinator.sizing = []
             table.rowNumberSelected = false
         }
         table.canPeek = model.availableRows > 0 && !model.columns.isEmpty
@@ -106,16 +114,13 @@ struct ResultTable: NSViewRepresentable {
                 header.leadingInset = index == 0 ? WorkspaceLayout.gutterInset : WorkspaceLayout.columnInset
                 header.trailingInset = index == model.columns.count - 1 ? WorkspaceLayout.textInset : WorkspaceLayout.columnInset
                 native.headerCell = header
-                native.width = 170
+                native.width = max(60, (column.name as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 12)]).width + 24)
                 native.minWidth = 60
                 native.maxWidth = .greatestFiniteMagnitude
                 table.addTableColumn(native)
             }
-            if table.tableColumns.reduce(0, { $0 + $1.width }) < table.bounds.width {
-                table.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
-                table.sizeLastColumnToFit()
-            }
         }
+        coordinator.sizeColumns()
         let selectedRows = table.selectedRowIndexes.intersection(IndexSet(integersIn: 0..<model.availableRows))
         table.reloadData()
         table.selectRowIndexes(selectedRows, byExtendingSelection: false)
@@ -146,6 +151,8 @@ struct ResultTable: NSViewRepresentable {
     static func dismantleNSView(_ scroll: NSScrollView, coordinator: Coordinator) {
         NotificationCenter.default.removeObserver(coordinator)
         if let table = coordinator.table { coordinator.model.focusCycle?.remove(table) }
+        coordinator.table?.didLayout = nil
+        coordinator.table?.userNavigated = nil
         coordinator.table?.resetPeek()
         coordinator.table?.delegate = nil
         coordinator.table?.dataSource = nil
@@ -158,6 +165,8 @@ struct ResultTable: NSViewRepresentable {
         var columns: [Column] = []
         var scope: ResultScope?
         var pendingPosition: ResultTablePosition?
+        var layoutPosition: ResultTablePosition?
+        var sizing: [ResultColumnSizing] = []
         var focusRequest: UInt64 = 0
         var applying = false
         var inspect: (() -> Void)?
@@ -200,12 +209,13 @@ struct ResultTable: NSViewRepresentable {
         }
         func tableViewSelectionDidChange(_ notification: Notification) {
             guard !applying, let table else { return }
-            pendingPosition = nil
+            cancelRestoration()
             model.select(row: table.selectedRow, column: min(table.focusedColumn, max(0, columns.count - 1)))
             rememberPosition()
             table.enclosingScrollView?.verticalRulerView?.needsDisplay = true
         }
         func focus() {
+            cancelRestoration()
             guard let table, let window = table.window, window.attachedSheet == nil else { return }
             if model.selected == nil, model.availableRows > 0, table.numberOfColumns > 0 {
                 let visible = table.rows(in: table.visibleRect)
@@ -226,8 +236,9 @@ struct ResultTable: NSViewRepresentable {
         @objc func scrolled() {
             if !applying {
                 if let type = NSApp.currentEvent?.type, [.scrollWheel, .leftMouseDown, .leftMouseDragged].contains(type) {
-                    pendingPosition = nil
+                    cancelRestoration()
                 }
+                restorePosition()
                 rememberPosition()
             }
             table?.enclosingScrollView?.verticalRulerView?.needsDisplay = true
@@ -239,16 +250,16 @@ struct ResultTable: NSViewRepresentable {
                   let table, table.numberOfRows > 0, let clip = table.enclosingScrollView?.contentView else { return }
             model.tablePositions[scope.document] = ResultTablePosition(headers: columns, origin: clip.bounds.origin,
                 widths: table.tableColumns.map(\.width), row: table.selectedRow >= 0 ? table.selectedRow : nil,
-                column: table.focusedColumn, rowNumberSelected: table.rowNumberSelected)
+                column: table.focusedColumn, sizing: sizing, rowNumberSelected: table.rowNumberSelected)
         }
 
         func restorePosition() {
-            guard let position = pendingPosition, !columns.isEmpty,
+            guard scope == model.scope, columns == model.columns, model.loadError == nil, let position = pendingPosition ?? layoutPosition, !columns.isEmpty,
                   let table, let scroll = table.enclosingScrollView else { return }
             guard let decision = model.restoration(for: position) else { return }
             switch decision.restoration {
             case .schemaChanged:
-                pendingPosition = nil
+                cancelRestoration()
                 if let scope { model.tablePositions.removeValue(forKey: scope.document) }
                 return
             case .apply: break
@@ -257,7 +268,11 @@ struct ResultTable: NSViewRepresentable {
             let wasApplying = applying
             applying = true
             defer { applying = wasApplying }
-            for (column, width) in zip(table.tableColumns, position.widths) { column.width = width }
+            layoutPosition = position
+            if pendingPosition != nil {
+                sizing = position.sizing ?? position.widths.map { ResultColumnSizing(preferred: $0, assigned: $0, manual: true, sampled: true) }
+                for (column, width) in zip(table.tableColumns, position.widths) { column.width = width }
+            }
             table.tile()
             let clip = scroll.contentView
             let maximumY = max(0, table.rect(ofRow: model.availableRows - 1).maxY - clip.bounds.height)
@@ -271,6 +286,47 @@ struct ResultTable: NSViewRepresentable {
             }
             if model.isFinished || position.origin.y <= maximumY && !decision.selectionPending {
                 pendingPosition = nil
+            }
+        }
+
+        func cancelRestoration() { pendingPosition = nil; layoutPosition = nil }
+
+        func tableViewColumnDidResize(_ notification: Notification) {
+            guard !applying else { return }
+            cancelRestoration()
+            sizeColumns()
+            rememberPosition()
+        }
+
+        func sizeColumns() {
+            guard scope == model.scope, columns == model.columns, let table, table.tableColumns.count == columns.count else { return }
+            if sizing.count != columns.count {
+                sizing = table.tableColumns.enumerated().map { index, column in
+                    ResultColumnSizing(preferred: max(60, (columns[index].name as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 12)]).width + 24), assigned: column.width)
+                }
+            }
+            let rows = min(16, model.availableRows)
+            for index in sizing.indices {
+                if abs(table.tableColumns[index].width - sizing[index].assigned) > 1 {
+                    sizing[index].manual = true
+                    sizing[index].assigned = table.tableColumns[index].width
+                }
+                if !sizing[index].manual && !sizing[index].sampled && rows > 0 && model.value(row: 0, column: index) != nil {
+                    let values = (0..<rows).compactMap { model.value(row: $0, column: index) }
+                    if values.count == rows {
+                        let natural = values.map { (ResultCellDisplay.preview($0) as NSString).size(withAttributes: [.font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)]).width + 40 }.max() ?? 60
+                        sizing[index].preferred = max(sizing[index].preferred, natural)
+                        sizing[index].sampled = true
+                    }
+                }
+            }
+            let wasApplying = applying
+            applying = true
+            defer { applying = wasApplying }
+            let widths = ResultColumnSizing.fit(sizing, available: table.enclosingScrollView?.contentView.bounds.width ?? 0)
+            for index in widths.indices {
+                sizing[index].assigned = widths[index]
+                if abs(table.tableColumns[index].width - widths[index]) > 0.5 { table.tableColumns[index].width = widths[index] }
             }
         }
 
@@ -318,6 +374,9 @@ public enum ResultCellDisplay {
 
 @MainActor
 final class NativeResultTable: NSTableView {
+    var didLayout: (() -> Void)?
+    var userNavigated: (() -> Void)?
+    override func layout() { super.layout(); didLayout?() }
     private var accessibleColumns: [Int: NSAccessibilityElement] = [:]
     private func accessibleArray(_ attribute: NSAccessibility.Attribute) -> [Any]? {
         switch attribute {
@@ -447,6 +506,7 @@ final class NativeResultTable: NSTableView {
     var copyRows: ((IndexSet) -> Void)?
     var cancelQuery: (() -> Bool)?
     override func mouseDown(with event: NSEvent) {
+        userNavigated?()
         rowNumberSelected = false
         let point = convert(event.locationInWindow, from: nil)
         let row = row(at: point)
@@ -457,6 +517,7 @@ final class NativeResultTable: NSTableView {
     }
     override func keyDown(with event: NSEvent) {
         let plain = event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty
+        if plain && [115, 116, 119, 121, 123, 124, 125, 126].contains(event.keyCode) { userNavigated?() }
         if plain && event.keyCode == 49, canPeek { if !event.isARepeat { beginPeek(event) }; return }
         if plain && event.keyCode == 53, cancelQuery?() == true { return }
         if plain && (event.keyCode == 123 || event.keyCode == 124), selectedRow >= 0, numberOfColumns > 0 {
