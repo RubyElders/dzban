@@ -1,0 +1,78 @@
+name: Maintenance
+
+on:
+  schedule:
+    - cron: '23 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 2
+  CCACHE_DISABLE: 1
+  RUST_BACKTRACE: 1
+
+jobs:
+  dependencies:
+    name: Security / Dependency advisories
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install Rust and audit tool
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          cargo +1.98.1 install cargo-audit --version 0.22.0 --locked
+      - name: Audit dependencies
+        run: cargo +1.98.1 audit
+
+  coverage:
+    name: Reports / Rust coverage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install Rust and coverage tool
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --component llvm-tools-preview
+          cargo +1.98.1 install cargo-llvm-cov --version 0.8.7 --locked
+      - name: Collect core and CLI coverage
+        run: cargo +1.98.1 llvm-cov --locked -p dzban-core -p dzban-db -p dzban-cli --all-targets --lcov --output-path lcov.info
+      - name: Upload coverage
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: core-cli-coverage
+          path: lcov.info
+          if-no-files-found: error
+
+  history:
+    name: Security / Git history secrets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: 1.26.7
+          cache: false
+      - name: Scan Git history
+        run: |
+          go install github.com/zricethezav/gitleaks/v8@v8.24.3
+          gitleaks git --redact --log-opts=--all .
