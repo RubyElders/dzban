@@ -1,3 +1,5 @@
+import AppKit
+import SwiftUI
 import DzbanBridge
 @testable import DzbanApplication
 import XCTest
@@ -11,13 +13,32 @@ final class NativeWorkspaceTests: XCTestCase {
         let url = directory.appendingPathComponent("workspace.json")
         try Data(#"{"version":1,"tabs":[{"profile":"fixture-slow","draft":"keep draft"}],"selected":0}"#.utf8).write(to: url)
         let store = ApplicationStore(bridge: try Bridge.fixture(), restorationURL: url)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1150, height: 760), styleMask: [.titled], backing: .buffered, defer: false)
+        let host = NSHostingView(rootView: RootView(store: store))
+        host.wantsLayer = true
+        host.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        window.contentView = host
+        window.makeKeyAndOrderFront(nil)
+        defer { window.contentView = NSView(); window.orderOut(nil) }
         let starting = Task { await store.start() }
         let deadline = ContinuousClock.now + .seconds(5)
         while store.pages.first?.phase != .connecting {
             if ContinuousClock.now >= deadline { throw ViewportFailure("Restoration was not admitted") }
             try await Task.sleep(for: .milliseconds(5))
         }
+        XCTAssertTrue(store.restoring)
+        XCTAssertFalse(store.connectionsVisible)
+        if ProcessInfo.processInfo.environment["DZBAN_PARITY_SCREENSHOTS"] != nil { try await Task.sleep(for: .milliseconds(20)) }
+        window.contentView?.layoutSubtreeIfNeeded()
+        if let path = ProcessInfo.processInfo.environment["DZBAN_PARITY_SCREENSHOTS"], let view = window.contentView,
+           let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
+            view.cacheDisplay(in: view.bounds, to: bitmap)
+            let directory = URL(fileURLWithPath: path)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try bitmap.representation(using: .png, properties: [:])?.write(to: directory.appendingPathComponent("restoring-workspace.png"))
+        }
         await store.start()
+        XCTAssertFalse(store.restoring)
         XCTAssertNotNil(store.selectedSession)
         XCTAssertEqual(store.pages.count, 1)
         XCTAssertEqual(store.document?.draft, "keep draft")
@@ -81,6 +102,37 @@ final class NativeWorkspaceTests: XCTestCase {
         let saved = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
         let tabs = try XCTUnwrap(saved["tabs"] as? [[String: Any]])
         XCTAssertEqual(tabs.first?["draft"] as? String, "unsent 😀")
+    }
+
+    func testReorderedNativeTabsKeepSelectionDraftsAndSavedOrder() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("workspace.json")
+        let store = ApplicationStore(bridge: try Bridge.fixture(), restorationURL: url)
+        await store.start()
+        let firstConnected = await store.connect(profile: "fixture")
+        XCTAssertTrue(firstConnected)
+        let first = try XCTUnwrap(store.selectedPage)
+        let firstDocument = try XCTUnwrap(store.document)
+        store.editor(for: firstDocument).edit(text: "SELECT first", selection: .init(location: 0, length: 0))
+        let secondConnected = await store.connect(profile: "fixture")
+        XCTAssertTrue(secondConnected)
+        let second = try XCTUnwrap(store.selectedPage)
+        let secondDocument = try XCTUnwrap(store.document)
+        store.editor(for: secondDocument).edit(text: "SELECT second", selection: .init(location: 0, length: 0))
+        await store.selectPage(first)
+        await store.movePage(second, to: 0)
+        XCTAssertEqual(store.pages.map(\.id), [second, first])
+        XCTAssertEqual(store.selectedPage, first)
+        XCTAssertEqual(store.document?.document, firstDocument.document)
+        XCTAssertEqual(store.editor(for: firstDocument).text, "SELECT first")
+        try await store.shutdown()
+        let restored = ApplicationStore(bridge: try Bridge.fixture(), restorationURL: url)
+        await restored.start()
+        XCTAssertEqual(restored.pages.map { $0.snapshot.draft }, ["SELECT second", "SELECT first"])
+        XCTAssertEqual(restored.selectedPage, restored.pages.last?.id)
+        try await restored.shutdown()
     }
 
     private func pending(_ bridge: Bridge) async throws {

@@ -1049,3 +1049,32 @@ fn shared_health_snapshots_track_sessions_and_bulk_profile_checks_without_extra_
     );
     assert!(dzban_release(app));
 }
+
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn moving_tabs_preserves_selection_and_document_identity() {
+    let app = dzban_macos_bridge::dzban_create_fixture();
+    let first = request(app, json!({"command":"open_tab","draft":"SELECT first"}));
+    let second = request(app, json!({"command":"open_tab","draft":"SELECT second"}));
+    let before = request(app, json!({"command":"tabs"}));
+    let moved = request(
+        app,
+        json!({"command":"move_tab","tab":second["tab"],"index":0}),
+    );
+    assert_eq!(moved["selected"], before["selected"]);
+    assert_eq!(moved["tabs"][0], before["tabs"][1]);
+    assert_eq!(moved["tabs"][1], before["tabs"][0]);
+    let clamped = request(
+        app,
+        json!({"command":"move_tab","tab":second["tab"],"index":99}),
+    );
+    assert_eq!(clamped["tabs"][0]["tab"], first["tab"]);
+    assert_eq!(clamped["tabs"][1]["tab"], second["tab"]);
+    let missing = request(
+        app,
+        json!({"command":"move_tab","tab":uuid::Uuid::new_v4(),"index":0}),
+    );
+    assert_eq!(missing["failure"]["kind"], "unknown_tab");
+    request(app, json!({"command":"shutdown"}));
+    assert!(dzban_release(app));
+}

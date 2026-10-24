@@ -30,8 +30,14 @@ struct QueryTabStrip: View {
                                     else { Image(systemName: "network").frame(width: 18, height: 18) }
                                     Text(title).lineLimit(1)
                                 }
-                            }.accessibilityLabel(title)
+                            }.buttonStyle(.plain).accessibilityLabel(title)
                             .accessibilityIdentifier(workspace.map { "workspace.\($0.id)" } ?? "tab.page.\(page.id)")
+                            .contextMenu {
+                                Button("Move Tab Left") { if let index = store.pages.firstIndex(where: { $0.id == page.id }) { Task { await store.movePage(page.id, to: index - 1) } } }
+                                    .disabled(store.pages.first?.id == page.id)
+                                Button("Move Tab Right") { if let index = store.pages.firstIndex(where: { $0.id == page.id }) { Task { await store.movePage(page.id, to: index + 1) } } }
+                                    .disabled(store.pages.last?.id == page.id)
+                            }
                             ZStack {
                                 if let workspace, workspace.documents.contains(where: { [ExecutionPhase.planning, .running, .canceling].contains($0.execution) }) {
                                     ProgressView().controlSize(.mini).accessibilityLabel("Query running")
@@ -45,6 +51,13 @@ struct QueryTabStrip: View {
                                 Image(systemName: "xmark").font(.caption).frame(width: 18, height: 18)
                             }.accessibilityLabel("Close \(workspace?.documents.first?.title ?? "New Query")")
                                 .accessibilityIdentifier(workspace.map { "connection.close.\($0.id)" } ?? "tab.close.\(page.id)")
+                        }
+                        .draggable(page.id.uuidString)
+                        .dropDestination(for: String.self) { items, _ in
+                            guard let value = items.first, let source = UUID(uuidString: value),
+                                  store.pages.contains(where: { $0.id == source }), let index = store.pages.firstIndex(where: { $0.id == page.id }) else { return false }
+                            Task { await store.movePage(source, to: index) }
+                            return true
                         }
                         .padding(.horizontal, 4).padding(.vertical, 5)
                         .background(store.selectedPage == page.id ? Color.accentColor.opacity(0.15) : .clear, in: RoundedRectangle(cornerRadius: 6))

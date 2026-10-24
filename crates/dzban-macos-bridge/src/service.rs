@@ -47,6 +47,10 @@ pub enum Command {
         tab: Uuid,
         revision: Option<u64>,
     },
+    MoveTab {
+        tab: Uuid,
+        index: usize,
+    },
     CloseTab {
         tab: Uuid,
     },
@@ -839,6 +843,16 @@ impl State {
                         "selection_superseded",
                         "Tab is missing or a newer navigation request is active",
                     ));
+                }
+                Ok(self.tab_inventory())
+            }
+            Command::MoveTab { tab, index } => {
+                if !self
+                    .context
+                    .tabs
+                    .move_tab(dzban_core::tabs::TabId(tab), index)
+                {
+                    return Err(failure("unknown_tab", "Tab is not open"));
                 }
                 Ok(self.tab_inventory())
             }

@@ -60,13 +60,14 @@ public final class ApplicationStore: ObservableObject, QueryInteractionHost {
     @Published public private(set) var isShuttingDown = false
     @Published public private(set) var isClosed = false
     @Published public var failure: String?
+    @Published public var recoveryNotice: String?
     public var historyFocused = false
     @Published public var historyVisible = false {
         didSet { if historyVisible != oldValue { historyFocused = historyVisible } }
     }
     @Published var actionSearchRequest = 0
     @Published public var shortcutsVisible = false
-    public var connectionsVisible: Bool { !isShuttingDown && selectedSession == nil }
+    public var connectionsVisible: Bool { !restoring && !isShuttingDown && selectedSession == nil }
     public var health: [UUID: ConnectionHealth] { connectionHealth.sessions }
     public var profileHealth: [String: ConnectionHealth] { connectionHealth.profiles }
     public var sharedInput: InputProjection? { queryInteraction.input }
@@ -77,7 +78,7 @@ public final class ApplicationStore: ObservableObject, QueryInteractionHost {
     }
     var unseenCompletionCount: Int { attention?.unseenCount ?? 0 }
 
-    private let connectionHealth: ConnectionHealthModel
+    let connectionHealth: ConnectionHealthModel
     private let queryAttention: QueryAttentionModel
     private var featureUpdates: Set<AnyCancellable> = []
     public let bridge: Bridge
@@ -91,7 +92,7 @@ public final class ApplicationStore: ObservableObject, QueryInteractionHost {
     #endif
     private let workspaceLocation: WorkspaceLocation?
     private var startup: Task<Void, Never>?
-    private var restoring = false
+    @Published public private(set) var restoring = false
     private var controlRevision: UInt64 = 0
     private var navigationRevision: UInt64 = 0
     private var observations: [UUID: Task<Void, Never>] = [:]
@@ -103,6 +104,7 @@ public final class ApplicationStore: ObservableObject, QueryInteractionHost {
 
     public init(bridge: Bridge, resultSource: (any ResultSource)? = nil, restorationURL: URL? = nil, restoreWorkspace: Bool = false) {
         workspaceLocation = restorationURL.map { WorkspaceLocation(host: .macos, path: $0.path) } ?? (restoreWorkspace ? WorkspaceLocation(host: .macos) : nil)
+        restoring = restorationURL != nil || restoreWorkspace
         self.bridge = bridge
         let application = ApplicationClient(bridge: bridge)
         self.application = application
@@ -132,6 +134,10 @@ public final class ApplicationStore: ObservableObject, QueryInteractionHost {
         queryInteraction.objectWillChange.sink { [weak self] in self?.objectWillChange.send() }.store(in: &featureUpdates)
         connectionHealth.objectWillChange.sink { [weak self] in self?.objectWillChange.send() }.store(in: &featureUpdates)
         queryAttention.objectWillChange.sink { [weak self] in self?.objectWillChange.send() }.store(in: &featureUpdates)
+        connectionHealth.recovered = { [weak self] _ in
+            guard let self, self.navigationAvailable else { return }
+            self.recoveryNotice = "Connection restored. " + ConnectionHealth.resetMessage
+        }
         connectionHealth.start()
         queryAttention.start()
     }
@@ -410,6 +416,14 @@ public final class ApplicationStore: ObservableObject, QueryInteractionHost {
     public func chooseConnections() async {
         guard navigationAvailable else { return }
         if selectedSession != nil { await newDocument() }
+    }
+
+    public func movePage(_ page: UUID, to index: Int) async {
+        guard navigationAvailable, !restoring, index >= 0, pages.contains(where: { $0.id == page }), !closingTabs.contains(page) else { return }
+        do {
+            adopt(try await application.moveTab(page, index: index))
+            try await saveWorkspace()
+        } catch { show(error) }
     }
 
     public func selectPage(_ page: UUID) async {

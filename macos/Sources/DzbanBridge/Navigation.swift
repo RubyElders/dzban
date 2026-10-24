@@ -106,6 +106,7 @@ public struct CreatedTab: Decodable, Sendable {
 extension BridgeCommand {
     public static var tabs: Self { Self(command: "tabs") }
     public static func openTab(profile: String? = nil, draft: String = "", revision: UInt64? = nil) -> Self { Self(command: "open_tab", profile: profile, draft: draft, revision: revision) }
+    public static func moveTab(_ tab: UUID, index: Int) -> Self { Self(command: "move_tab", tab: tab, index: index) }
     public static func cycleTabs(_ direction: Int, revision: UInt64? = nil) -> Self { Self(command: "cycle_tabs", revision: revision, direction: direction) }
     public static func selectTab(_ tab: UUID, revision: UInt64? = nil) -> Self { Self(command: "select_tab", tab: tab, revision: revision) }
     public static func cancelTabConnection(_ tab: UUID) -> Self { Self(command: "cancel_tab_connection", tab: tab) }

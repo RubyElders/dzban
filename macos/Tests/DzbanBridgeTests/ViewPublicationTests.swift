@@ -99,6 +99,34 @@ final class ViewPublicationTests: XCTestCase {
         try await bridge.shutdown()
     }
 
+    func testContentWidthsFollowAvailableSpaceAndPreserveManualResizing() async throws {
+        let store = ApplicationStore(bridge: try Bridge.fixture())
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1200, height: 760), styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+        window.contentView = NSHostingView(rootView: RootView(store: store))
+        window.makeKeyAndOrderFront(nil)
+        defer { window.contentView = NSView(); window.orderOut(nil) }
+        await store.start()
+        let connected = await store.connect(profile: "fixture")
+        XCTAssertTrue(connected)
+        let document = try XCTUnwrap(store.document)
+        store.editor(for: document).restore(text: "huge")
+        await store.performEditorIntent(.submit)
+        try await until { self.resultTable(in: window.contentView)?.numberOfColumns == 2 }
+        let table = try XCTUnwrap(resultTable(in: window.contentView))
+        try await until { table.tableColumns[1].width > 600 }
+        XCTAssertLessThan(table.tableColumns[0].width, 100)
+        let wide = table.tableColumns[1].width
+        window.setContentSize(NSSize(width: 960, height: 760))
+        try await until { table.tableColumns[1].width < wide }
+        window.setContentSize(NSSize(width: 1200, height: 760))
+        try await until { abs(table.tableColumns[1].width - wide) < 1 }
+        table.tableColumns[1].width = 420
+        window.setContentSize(NSSize(width: 1000, height: 760))
+        window.contentView?.layoutSubtreeIfNeeded()
+        XCTAssertEqual(table.tableColumns[1].width, 420, accuracy: 1)
+        try await store.shutdown()
+    }
+
     func testWideSchemaKeepsColumnWidthsAfterNarrowResultsAndWindowResize() async throws {
         let store = ApplicationStore(bridge: try Bridge.fixture())
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1200, height: 760), styleMask: [.titled, .resizable], backing: .buffered, defer: false)
@@ -119,11 +147,13 @@ final class ViewPublicationTests: XCTestCase {
             }
         }
         let table = try XCTUnwrap(resultTable(in: window.contentView))
+        let initialWidth = try XCTUnwrap(table.tableColumns.last).width
+        XCTAssertGreaterThan(initialWidth, 70)
         for width in [1200.0, 960.0, 1150.0] {
             window.setContentSize(NSSize(width: width, height: 760))
             window.contentView?.layoutSubtreeIfNeeded()
             await Task.yield()
-            XCTAssertEqual(table.tableColumns.last?.width ?? 0, 170, accuracy: 1)
+            XCTAssertEqual(table.tableColumns.last?.width ?? 0, initialWidth, accuracy: 1)
         }
         try await store.shutdown()
     }
@@ -155,13 +185,14 @@ final class ViewPublicationTests: XCTestCase {
         try await until { store.document?.execution == .finished && store.results.columns.count == 128 }
         try await until(details: "columns=\(self.resultTable(in: window.contentView)?.numberOfColumns.description ?? "missing") visible=\(window.isVisible)") { self.resultTable(in: window.contentView)?.numberOfColumns == 128 }
         let table = try XCTUnwrap(resultTable(in: window.contentView))
+        try await until { table.numberOfRows == 500 }
         table.focusedColumn = 127
         table.selectRowIndexes(IndexSet(integer: 499), byExtendingSelection: false)
         table.scrollRowToVisible(499)
         table.scrollColumnToVisible(127)
         let generation = try XCTUnwrap(store.document).generation
         await store.performEditorIntent(.submit)
-        try await until { (store.document?.generation ?? 0) > generation && store.document?.execution == .finished && store.results.selected?.row == 499 }
+        try await until(details: "generation=\(store.document?.generation.description ?? "none") selection=\(store.results.selected?.row.description ?? "none") saved=\(store.results.tablePositions[document.document]?.row?.description ?? "none") table=\(table.selectedRow)/\(table.numberOfRows)") { (store.document?.generation ?? 0) > generation && store.document?.execution == .finished && store.results.selected?.row == 499 }
         try await until {
             table.selectedRow == 499 && table.focusedColumn == 127
                 && store.results.value(row: 499, column: 127) != nil
