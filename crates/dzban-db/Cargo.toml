@@ -20,6 +20,8 @@ async-trait.workspace = true
 reqwest.workspace = true
 uuid.workspace = true
 futures-util = "=0.3.34"
+postgres-protocol = "0.6"
+fallible-iterator = "0.2"
 
 # Logging
 tracing.workspace = true
