@@ -521,7 +521,9 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "dzban-core",
+ "fallible-iterator",
  "futures-util",
+ "postgres-protocol",
  "reqwest",
  "serde",
  "serde_json",
