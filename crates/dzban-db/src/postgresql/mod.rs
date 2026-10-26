@@ -1,6 +1,6 @@
 use crate::config::{DatabaseBackend, DatabaseConfig};
 use crate::errors::format_error_chain;
-use crate::postgres_value::{display_value, is_null};
+use crate::postgres_value::{ValueFormat, display_formatted, is_null, needs_money_scale};
 use crate::result::{QueryEstimate, QueryPlan, ResultCell, ResultColumn, ResultSet};
 use async_trait::async_trait;
 use dzban_core::adapter::DatabaseSession;
@@ -17,10 +17,14 @@ pub(crate) struct PostgresSession {
     client: RwLock<Option<Arc<Client>>>,
 }
 
-fn result_set(statement: &tokio_postgres::Statement, rows: &[tokio_postgres::Row]) -> ResultSet {
+fn result_set(
+    statement: &tokio_postgres::Statement,
+    rows: &[tokio_postgres::Row],
+    format: ValueFormat,
+) -> ResultSet {
     ResultSet {
         columns: result_columns(statement),
-        rows: rows.iter().map(result_row).collect(),
+        rows: rows.iter().map(|row| result_row(row, format)).collect(),
     }
 }
 
@@ -35,7 +39,7 @@ fn result_columns(statement: &tokio_postgres::Statement) -> Vec<ResultColumn> {
         .collect()
 }
 
-fn result_row(row: &tokio_postgres::Row) -> Vec<ResultCell> {
+fn result_row(row: &tokio_postgres::Row, format: ValueFormat) -> Vec<ResultCell> {
     row.columns()
         .iter()
         .enumerate()
@@ -43,10 +47,33 @@ fn result_row(row: &tokio_postgres::Row) -> Vec<ResultCell> {
             if is_null(row, index) {
                 ResultCell::Null
             } else {
-                ResultCell::Text(display_value(row, index))
+                ResultCell::Text(display_formatted(row, index, format))
             }
         })
         .collect()
+}
+
+async fn value_format(
+    client: &Client,
+    statement: &tokio_postgres::Statement,
+) -> Result<ValueFormat, dzban_core::error::ExecutionError> {
+    let money_scale = if statement
+        .columns()
+        .iter()
+        .any(|column| needs_money_scale(column.type_()))
+    {
+        let row = client
+            .query_one(
+                "SELECT pg_catalog.scale(0::pg_catalog.money::pg_catalog.numeric)",
+                &[],
+            )
+            .await
+            .map_err(|error| dzban_core::error::ExecutionError::Database(postgres_error(&error)))?;
+        Some(row.get::<_, i32>(0) as u32)
+    } else {
+        None
+    };
+    Ok(ValueFormat::with_money_scale(money_scale))
 }
 
 impl PostgresSession {
@@ -100,7 +127,7 @@ impl DatabaseSession for PostgresSession {
                     &error,
                 )))
             })?;
-        let result = result_set(&statement, &rows);
+        let result = result_set(&statement, &rows, ValueFormat::default());
         crate::catalog::entries(
             DatabaseBackend::Postgresql,
             &self.config.database,
@@ -206,12 +233,13 @@ impl DatabaseSession for PostgresSession {
                 },
             ));
         }
+        let format = value_format(&client, &statement).await?;
         let rows = client
             .query(&statement, &[])
             .await
             .map_err(|error| ExecutionError::Database(postgres_error(&error)))?;
         Ok(dzban_core::ExecutionOutcome::Rows(result_set(
-            &statement, &rows,
+            &statement, &rows, format,
         )))
     }
 
@@ -242,6 +270,7 @@ impl DatabaseSession for PostgresSession {
                 affected_rows: Some(affected_rows),
             }));
         }
+        let format = value_format(&client, &statement).await?;
         let mut delivery = results.schema(result_columns(&statement)).await?;
         let mut stream = Box::pin(
             client
@@ -270,7 +299,7 @@ impl DatabaseSession for PostgresSession {
                 }
             };
             if delivery == Delivery::Continue && storage_failure.is_none() {
-                match results.row(result_row(&row)).await {
+                match results.row(result_row(&row, format)).await {
                     Ok(next) => delivery = next,
                     Err(error) => storage_failure = Some(error),
                 }

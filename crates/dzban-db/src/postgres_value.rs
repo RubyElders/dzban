@@ -3,6 +3,44 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use tokio_postgres::Row;
 use tokio_postgres::types::{FromSql, Kind, Type};
 
+#[cfg(test)]
+mod advanced_tests;
+mod containers;
+mod geometry;
+mod text_search;
+mod wire;
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ValueFormat {
+    money_scale: Option<u32>,
+    depth: usize,
+}
+
+impl ValueFormat {
+    pub(crate) fn with_money_scale(money_scale: Option<u32>) -> Self {
+        Self {
+            money_scale,
+            depth: 0,
+        }
+    }
+    fn nested(self) -> Option<Self> {
+        (self.depth < 64).then_some(Self {
+            depth: self.depth + 1,
+            ..self
+        })
+    }
+}
+
+pub(crate) fn needs_money_scale(type_: &Type) -> bool {
+    match type_.kind() {
+        Kind::Domain(inner) | Kind::Array(inner) | Kind::Range(inner) | Kind::Multirange(inner) => {
+            needs_money_scale(inner)
+        }
+        Kind::Composite(fields) => fields.iter().any(|field| needs_money_scale(field.type_())),
+        _ => *type_ == Type::MONEY || *type_ == Type::RECORD,
+    }
+}
+
 struct RawValue(Vec<u8>);
 
 impl<'a> FromSql<'a> for RawValue {
@@ -15,7 +53,12 @@ impl<'a> FromSql<'a> for RawValue {
     }
 }
 
-pub(crate) fn display_value(row: &Row, index: usize) -> String {
+#[cfg(test)]
+fn display_value(row: &Row, index: usize) -> String {
+    display_formatted(row, index, ValueFormat::default())
+}
+
+pub(crate) fn display_formatted(row: &Row, index: usize, format: ValueFormat) -> String {
     if let Ok(value) = row.try_get::<_, Option<String>>(index) {
         return value.unwrap_or_else(|| "NULL".to_string());
     }
@@ -67,7 +110,7 @@ pub(crate) fn display_value(row: &Row, index: usize) -> String {
 
     let type_ = row.columns()[index].type_();
     match row.try_get::<_, Option<RawValue>>(index) {
-        Ok(Some(value)) => format_raw(type_, &value.0),
+        Ok(Some(value)) => format_with(type_, &value.0, format),
         Ok(None) => "NULL".to_string(),
         Err(_) => format!("Unable to display {} value", type_.name()),
     }
@@ -77,25 +120,34 @@ pub(crate) fn is_null(row: &Row, index: usize) -> bool {
     matches!(row.try_get::<_, Option<RawValue>>(index), Ok(None))
 }
 
+#[cfg(test)]
 fn format_raw(type_: &Type, raw: &[u8]) -> String {
+    format_with(type_, raw, ValueFormat::default())
+}
+
+fn format_with(type_: &Type, raw: &[u8], format: ValueFormat) -> String {
+    let Some(nested) = format.nested() else {
+        return fallback(type_, raw);
+    };
     if let Kind::Domain(inner) = type_.kind() {
-        return format_raw(inner, raw);
+        return format_with(inner, raw, nested);
     }
     if let Kind::Enum(_) = type_.kind() {
         return String::from_utf8_lossy(raw).into_owned();
     }
-    if let Kind::Array(member) = type_.kind()
-        && let Ok(values) = <Vec<Option<RawValue>> as FromSql>::from_sql(type_, raw)
-    {
-        let values = values
-            .into_iter()
-            .map(|value| {
-                value
-                    .map(|value| format_array_value(member, &value.0))
-                    .unwrap_or_else(|| "NULL".to_string())
-            })
-            .collect::<Vec<_>>();
-        return format!("{{{}}}", values.join(", "));
+    if *type_ == Type::INT2_VECTOR || *type_ == Type::OID_VECTOR {
+        return containers::vector(type_, raw, nested).unwrap_or_else(|| fallback(type_, raw));
+    }
+    let container = match type_.kind() {
+        Kind::Array(member) => Some(containers::array(member, raw, nested)),
+        Kind::Range(member) => Some(containers::range(member, raw, nested)),
+        Kind::Multirange(member) => Some(containers::multirange(member, raw, nested)),
+        Kind::Composite(_) => Some(containers::record(type_, raw, nested)),
+        _ if *type_ == Type::RECORD => Some(containers::record(type_, raw, nested)),
+        _ => None,
+    };
+    if let Some(value) = container {
+        return value.unwrap_or_else(|| fallback(type_, raw));
     }
 
     match type_.name() {
@@ -126,6 +178,22 @@ fn format_raw(type_: &Type, raw: &[u8]) -> String {
         | "lquery" | "ltxtquery" => String::from_utf8_lossy(raw).into_owned(),
         "json" => String::from_utf8_lossy(raw).into_owned(),
         "jsonb" if raw.first() == Some(&1) => String::from_utf8_lossy(&raw[1..]).into_owned(),
+        "jsonpath" if raw.first() == Some(&1) => std::str::from_utf8(&raw[1..])
+            .map(str::to_owned)
+            .unwrap_or_else(|_| fallback(type_, raw)),
+        "hstore" => containers::hstore(type_, raw).unwrap_or_else(|| fallback(type_, raw)),
+        "point" | "box" | "path" | "line" | "lseg" | "polygon" | "circle" => {
+            geometry::format(type_, raw).unwrap_or_else(|| fallback(type_, raw))
+        }
+        "tsvector" => text_search::vector(raw).unwrap_or_else(|| fallback(type_, raw)),
+        "tsquery" => text_search::query(raw).unwrap_or_else(|| fallback(type_, raw)),
+        "money" => format
+            .money_scale
+            .and_then(|scale| wire::money(raw, scale))
+            .unwrap_or_else(|| fallback(type_, raw)),
+        "pg_snapshot" | "txid_snapshot" => {
+            wire::snapshot(raw).unwrap_or_else(|| fallback(type_, raw))
+        }
         "xid" | "cid" | "oid" | "regproc" | "regprocedure" | "regoper" | "regoperator"
         | "regclass" | "regtype" | "regconfig" | "regdictionary" | "regnamespace" | "regrole"
         | "regcollation" => read_u32(raw)
@@ -166,15 +234,6 @@ fn format_raw(type_: &Type, raw: &[u8]) -> String {
             .unwrap_or_else(|| fallback(type_, raw)),
         "bit" | "varbit" => format_bits(raw).unwrap_or_else(|| fallback(type_, raw)),
         _ => fallback(type_, raw),
-    }
-}
-
-fn format_array_value(type_: &Type, raw: &[u8]) -> String {
-    let value = format_raw(type_, raw);
-    if value.contains([',', '{', '}', '"', '\\', ' ', '\n', '\r', '\t']) {
-        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
-    } else {
-        value
     }
 }
 
