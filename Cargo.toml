@@ -10,7 +10,7 @@ members = [
 
 [workspace.dependencies]
 # Shared dependencies with locked versions
-glib = "0.21"
+glib = "0.22"
 tokio = { version = "1", features = ["full"] }
 tokio-postgres = { version = "0.7", features = ["runtime", "with-serde_json-1"] }
 tokio-postgres-rustls = { version = "0.14", features = ["native-certs", "ring"] }
