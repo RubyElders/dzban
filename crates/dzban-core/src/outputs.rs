@@ -1,4 +1,5 @@
 mod export;
+pub mod grid;
 mod history;
 pub mod view;
 

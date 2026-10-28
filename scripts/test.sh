@@ -97,7 +97,7 @@ screens() {
     if [[ -n ${DZBAN_UI_SCENARIO:-} ]]; then
         scenarios=("$DZBAN_UI_SCENARIO")
     else
-        scenarios=(empty database clickhouse shutdown restore streaming-postgres streaming-clickhouse)
+        scenarios=(empty database clickhouse shutdown restore streaming-postgres streaming-clickhouse result-grid)
     fi
     for scenario in "${scenarios[@]}"; do
         PYTHONPATH="$system_paths${PYTHONPATH:+:$PYTHONPATH}" \

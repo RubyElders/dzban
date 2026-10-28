@@ -657,6 +657,7 @@ fn copying_selected_rows_publishes_complete_markdown() {
     harness.finished(&page);
     wait_until("streamed rows", || page.results().available_rows() == 3);
     page.results().focus();
+    page.results().toggle_result_rows();
     page.results().copy_selection();
     wait_until("the copy to finish", || !page.results().is_copying());
     let clipboard = page.results().widget().clipboard();
@@ -664,8 +665,223 @@ fn copying_selected_rows_publishes_complete_markdown() {
         .block_on(clipboard.read_text_future())
         .unwrap()
         .unwrap();
-    assert!(text.starts_with("| id | value |"), "{text}");
+    assert!(text.starts_with("| # | id | value |"), "{text}");
     assert!(text.contains("row 0"), "{text}");
+}
+
+fn result_key(view: &gtk4::ColumnView, key: gdk::Key, modifiers: gdk::ModifierType) {
+    let controllers = view.observe_controllers();
+    let keys = (0..controllers.n_items())
+        .find_map(|index| {
+            controllers
+                .item(index)
+                .and_downcast::<gtk4::EventControllerKey>()
+        })
+        .unwrap();
+    assert!(keys.emit_by_name::<bool>("key-pressed", &[&key, &0_u32, &modifiers]));
+}
+
+fn copied_results(results: &super::results::ResultPanel) -> String {
+    results.copy_selection();
+    wait_until("result clipboard export", || !results.is_copying());
+    glib::MainContext::default()
+        .block_on(results.widget().clipboard().read_text_future())
+        .unwrap()
+        .unwrap()
+        .to_string()
+}
+
+#[gtk4::test]
+#[ignore = "requires a graphical display"]
+fn returning_to_results_keeps_native_focus_on_the_shared_cursor_row() {
+    super::window::install_styles();
+    fn has_label(widget: &gtk4::Widget, text: &str) -> bool {
+        if widget
+            .downcast_ref::<gtk4::Label>()
+            .is_some_and(|label| label.text() == text)
+        {
+            return true;
+        }
+        let mut child = widget.first_child();
+        while let Some(widget) = child {
+            if has_label(&widget, text) {
+                return true;
+            }
+            child = widget.next_sibling();
+        }
+        false
+    }
+    let harness = harness();
+    let page = harness.connect("fixture");
+    harness.run(&page, "rows");
+    harness.finished(&page);
+    wait_until("result rows", || page.results().available_rows() == 3);
+    page.results().focus();
+    let view = page.results().table().unwrap();
+    for _ in 0..2 {
+        result_key(&view, gdk::Key::Down, gdk::ModifierType::NO_MODIFIER_MASK);
+    }
+    assert_eq!(page.results().selected(), Some(2));
+    assert!(page.editor().focus());
+    assert!(page.results().focus());
+    gtk4::test_widget_wait_for_draw(&view);
+    let window = view.root().and_downcast::<gtk4::Window>().unwrap();
+    wait_until("native focus on row three", || {
+        let Some(focus) = gtk4::prelude::GtkWindowExt::focus(&window) else {
+            return false;
+        };
+        has_label(&focus, "3")
+    });
+    assert_eq!(page.results().selected(), Some(2));
+    assert_eq!(copied_results(page.results()), "2");
+    wait_until("the cursor cell to render", || {
+        has_label(view.upcast_ref(), "row 2")
+    });
+    harness.capture("grid-restored-cursor-focus");
+}
+
+#[gtk4::test]
+#[ignore = "requires a graphical display"]
+fn result_cells_ranges_headers_and_row_numbers_have_distinct_copy_contracts() {
+    let harness = harness();
+    let page = harness.connect("fixture");
+    harness.run(&page, "rows");
+    harness.finished(&page);
+    wait_until("result rows", || page.results().available_rows() == 3);
+    page.results().focus();
+    let view = page.results().table().unwrap();
+    assert_eq!(copied_results(page.results()), "0");
+    result_key(&view, gdk::Key::Right, gdk::ModifierType::SHIFT_MASK);
+    assert!(copied_results(page.results()).starts_with("| id | value |\n"));
+    result_key(&view, gdk::Key::Down, gdk::ModifierType::SHIFT_MASK);
+    let rectangle = copied_results(page.results());
+    assert!(
+        rectangle.contains("| 0 | row 0 |\n") && rectangle.contains("| 1 | NULL |\n"),
+        "{rectangle}"
+    );
+    result_key(&view, gdk::Key::Up, gdk::ModifierType::SHIFT_MASK);
+    result_key(&view, gdk::Key::space, gdk::ModifierType::CONTROL_MASK);
+    assert!(copied_results(page.results()).starts_with("| # | id | value |\n"));
+    result_key(&view, gdk::Key::space, gdk::ModifierType::CONTROL_MASK);
+    assert_eq!(copied_results(page.results()), "row 0");
+    page.results().select_cell_for_test(0, 0, false);
+    assert_eq!(copied_results(page.results()), "| # |\n| --- |\n| 1 |\n");
+    let header = view
+        .first_child()
+        .unwrap()
+        .first_child()
+        .unwrap()
+        .next_sibling()
+        .unwrap();
+    let controllers = header.observe_controllers();
+    gtk4::test_widget_wait_for_draw(&view);
+    wait_until("allocated result header", || header.width() > 32);
+    let click = (0..controllers.n_items())
+        .filter_map(|index| controllers.item(index).and_downcast::<gtk4::GestureClick>())
+        .find(|click| click.name().as_deref() == Some("result-column-selection"))
+        .unwrap();
+    click.emit_by_name::<()>("pressed", &[&1_i32, &20.0_f64, &8.0_f64]);
+    assert_eq!(
+        copied_results(page.results()),
+        "| id |\n| --- |\n| 0 |\n| 1 |\n| 2 |\n"
+    );
+    fn number(widget: &gtk4::Widget) -> Option<gtk4::Label> {
+        if let Some(label) = widget.downcast_ref::<gtk4::Label>()
+            && label.text() == "2"
+            && label.has_css_class("dim-label")
+        {
+            return Some(label.clone());
+        }
+        let mut child = widget.first_child();
+        while let Some(widget) = child {
+            if let Some(label) = number(&widget) {
+                return Some(label);
+            }
+            child = widget.next_sibling();
+        }
+        None
+    }
+    let number = number(view.upcast_ref()).unwrap();
+    let click = [Some(number.clone().upcast()), number.parent()]
+        .into_iter()
+        .flatten()
+        .flat_map(|widget| {
+            let controllers = widget.observe_controllers();
+            (0..controllers.n_items()).filter_map(move |index| {
+                controllers.item(index).and_downcast::<gtk4::GestureClick>()
+            })
+        })
+        .find(|click| click.name().as_deref() == Some("result-row-selection"))
+        .unwrap();
+    click.emit_by_name::<()>("pressed", &[&1_i32, &20.0_f64, &8.0_f64]);
+    assert!(copied_results(page.results()).contains("| 2 | 1 | NULL |\n"));
+    harness.capture("grid-cell-column-selection");
+}
+
+#[gtk4::test]
+#[ignore = "requires a graphical display"]
+fn sticky_result_columns_preserve_scroll_and_restore_with_matching_schema() {
+    let harness = harness();
+    let page = harness.connect("fixture");
+    harness.run(&page, "wide");
+    harness.finished(&page);
+    wait_until("result rows", || page.results().available_rows() == 500);
+    let view = page.results().table().unwrap();
+    wait_until("result geometry", || {
+        view.hadjustment().unwrap().upper() > 3000.0
+    });
+    let h = view.hadjustment().unwrap();
+    let v = view.vadjustment().unwrap();
+    h.set_value(1500.0);
+    v.set_value(1200.0);
+    gtk4::test_widget_wait_for_draw(&view);
+    assert!(
+        (h.value() - 1500.0).abs() < 1.0 && (v.value() - 1200.0).abs() < 1.0,
+        "scroll before lock: {:?}",
+        (h.value(), v.value())
+    );
+    page.results()
+        .widget()
+        .activate_action("results.freeze-40", None)
+        .unwrap();
+    let (left, right) = page.results().sticky_views();
+    wait_until("sticky columns", || left.is_visible() && right.is_visible());
+    gtk4::test_widget_wait_for_draw(&view);
+    assert!(
+        (h.value() - 1500.0).abs() < 1.0 && (v.value() - 1200.0).abs() < 1.0,
+        "scroll after lock: {:?}",
+        (h.value(), v.value())
+    );
+    assert!(
+        left.width() >= 80 && left.width() < 100,
+        "left width {}",
+        left.width()
+    );
+    assert!(
+        right.width() > 0 && right.width() < 400,
+        "right width {}",
+        right.width()
+    );
+    let right_view = right.child().and_downcast::<gtk4::ColumnView>().unwrap();
+    assert!((right_view.vadjustment().unwrap().value() - v.value()).abs() < 1.0);
+    let before = (h.value(), v.value());
+    page.results().select_cell_for_test(50, 40, false);
+    result_key(&view, gdk::Key::space, gdk::ModifierType::CONTROL_MASK);
+    result_key(&view, gdk::Key::space, gdk::ModifierType::CONTROL_MASK);
+    assert!((h.value() - before.0).abs() < 1.0);
+    harness.capture("grid-frozen-both-edges");
+    harness.run(&page, "wide");
+    harness.finished(&page);
+    wait_until("restored sticky columns", || {
+        page.results().table().is_some_and(|current| {
+            current != view && (current.hadjustment().unwrap().value() - before.0).abs() < 1.0
+        }) && page.results().sticky_views().1.is_visible()
+    });
+    harness.capture("grid-frozen-restored");
+    harness.run(&page, "rows");
+    harness.finished(&page);
+    wait_until("new result schema", || page.results().available_rows() == 3);
+    assert!(!page.results().sticky_views().1.is_visible());
 }
 
 #[gtk4::test]
@@ -799,11 +1015,7 @@ fn repeated_fast_queries_keep_the_viewport_after_layout_settles() {
     }
     harness.capture("scroll-after");
     let current = page.results().table().unwrap();
-    let scroll = current
-        .ancestor(gtk4::ScrolledWindow::static_type())
-        .and_downcast::<gtk4::ScrolledWindow>()
-        .unwrap();
-    let controllers = scroll.observe_controllers();
+    let controllers = page.results().widget().observe_controllers();
     let wheel = (0..controllers.n_items())
         .find_map(|index| {
             controllers

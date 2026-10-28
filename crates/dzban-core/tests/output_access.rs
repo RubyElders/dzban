@@ -97,6 +97,27 @@ impl DatabaseSession for Session {
             }
             return Ok(None);
         }
+        if sql == "paged grid export" {
+            sink.schema(vec![
+                ResultColumn {
+                    name: "large".into(),
+                    type_name: "text".into(),
+                },
+                ResultColumn {
+                    name: "value".into(),
+                    type_name: "text".into(),
+                },
+            ])
+            .await?;
+            for row in 0..5 {
+                sink.row(vec![
+                    ResultCell::Text("x".repeat(700 * 1024)),
+                    ResultCell::Text(format!("value{row}")),
+                ])
+                .await?;
+            }
+            return Ok(None);
+        }
         if sql == "large export" {
             sink.schema(vec![ResultColumn {
                 name: "value".into(),
@@ -217,6 +238,81 @@ async fn exported(mut export: OutputExport) -> (String, bool) {
             return (text, chunk.is_null);
         }
     }
+}
+
+#[tokio::test]
+async fn grid_exports_project_columns_and_distinguish_raw_values_from_markdown() {
+    use dzban_core::outputs::grid::GridCopy;
+    let fixture = Fixture::new();
+    let tab = fixture.connect().await;
+    let reader = fixture.reader(&tab).await;
+    let single = reader
+        .export_grid(GridCopy {
+            rows: vec![RowRange { start: 0, end: 1 }],
+            columns: vec![2],
+        })
+        .await
+        .unwrap();
+    assert_eq!(exported(single).await, ("NULL".into(), false));
+    let number = reader
+        .export_grid(GridCopy {
+            rows: vec![RowRange { start: 1, end: 2 }],
+            columns: vec![0],
+        })
+        .await
+        .unwrap();
+    assert_eq!(exported(number).await.0, "| # |\n| --- |\n| 2 |\n");
+    let projected = reader
+        .export_grid(GridCopy {
+            rows: vec![RowRange { start: 0, end: 2 }],
+            columns: vec![0, 1],
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        exported(projected).await.0,
+        "| # | value |\n| --- | --- |\n| 1 | NULL |\n| 2 | žluť<br>😀é |\n"
+    );
+    assert!(matches!(
+        reader
+            .export_grid(GridCopy {
+                rows: vec![RowRange { start: 0, end: 2 }],
+                columns: vec![3]
+            })
+            .await,
+        Err(OutputError::InvalidSelection)
+    ));
+}
+
+#[tokio::test]
+async fn grid_copy_continues_across_byte_limited_disk_pages() {
+    let fixture = Fixture::new();
+    let tab = fixture.connect().await;
+    tab.submit(
+        "paged grid export".into(),
+        dzban_core::result_store::ResultLimits {
+            memory_rows: 1,
+            ..Default::default()
+        },
+        None,
+    )
+    .unwrap()
+    .wait()
+    .await
+    .unwrap();
+    let reader = fixture.context.result_reader(scope(&tab)).unwrap();
+    assert!(reader.page(0, 5).await.unwrap().rows.len() < 5);
+    let selection = dzban_core::outputs::grid::GridCopy {
+        rows: vec![RowRange { start: 0, end: 5 }],
+        columns: vec![0, 2],
+    };
+    let text = exported(reader.export_grid(selection).await.unwrap())
+        .await
+        .0;
+    assert_eq!(
+        text,
+        "| # | value |\n| --- | --- |\n| 1 | value0 |\n| 2 | value1 |\n| 3 | value2 |\n| 4 | value3 |\n| 5 | value4 |\n"
+    );
 }
 
 #[tokio::test]

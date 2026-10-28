@@ -691,6 +691,12 @@ impl Shell {
         };
         add(Action::FocusEditor, None, ready);
         add(Action::FocusResults, None, ready);
+        let has_rows = page
+            .as_ref()
+            .is_some_and(|page| page.results().available_rows() > 0);
+        add(Action::CopyResults, None, has_rows);
+        add(Action::ToggleResultRows, None, has_rows);
+        add(Action::ToggleFrozenColumn, None, has_rows);
         add(Action::ShowConnections, None, true);
         add(Action::ToggleHistory, None, true);
         add(Action::FocusHistory, None, true);
@@ -846,6 +852,16 @@ impl Shell {
             }
             Action::CopyResults => page.is_some_and(|page| {
                 page.results().copy_selection();
+                true
+            }),
+            Action::ToggleResultRows => page.is_some_and(|page| {
+                page.results().focus();
+                page.results().toggle_result_rows();
+                true
+            }),
+            Action::ToggleFrozenColumn => page.is_some_and(|page| {
+                page.results().focus();
+                page.results().toggle_frozen_column();
                 true
             }),
             Action::ShowShortcuts => {
@@ -1080,6 +1096,8 @@ impl Shell {
                     | Action::StopQuery
                     | Action::PreviewRow
                     | Action::CopyResults
+                    | Action::ToggleResultRows
+                    | Action::ToggleFrozenColumn
             ) {
                 return glib::Propagation::Proceed;
             }
@@ -1412,6 +1430,22 @@ pub fn install_styles() {
         }
         columnview.result-table row:selected {
             background-color: alpha(@accent_bg_color, 0.25);
+        }
+        columnview.result-table.cell-selection row:selected {
+            background-color: transparent;
+            color: @view_fg_color;
+        }
+        columnview.result-table.cell-selection row {
+            outline: none;
+        }
+        columnview.result-table .result-selected {
+            background-color: alpha(@accent_bg_color, 0.2);
+        }
+        columnview.result-table .result-column-selected {
+            background-color: alpha(@accent_bg_color, 0.2);
+        }
+        .result-frozen {
+            background-color: @view_bg_color;
         }
         columnview.result-table .result-cursor {
             background-color: alpha(@accent_bg_color, 0.45);
