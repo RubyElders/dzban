@@ -7,8 +7,9 @@ use std::time::{Duration, Instant};
 use dzban_core::ResultColumn;
 use dzban_core::documents::DocumentId;
 use dzban_core::execution::SessionId;
+use dzban_core::outputs::OutputExport;
+use dzban_core::outputs::grid::{ResultGrid, SelectionGesture, SelectionMode};
 use dzban_core::outputs::view::{RestorationState, ResultViewRequest};
-use dzban_core::outputs::{OutputExport, RowRange};
 use dzban_core::outputs::{ResultReader, ResultScope};
 use dzban_core::presentation::{DocumentPresentation, ResultProgress};
 use dzban_core::preview::{PeekEvent, PreviewSurface};
@@ -26,7 +27,10 @@ use super::row_inspector::RowInspector;
 
 const MAX_COLUMN_WIDTH: i32 = 360;
 const CELL_SPACE: i32 = 16;
-const HEADER_SPACE: i32 = 32;
+const HEADER_SPACE: i32 = 52;
+const ROW_NUMBER_WIDTH: i32 = 80;
+
+mod grid;
 const PREVIEW_CHARS: usize = 512;
 const TOOLTIP_CHARS: usize = 16_384;
 const INSPECTOR_CHARS: usize = 8_192;
@@ -59,6 +63,7 @@ struct Restore {
     column: usize,
     horizontal: f64,
     vertical: f64,
+    grid: Option<ResultGrid>,
 }
 
 #[derive(Clone, Copy)]
@@ -109,7 +114,7 @@ fn size_columns(view: &gtk4::ColumnView, widths: &RefCell<Vec<ColumnWidth>>) {
     let assigned = fit_widths(
         &base,
         &preferred,
-        (adjustment.page_size() as i32 - 56).max(0),
+        (adjustment.page_size() as i32 - ROW_NUMBER_WIDTH).max(0),
     );
     for (index, (width, assigned)) in widths.iter_mut().zip(assigned).enumerate() {
         if let ColumnWidth::Automatic {
@@ -148,6 +153,10 @@ struct Inner {
     banner_text: gtk4::Label,
     retry: gtk4::Button,
     scroll: gtk4::ScrolledWindow,
+    sticky: grid::StickyViews,
+    grid: RefCell<Option<ResultGrid>>,
+    header_locks: RefCell<Vec<(glib::WeakRef<gtk4::Image>, usize)>>,
+    freeze_actions: RefCell<Vec<gtk4::gio::SimpleAction>>,
     state: ResultState,
     summary: gtk4::Box,
     summary_title: gtk4::Label,
@@ -164,7 +173,6 @@ struct Inner {
     copying: RefCell<Option<Arc<AtomicBool>>>,
     restore: RefCell<Option<Restore>>,
     pending_scroll: Cell<Option<ScrollRestore>>,
-    column: Cell<usize>,
     cells: RefCell<Vec<CellEntry>>,
     space: Cell<Option<Instant>>,
     peek_request: Cell<u64>,
@@ -221,6 +229,7 @@ impl ResultPanel {
         let scroll = gtk4::ScrolledWindow::new();
         scroll.set_vexpand(true);
         scroll.set_hexpand(true);
+        scroll.set_overlay_scrolling(false);
         scroll.update_property(&[
             gtk4::accessible::Property::Label("Query results"),
             gtk4::accessible::Property::Description(
@@ -228,6 +237,7 @@ impl ResultPanel {
             ),
         ]);
         overlay.set_child(Some(&scroll));
+        let sticky = grid::StickyViews::new(&overlay, &scroll);
 
         let state = ResultState::new();
         overlay.add_overlay(&state.root);
@@ -270,6 +280,10 @@ impl ResultPanel {
             banner_text,
             retry: retry.clone(),
             scroll,
+            sticky,
+            grid: RefCell::new(None),
+            header_locks: RefCell::new(Vec::new()),
+            freeze_actions: RefCell::new(Vec::new()),
             state,
             summary,
             summary_title,
@@ -286,7 +300,6 @@ impl ResultPanel {
             copying: RefCell::new(None),
             restore: RefCell::new(None),
             pending_scroll: Cell::new(None),
-            column: Cell::new(0),
             cells: RefCell::new(Vec::new()),
             space: Cell::new(None),
             peek_request: Cell::new(0),
@@ -358,7 +371,9 @@ impl ResultPanel {
                         {
                             size_columns(&table.view, &table.widths);
                         }
-                        ResultPanel(inner).schedule_pending_scroll();
+                        let panel = ResultPanel(inner);
+                        panel.schedule_pending_scroll();
+                        panel.refresh_grid_view();
                     }
                     None
                 });
@@ -381,12 +396,13 @@ impl ResultPanel {
             keys.clone().upcast(),
         ] {
             controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
-            panel.0.scroll.add_controller(controller);
+            panel.0.root.add_controller(controller);
         }
         let weak = Rc::downgrade(&panel.0);
         wheel.connect_scroll(move |_, _, _| {
             if let Some(inner) = weak.upgrade() {
                 inner.pending_scroll.set(None);
+                inner.restore.borrow_mut().take();
             }
             glib::Propagation::Proceed
         });
@@ -394,12 +410,14 @@ impl ResultPanel {
         click.connect_pressed(move |_, _, _, _| {
             if let Some(inner) = weak.upgrade() {
                 inner.pending_scroll.set(None);
+                inner.restore.borrow_mut().take();
             }
         });
         let weak = Rc::downgrade(&panel.0);
         keys.connect_key_pressed(move |_, _, _, _| {
             if let Some(inner) = weak.upgrade() {
                 inner.pending_scroll.set(None);
+                inner.restore.borrow_mut().take();
             }
             glib::Propagation::Proceed
         });
@@ -432,6 +450,7 @@ impl ResultPanel {
             source.remove();
         }
         self.0.table.replace(None);
+        self.0.sticky.clear();
         self.0.scroll.set_child(None::<&gtk4::Widget>);
     }
 
@@ -510,6 +529,7 @@ impl ResultPanel {
             .is_some_and(|table| Some(table.scope) != scope);
         if replaced {
             self.save_restore();
+            self.0.sticky.clear();
             self.0.table.replace(None);
             self.0.scroll.set_child(None::<&gtk4::Widget>);
             self.0.load_error.replace(None);
@@ -529,6 +549,9 @@ impl ResultPanel {
             self.0.load_error.replace(None);
         }
         self.0.document.replace(Some(document.clone()));
+        if let Some(grid) = self.0.grid.borrow_mut().as_mut() {
+            grid.resize(document.rows);
+        }
         if let Some(table) = self.0.table.borrow().as_ref() {
             table.model.set_rows(document.rows);
         } else if let Some(scope) = scope
@@ -539,6 +562,7 @@ impl ResultPanel {
             self.build(scope);
         }
         self.apply_restore();
+        self.refresh_grid_view();
         self.render_state();
         self.changed();
     }
@@ -601,6 +625,16 @@ impl ResultPanel {
         );
         let selection = gtk4::MultiSelection::new(Some(model.clone()));
         keep_selection_across_page_loads(&selection);
+        let mut grid = self
+            .0
+            .restore
+            .borrow()
+            .as_ref()
+            .and_then(|restore| restore.grid.clone())
+            .filter(|grid| grid.schema() == columns.as_slice())
+            .unwrap_or_else(|| ResultGrid::new(columns.clone(), rows));
+        grid.resize(rows);
+        self.0.grid.replace(Some(grid));
         let widths = Rc::new(RefCell::new(Vec::new()));
         let view = self.create_view(&selection, &model, &columns, &widths);
         let weak = Rc::downgrade(&self.0);
@@ -630,7 +664,6 @@ impl ResultPanel {
             None
         });
         self.0.scroll.set_child(Some(&view));
-        self.0.column.set(0);
         self.0.table.replace(Some(Table {
             scope,
             reader,
@@ -640,6 +673,7 @@ impl ResultPanel {
             selection,
             widths,
         }));
+        self.refresh_grid_view();
     }
 
     fn create_view(
@@ -650,6 +684,7 @@ impl ResultPanel {
         widths: &Rc<RefCell<Vec<ColumnWidth>>>,
     ) -> gtk4::ColumnView {
         let view = gtk4::ColumnView::new(Some(selection.clone()));
+        self.init_grid_actions(columns.len() + 1);
         view.add_css_class("result-table");
         view.set_focusable(true);
         view.set_show_column_separators(true);
@@ -665,14 +700,48 @@ impl ResultPanel {
             label.add_css_class("dim-label");
             item.set_child(Some(&label));
         });
-        numbers.connect_bind(|_, item| {
+        let weak = Rc::downgrade(&self.0);
+        numbers.connect_setup(move |_, item| {
+            let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
+            if let Some(label) = item.child().and_downcast::<gtk4::Label>() {
+                if let Some(inner) = weak.upgrade() {
+                    inner
+                        .cells
+                        .borrow_mut()
+                        .push((item.downgrade(), label.downgrade(), 0));
+                }
+                let click = gtk4::GestureClick::new();
+                click.set_name(Some("result-row-selection"));
+                click.set_propagation_phase(gtk4::PropagationPhase::Capture);
+                let weak_item = item.downgrade();
+                let weak = weak.clone();
+                click.connect_pressed(move |gesture, _, _, _| {
+                    if let (Some(inner), Some(item)) = (weak.upgrade(), weak_item.upgrade()) {
+                        ResultPanel(inner).select_grid_row(
+                            item.position() as usize,
+                            gesture.current_event_state(),
+                        );
+                        gesture.set_state(gtk4::EventSequenceState::Claimed);
+                    }
+                });
+                label
+                    .parent()
+                    .unwrap_or_else(|| label.clone().upcast())
+                    .add_controller(click);
+            }
+        });
+        let weak = Rc::downgrade(&self.0);
+        numbers.connect_bind(move |_, item| {
             let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
             if let Some(label) = item.child().and_downcast::<gtk4::Label>() {
                 label.set_text(&(item.position() + 1).to_string());
+                if let Some(inner) = weak.upgrade() {
+                    ResultPanel(inner).mark_cursor(item, &label, 0);
+                }
             }
         });
-        let number_column = gtk4::ColumnViewColumn::new(None, Some(numbers));
-        number_column.set_fixed_width(56);
+        let number_column = gtk4::ColumnViewColumn::new(Some("#"), Some(numbers));
+        number_column.set_fixed_width(ROW_NUMBER_WIDTH);
         view.append_column(&number_column);
 
         for (index, column) in columns.iter().enumerate() {
@@ -682,28 +751,40 @@ impl ResultPanel {
             factory.connect_setup(move |_, item| {
                 let item = item.downcast_ref::<gtk4::ListItem>().unwrap();
                 let label = cell_label();
+                item.set_child(Some(&label));
                 if let Some(inner) = weak.upgrade() {
                     inner
                         .cells
                         .borrow_mut()
-                        .push((item.downgrade(), label.downgrade(), index));
+                        .push((item.downgrade(), label.downgrade(), index + 1));
                 }
                 let click = gtk4::GestureClick::new();
+                click.set_name(Some("result-cell-selection"));
+                click.set_propagation_phase(gtk4::PropagationPhase::Capture);
                 let weak_item = item.downgrade();
                 let weak_panel = weak.clone();
-                click.connect_pressed(move |_, presses, _, _| {
+                click.connect_pressed(move |gesture, presses, _, _| {
                     let (Some(inner), Some(item)) = (weak_panel.upgrade(), weak_item.upgrade())
                     else {
                         return;
                     };
-                    inner.column.set(index);
                     let panel = ResultPanel(inner);
-                    panel.refresh_cursor();
+                    panel.select_grid_cell(
+                        item.position() as usize,
+                        index + 1,
+                        gesture
+                            .current_event_state()
+                            .contains(gdk::ModifierType::SHIFT_MASK),
+                    );
+                    gesture.set_state(gtk4::EventSequenceState::Claimed);
                     if presses == 2 {
                         panel.open_cell_dialog(item.position() as usize, index);
                     }
                 });
-                label.add_controller(click);
+                label
+                    .parent()
+                    .unwrap_or_else(|| label.clone().upcast())
+                    .add_controller(click);
                 let weak_item = item.downgrade();
                 let tooltip = Rc::new(RefCell::new(None::<(u32, String)>));
                 let requested = Rc::new(Cell::new(None::<u32>));
@@ -759,7 +840,6 @@ impl ResultPanel {
                     });
                     false
                 });
-                item.set_child(Some(&label));
             });
             let weak = Rc::downgrade(&self.0);
             factory.connect_bind(move |_, item| {
@@ -768,7 +848,7 @@ impl ResultPanel {
                     return;
                 };
                 if let Some(inner) = weak.upgrade() {
-                    ResultPanel(inner).mark_cursor(item, &label, index);
+                    ResultPanel(inner).mark_cursor(item, &label, index + 1);
                 }
                 let row = item
                     .item()
@@ -833,13 +913,94 @@ impl ResultPanel {
                     | gdk::ModifierType::SHIFT_MASK
                     | gdk::ModifierType::ALT_MASK);
             match (key, modifiers) {
+                (gdk::Key::a, gdk::ModifierType::CONTROL_MASK) => {
+                    if let Some(grid) = panel.0.grid.borrow_mut().as_mut() {
+                        grid.select_all();
+                    }
+                    panel.apply_grid_selection();
+                    glib::Propagation::Stop
+                }
+                (gdk::Key::Home | gdk::Key::End, modifiers)
+                    if (modifiers & !gdk::ModifierType::SHIFT_MASK).is_empty()
+                        || (modifiers & !gdk::ModifierType::SHIFT_MASK)
+                            == gdk::ModifierType::CONTROL_MASK =>
+                {
+                    let distance = if key == gdk::Key::Home {
+                        i64::MIN
+                    } else {
+                        i64::MAX
+                    };
+                    panel.grid_move(
+                        distance,
+                        if modifiers.contains(gdk::ModifierType::CONTROL_MASK) {
+                            distance
+                        } else {
+                            0
+                        },
+                        modifiers.contains(gdk::ModifierType::SHIFT_MASK),
+                    );
+                    glib::Propagation::Stop
+                }
+                (gdk::Key::Page_Up | gdk::Key::Page_Down, modifiers)
+                    if modifiers.is_empty() || modifiers == gdk::ModifierType::SHIFT_MASK =>
+                {
+                    let rows = (panel.0.scroll.vadjustment().page_size() / 24.0)
+                        .floor()
+                        .max(1.0) as i64;
+                    panel.grid_move(
+                        0,
+                        if key == gdk::Key::Page_Up {
+                            -rows
+                        } else {
+                            rows
+                        },
+                        modifiers == gdk::ModifierType::SHIFT_MASK,
+                    );
+                    glib::Propagation::Stop
+                }
+                (gdk::Key::space, gdk::ModifierType::CONTROL_MASK) => {
+                    panel.toggle_result_rows();
+                    glib::Propagation::Stop
+                }
+                (gdk::Key::x, gdk::ModifierType::NO_MODIFIER_MASK) => {
+                    panel.toggle_frozen_column();
+                    glib::Propagation::Stop
+                }
+                (
+                    gdk::Key::Up | gdk::Key::Down | gdk::Key::Left | gdk::Key::Right,
+                    gdk::ModifierType::SHIFT_MASK,
+                ) => {
+                    let (x, y) = match key {
+                        gdk::Key::Up => (0, -1),
+                        gdk::Key::Down => (0, 1),
+                        gdk::Key::Left => (-1, 0),
+                        _ => (1, 0),
+                    };
+                    panel.grid_move(x, y, true);
+                    glib::Propagation::Stop
+                }
+                (gdk::Key::Up | gdk::Key::Down, gdk::ModifierType::NO_MODIFIER_MASK) => {
+                    panel.grid_move(0, if key == gdk::Key::Up { -1 } else { 1 }, false);
+                    glib::Propagation::Stop
+                }
                 (gdk::Key::space, gdk::ModifierType::NO_MODIFIER_MASK) => {
                     panel.space_pressed();
                     glib::Propagation::Stop
                 }
                 (gdk::Key::Return | gdk::Key::KP_Enter, gdk::ModifierType::NO_MODIFIER_MASK) => {
                     if let Some(row) = panel.selected_row() {
-                        panel.open_cell_dialog(row, panel.0.column.get());
+                        if panel
+                            .0
+                            .grid
+                            .borrow()
+                            .as_ref()
+                            .and_then(ResultGrid::cursor)
+                            .is_some_and(|cursor| cursor.column == 0)
+                        {
+                            panel.show_row_preview();
+                        } else {
+                            panel.open_cell_dialog(row, panel.data_column());
+                        }
                     }
                     glib::Propagation::Stop
                 }
@@ -863,11 +1024,16 @@ impl ResultPanel {
             }
         });
         view.add_controller(keys);
+        self.install_grid_headers(&view, &(0..=columns.len()).collect::<Vec<_>>());
 
         let weak = Rc::downgrade(&self.0);
-        selection.connect_selection_changed(move |_, _, _| {
+        selection.connect_selection_changed(move |selection, _, _| {
             if let Some(inner) = weak.upgrade() {
                 let panel = ResultPanel(inner);
+                let rows = selection.selection();
+                if let Some(grid) = panel.0.grid.borrow_mut().as_mut() {
+                    grid.sync_rows((0..rows.size()).map(|index| rows.nth(index as u32) as usize));
+                }
                 panel.refresh_cursor();
                 if panel.0.inspector.is_visible() {
                     panel.refresh_inspector();
@@ -1075,9 +1241,10 @@ impl ResultPanel {
         self.0.restore.replace(Some(Restore {
             columns: table.columns.clone(),
             row: first_selected(&table.selection),
-            column: self.0.column.get(),
+            column: self.data_column(),
             horizontal,
             vertical,
+            grid: self.0.grid.borrow().clone(),
         }));
     }
 
@@ -1113,13 +1280,38 @@ impl ResultPanel {
             terminal,
         }
         .evaluate();
+        if decision.restoration == Some(RestorationState::Apply) {
+            self.0.pending_scroll.set(Some(ScrollRestore {
+                target: (restore.horizontal, restore.vertical),
+            }));
+            self.schedule_pending_scroll();
+        }
         match decision.restoration {
-            Some(RestorationState::Apply) if !decision.selection_pending => {
+            Some(RestorationState::Apply)
+                if !decision.selection_pending
+                    && restore.grid.as_ref().is_none_or(|grid| {
+                        terminal
+                            || grid.mode() == SelectionMode::Columns
+                            || grid.rows().last().is_none_or(|row| *row < rows)
+                    }) =>
+            {
                 let Some(table) = table.as_ref() else {
                     return;
                 };
-                if let Some(position) = decision.selection {
-                    self.0.column.set(position.column);
+                if let Some(mut grid) = restore.grid.clone() {
+                    grid.resize(rows);
+                    self.0.grid.replace(Some(grid));
+                    self.apply_grid_selection();
+                } else if let Some(position) = decision.selection {
+                    if let Some(grid) = self.0.grid.borrow_mut().as_mut() {
+                        grid.select_cell(
+                            dzban_core::outputs::view::ResultPosition {
+                                row: position.row,
+                                column: position.column + 1,
+                            },
+                            false,
+                        );
+                    }
                     table.selection.select_item(position.row as u32, true);
                 }
                 self.0.pending_scroll.set(Some(ScrollRestore {
@@ -1181,7 +1373,13 @@ impl ResultPanel {
                 });
                 match target {
                     Some(row) => {
-                        let column = self.0.column.get();
+                        let cursor = self.0.grid.borrow().as_ref().and_then(ResultGrid::cursor);
+                        if let Some(cursor) = cursor {
+                            view.grab_focus();
+                            self.reveal_grid_cell(cursor);
+                            return true;
+                        }
+                        let column = self.data_column();
                         self.focus_cell(row, column);
                         true
                     }
@@ -1193,6 +1391,9 @@ impl ResultPanel {
     }
 
     fn selected_row(&self) -> Option<usize> {
+        if let Some(cursor) = self.0.grid.borrow().as_ref().and_then(ResultGrid::cursor) {
+            return Some(cursor.row);
+        }
         self.0
             .table
             .borrow()
@@ -1245,7 +1446,7 @@ impl ResultPanel {
         if visibility.visible && (!was_visible || self.0.inspector.row() != self.selected_row()) {
             self.refresh_inspector();
             if !was_visible {
-                self.0.inspector.select_column(self.0.column.get());
+                self.0.inspector.select_column(self.data_column());
             }
         }
         self.0
@@ -1271,19 +1472,8 @@ impl ResultPanel {
         if !contains_focus(&self.0.root) {
             return false;
         }
-        let table = self.0.table.borrow();
-        let Some(table) = table.as_ref() else {
-            return false;
-        };
-        let rows = table.model.n_items() as i64;
         if let Some(delta) = direction.vertical() {
-            if rows == 0 {
-                return true;
-            }
-            let current = first_selected(&table.selection).map_or(-1, |row| row as i64);
-            let next = (current + delta).clamp(0, rows - 1) as usize;
-            let column = self.0.column.get();
-            self.focus_cell(next, column);
+            self.grid_move(0, delta, false);
         } else if let Some(delta) = direction.horizontal() {
             self.move_cursor(delta);
         }
@@ -1310,42 +1500,50 @@ impl ResultPanel {
     }
 
     #[cfg(test)]
+    pub fn select_cell_for_test(&self, row: usize, column: usize, extend: bool) {
+        self.select_grid_cell(row, column, extend);
+    }
+
+    #[cfg(test)]
+    pub fn sticky_views(&self) -> (gtk4::ScrolledWindow, gtk4::ScrolledWindow) {
+        (self.0.sticky.left.clone(), self.0.sticky.right.clone())
+    }
+
+    #[cfg(test)]
     pub fn focused(&self) -> bool {
         contains_focus(&self.0.root)
     }
 
     #[cfg(test)]
     pub fn column(&self) -> usize {
-        self.0.column.get()
+        self.data_column()
+    }
+
+    fn data_column(&self) -> usize {
+        self.0
+            .grid
+            .borrow()
+            .as_ref()
+            .and_then(ResultGrid::cursor)
+            .map_or(0, |cursor| cursor.column.saturating_sub(1))
     }
 
     fn move_cursor(&self, delta: i64) {
-        let row = {
-            let table = self.0.table.borrow();
-            let Some(table) = table.as_ref() else {
-                return;
-            };
-            let count = table.columns.len() as i64;
-            if count == 0 {
-                return;
-            }
-            let next = (self.0.column.get() as i64 + delta).clamp(0, count - 1);
-            self.0.column.set(next as usize);
-            first_selected(&table.selection)
-        };
-        self.refresh_cursor();
-        if let Some(row) = row {
-            self.reveal_cell(row, self.0.column.get(), gtk4::ListScrollFlags::NONE);
-        }
+        self.grid_move(delta, 0, false);
     }
 
     fn focus_cell(&self, row: usize, column: usize) {
-        self.0.column.set(column);
-        self.reveal_cell(
+        let position = dzban_core::outputs::view::ResultPosition {
             row,
-            column,
-            gtk4::ListScrollFlags::FOCUS | gtk4::ListScrollFlags::SELECT,
-        );
+            column: column + 1,
+        };
+        if let Some(grid) = self.0.grid.borrow_mut().as_mut()
+            && grid.cursor() != Some(position)
+        {
+            grid.select_cell(position, false);
+        }
+        self.apply_grid_selection();
+        self.reveal_cell(row, column, gtk4::ListScrollFlags::FOCUS);
         self.refresh_cursor();
     }
 
@@ -1371,9 +1569,20 @@ impl ResultPanel {
     }
 
     fn mark_cursor(&self, item: &gtk4::ListItem, label: &gtk4::Label, column: usize) {
-        let cursor =
-            self.selected_row() == Some(item.position() as usize) && self.0.column.get() == column;
+        let grid = self.0.grid.borrow();
+        let cursor = grid.as_ref().and_then(ResultGrid::cursor)
+            == Some(dzban_core::outputs::view::ResultPosition {
+                row: item.position() as usize,
+                column,
+            });
         let target = label.parent().unwrap_or_else(|| label.clone().upcast());
+        if grid.as_ref().is_some_and(|grid| {
+            grid.mode() != SelectionMode::Rows && grid.selected(item.position() as usize, column)
+        }) {
+            target.add_css_class("result-selected");
+        } else {
+            target.remove_css_class("result-selected");
+        }
         if cursor {
             target.add_css_class("result-cursor");
         } else {
@@ -1382,6 +1591,34 @@ impl ResultPanel {
     }
 
     fn refresh_cursor(&self) {
+        let cells_mode = self
+            .0
+            .grid
+            .borrow()
+            .as_ref()
+            .is_none_or(|grid| grid.mode() != SelectionMode::Rows);
+        for side in [&self.0.sticky.left, &self.0.sticky.right] {
+            if let Some(view) = side.child() {
+                if cells_mode {
+                    view.add_css_class("cell-selection");
+                } else {
+                    view.remove_css_class("cell-selection");
+                }
+            }
+        }
+        if let Some(table) = self.0.table.borrow().as_ref() {
+            if self
+                .0
+                .grid
+                .borrow()
+                .as_ref()
+                .is_none_or(|grid| grid.mode() != SelectionMode::Rows)
+            {
+                table.view.add_css_class("cell-selection");
+            } else {
+                table.view.remove_css_class("cell-selection");
+            }
+        }
         let cells = {
             let mut cells = self.0.cells.borrow_mut();
             cells.retain(|(item, label, _)| item.upgrade().is_some() && label.upgrade().is_some());
@@ -1484,13 +1721,13 @@ impl ResultPanel {
             return;
         };
         let rows = table.model.n_items() as usize;
-        let Some(current) = first_selected(&table.selection) else {
+        let Some(current) = self.selected_row() else {
             return;
         };
         let decision = ResultViewRequest::MoveRow {
             position: dzban_core::outputs::view::ResultPosition {
                 row: current,
-                column: self.0.column.get(),
+                column: self.data_column(),
             },
             direction,
             rows,
@@ -1498,6 +1735,15 @@ impl ResultPanel {
         }
         .evaluate();
         if let Some(position) = decision.selection {
+            if let Some(grid) = self.0.grid.borrow_mut().as_mut() {
+                grid.select_cell(
+                    dzban_core::outputs::view::ResultPosition {
+                        row: position.row,
+                        column: position.column + 1,
+                    },
+                    false,
+                );
+            }
             table.selection.select_item(position.row as u32, true);
             table
                 .view
@@ -1547,17 +1793,20 @@ impl ResultPanel {
     }
 
     pub fn copy_selection(&self) {
-        let (reader, ranges) = {
+        let (reader, selection) = {
             let table = self.0.table.borrow();
             let Some(table) = table.as_ref() else {
                 return;
             };
-            (table.reader.clone(), selected_ranges(&table.selection))
+            let Some(grid) = self.0.grid.borrow().as_ref().map(ResultGrid::copy) else {
+                return;
+            };
+            (table.reader.clone(), grid)
         };
-        if ranges.is_empty() {
+        if selection.rows.is_empty() || selection.columns.is_empty() {
             return;
         }
-        self.copy(async move { reader.export_markdown(ranges).await }, None);
+        self.copy(async move { reader.export_grid(selection).await }, None);
     }
 
     fn copy<F>(&self, start: F, done: Option<CopyDone>)
@@ -1583,7 +1832,11 @@ impl ResultPanel {
                     .next_chunk()
                     .await
                     .map_err(|error| error.to_string())?;
-                text.push_str(&chunk.text);
+                if chunk.is_null {
+                    text.push_str("NULL");
+                } else {
+                    text.push_str(&chunk.text);
+                }
                 if chunk.done {
                     return Ok(text);
                 }
@@ -1854,23 +2107,6 @@ impl ResultState {
 fn first_selected(selection: &gtk4::MultiSelection) -> Option<usize> {
     let bitset = selection.selection();
     (!bitset.is_empty()).then(|| bitset.minimum() as usize)
-}
-
-fn selected_ranges(selection: &gtk4::MultiSelection) -> Vec<RowRange> {
-    let bitset = selection.selection();
-    let mut ranges: Vec<RowRange> = Vec::new();
-    let size = bitset.size();
-    for index in 0..size {
-        let row = bitset.nth(index as u32) as usize;
-        match ranges.last_mut() {
-            Some(range) if range.end == row => range.end += 1,
-            _ => ranges.push(RowRange {
-                start: row,
-                end: row + 1,
-            }),
-        }
-    }
-    ranges
 }
 
 fn keep_selection_across_page_loads(selection: &gtk4::MultiSelection) {

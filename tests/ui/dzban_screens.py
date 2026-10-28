@@ -500,6 +500,43 @@ class DzbanScreens(unittest.TestCase):
         wait_for_node(application, "Ready to query")
         wait_for_node(application, "Run a query to see results")
 
+    def test_result_cursor_selection_and_freeze(self):
+        from dogtail import rawinput
+
+        application = self.launch(POSTGRES)
+        wait_for_node(application, "Open", "button")
+        rawinput.key_combo("F11")
+        wait_until(lambda: application.child(role_name="frame").extents[2:] == self.session.monitor_size(), "The result-grid test window did not fullscreen")
+        wait_for_node(application, "Open", "button").do_action_named("click")
+        editor = self.run_sql(application, "SELECT i AS id, 'row ' || i AS value FROM generate_series(1, 3) i")
+        wait_for_node(application, "row 1")
+        self.action(application, "Focus Results", "Focus Results")
+
+        def copied():
+            rawinput.key_combo("<Control>c")
+            time.sleep(0.2)
+            self.action(application, "Focus Query Editor", "Focus Query Editor")
+            editor.text = ""
+            wait_until(lambda: editor.focused, "The editor did not receive keyboard focus")
+            rawinput.key_combo("<Control>v")
+            wait_until(lambda: bool(editor.text), "The result selection was not copied")
+            return editor.text
+
+        self.assertEqual(copied(), "1")
+        self.action(application, "Focus Results", "Focus Results")
+        rawinput.key_combo("<Shift>Right")
+        self.assertTrue(copied().startswith("| id | value |\n"))
+        self.action(application, "Focus Results", "Focus Results")
+        rawinput.key_combo("<Control>space")
+        self.assertTrue(copied().startswith("| # | id | value |\n"))
+        wait_for_node(application, "value").click()
+        self.assertEqual(copied(), "| value |\n| --- |\n| row 1 |\n| row 2 |\n| row 3 |\n")
+        self.action(application, "Focus Results", "Focus Results")
+        rawinput.key_combo("x")
+        wait_for_node(application, "Frozen column: value")
+        rawinput.key_combo("x")
+        wait_for_node_to_disappear(application, "Frozen column: value")
+
 
 if __name__ == "__main__":
     scenarios = {
@@ -510,6 +547,7 @@ if __name__ == "__main__":
         "restore": "test_restored_tabs_reconnect_without_running_saved_sql",
         "streaming-postgres": "test_postgres_streamed_results",
         "streaming-clickhouse": "test_clickhouse_streamed_results",
+        "result-grid": "test_result_cursor_selection_and_freeze",
     }
     scenario = os.environ.get("DZBAN_UI_SCENARIO")
     if scenario not in scenarios:
