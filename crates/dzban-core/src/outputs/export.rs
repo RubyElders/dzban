@@ -24,6 +24,7 @@ enum Content {
     Markdown {
         ranges: VecDeque<RowRange>,
         columns: usize,
+        projection: Vec<Option<usize>>,
         rows: VecDeque<Vec<ResultCell>>,
     },
 }
@@ -67,6 +68,43 @@ impl ResultReader {
         &self,
         ranges: Vec<RowRange>,
     ) -> Result<OutputExport, OutputError> {
+        let schema = self.page(0, 0).await?;
+        self.export_table(ranges, (0..schema.columns.len()).map(Some).collect())
+            .await
+    }
+
+    pub async fn export_grid(
+        &self,
+        selection: super::grid::GridCopy,
+    ) -> Result<OutputExport, OutputError> {
+        if selection.columns.is_empty()
+            || selection.rows.is_empty()
+            || selection.columns.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(OutputError::InvalidSelection);
+        }
+        if let ([range], [column]) = (selection.rows.as_slice(), selection.columns.as_slice())
+            && range.start.checked_add(1) == Some(range.end)
+            && *column > 0
+        {
+            return self.export_cell(range.start, column - 1).await;
+        }
+        self.export_table(
+            selection.rows,
+            selection
+                .columns
+                .into_iter()
+                .map(|column| column.checked_sub(1))
+                .collect(),
+        )
+        .await
+    }
+
+    async fn export_table(
+        &self,
+        ranges: Vec<RowRange>,
+        projection: Vec<Option<usize>>,
+    ) -> Result<OutputExport, OutputError> {
         let mut previous = 0;
         for range in &ranges {
             if range.start >= range.end || range.start < previous {
@@ -75,17 +113,27 @@ impl ResultReader {
             previous = range.end;
         }
         let schema = self.page(0, 0).await?;
+        if projection
+            .iter()
+            .flatten()
+            .any(|column| *column >= schema.columns.len())
+        {
+            return Err(OutputError::InvalidSelection);
+        }
         let mut pending = String::new();
         append_line(
             &mut pending,
-            schema.columns.iter().map(|column| column.name.as_str()),
+            projection
+                .iter()
+                .map(|column| column.map_or("#", |column| schema.columns[column].name.as_str())),
         )?;
-        append_line(&mut pending, schema.columns.iter().map(|_| "---"))?;
+        append_line(&mut pending, projection.iter().map(|_| "---"))?;
         Ok(OutputExport {
             reader: self.clone(),
             content: Content::Markdown {
                 ranges: ranges.into(),
                 columns: schema.columns.len(),
+                projection,
                 rows: VecDeque::new(),
             },
             bytes: pending.len(),
@@ -125,6 +173,7 @@ impl OutputExport {
             if let Content::Markdown {
                 ranges,
                 columns,
+                projection,
                 rows,
             } = &mut self.content
             {
@@ -135,7 +184,7 @@ impl OutputExport {
                     if rows.is_empty() {
                         let count = (range.end - range.start).min(64);
                         let page = self.reader.page(range.start, count).await?;
-                        if page.rows.len() != count {
+                        if page.rows.is_empty() || page.rows.len() > count {
                             return Err(OutputError::InvalidSelection);
                         }
                         *rows = page.rows.into();
@@ -145,12 +194,16 @@ impl OutputExport {
                         return Err(OutputError::InvalidSelection);
                     }
                     let before = self.pending.len();
+                    let number = (range.start + 1).to_string();
                     append_line(
                         &mut self.pending,
-                        row.iter().map(|cell| match cell {
-                            ResultCell::Null => "NULL",
-                            ResultCell::Text(text) => text.as_str(),
-                        }),
+                        projection
+                            .iter()
+                            .map(|column| match column.map(|column| &row[column]) {
+                                None => number.as_str(),
+                                Some(ResultCell::Null) => "NULL",
+                                Some(ResultCell::Text(text)) => text.as_str(),
+                            }),
                     )?;
                     self.bytes = self
                         .bytes
