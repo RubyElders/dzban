@@ -65,6 +65,13 @@ final class ShellTests: XCTestCase {
     }
 
     func testActionsFocusResultsAndReturnToEditorWithoutChangingDraft() throws {
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name(fixtureDirectory.lastPathComponent))
+        func expectSelectedValue(_ value: String) {
+            pasteboard.clearContents()
+            app.typeKey("c", modifierFlags: .command)
+            let copied = expectation(for: NSPredicate { _, _ in pasteboard.string(forType: .string) == value }, evaluatedWith: nil)
+            wait(for: [copied], timeout: 5)
+        }
         app.launchArguments = ["--fixture-query", "wide"]
         launchApp()
         waitForValue("Complete - 500 rows", in: app.staticTexts["results.status"])
@@ -80,10 +87,7 @@ final class ShellTests: XCTestCase {
                 waitForValue("SELECT hjkl tail", in: editor)
             } else {
                 if (editor.value as? String) == "SELECT hjkl" { app.typeKey("j", modifierFlags: []) }
-                app.typeKey(" ", modifierFlags: [])
-                XCTAssertTrue(app.buttons["row.close"].waitForExistence(timeout: 5), app.debugDescription)
-                waitForValue("Row 2", in: app.staticTexts["row.title"])
-                app.typeKey(.escape, modifierFlags: [])
+                expectSelectedValue("1")
             }
         }
         app.typeKey("k", modifierFlags: .command)
@@ -91,10 +95,7 @@ final class ShellTests: XCTestCase {
         waitForValue("SELECT hjkl tail again", in: editor)
         app.typeKey("k", modifierFlags: .command)
         app.typeKey("j", modifierFlags: [])
-        app.typeKey(" ", modifierFlags: [])
-        XCTAssertTrue(app.buttons["row.close"].waitForExistence(timeout: 5))
-        waitForValue("Row 3", in: app.staticTexts["row.title"])
-        app.typeKey(.escape, modifierFlags: [])
+        expectSelectedValue("2")
         app.typeKey("k", modifierFlags: .command)
         app.typeText(" end")
         waitForValue("SELECT hjkl tail again end", in: editor)
