@@ -660,6 +660,7 @@ public final class ApplicationStore: ObservableObject, QueryInteractionHost {
             if results.scope?.session == session { results.retire() }
         }
         results.tablePositions.removeValue(forKey: page.document)
+        results.removeGrid(for: page.document)
         observations.removeValue(forKey: page.document)?.cancel()
         editorAttachments.retire(page.document)
     }

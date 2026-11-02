@@ -239,6 +239,7 @@ pub enum Command {
         row: Option<usize>,
         column: Option<usize>,
         ranges: Option<Vec<RowRange>>,
+        columns: Option<Vec<usize>>,
     },
     ReadExport {
         export: Uuid,
@@ -1366,11 +1367,17 @@ impl State {
                 row,
                 column,
                 ranges,
+                columns,
             } => {
                 let reader = self.output_reader(session, document, generation)?;
-                let output = match (row, column, ranges) {
-                    (Some(row), Some(column), None) => reader.export_cell(row, column).await,
-                    (None, None, Some(ranges)) => reader.export_markdown(ranges).await,
+                let output = match (row, column, ranges, columns) {
+                    (Some(row), Some(column), None, None) => reader.export_cell(row, column).await,
+                    (None, None, Some(ranges), None) => reader.export_markdown(ranges).await,
+                    (None, None, Some(rows), Some(columns)) => {
+                        reader
+                            .export_grid(dzban_core::outputs::grid::GridCopy { rows, columns })
+                            .await
+                    }
                     _ => return Err(failure("invalid_selection", "Specify a cell or row ranges")),
                 }
                 .map_err(output_error)?;

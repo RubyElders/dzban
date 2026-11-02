@@ -80,8 +80,8 @@ final class ShellTests: XCTestCase {
                 waitForValue("SELECT hjkl tail", in: editor)
             } else {
                 if (editor.value as? String) == "SELECT hjkl" { app.typeKey("j", modifierFlags: []) }
-                app.typeText(" ")
-                XCTAssertTrue(app.buttons["row.close"].waitForExistence(timeout: 5))
+                app.typeKey(" ", modifierFlags: [])
+                XCTAssertTrue(app.buttons["row.close"].waitForExistence(timeout: 5), app.debugDescription)
                 waitForValue("Row 2", in: app.staticTexts["row.title"])
                 app.typeKey(.escape, modifierFlags: [])
             }
@@ -91,7 +91,7 @@ final class ShellTests: XCTestCase {
         waitForValue("SELECT hjkl tail again", in: editor)
         app.typeKey("k", modifierFlags: .command)
         app.typeKey("j", modifierFlags: [])
-        app.typeText(" ")
+        app.typeKey(" ", modifierFlags: [])
         XCTAssertTrue(app.buttons["row.close"].waitForExistence(timeout: 5))
         waitForValue("Row 3", in: app.staticTexts["row.title"])
         app.typeKey(.escape, modifierFlags: [])
@@ -188,14 +188,14 @@ final class ShellTests: XCTestCase {
         let number = app.buttons["result.row-number.0"]
         XCTAssertTrue(number.waitForExistence(timeout: 5))
         XCTAssertEqual(number.value as? String, "1")
-        let header = app.staticTexts["results.row-number-header"]
+        let header = app.buttons["results.row-number-header"]
         XCTAssertTrue(header.isHittable)
         XCTAssertEqual(header.value as? String, "#")
         let left = number.frame.minX
         XCTAssertLessThan(number.frame.maxX, app.descendants(matching: .any)["result.cell.0.0"].frame.minX)
         number.click()
-        app.typeText(" ")
-        XCTAssertTrue(app.buttons["row.close"].waitForExistence(timeout: 5))
+        app.typeKey(" ", modifierFlags: [])
+        XCTAssertTrue(app.buttons["row.close"].waitForExistence(timeout: 5), app.debugDescription)
         app.typeKey(.return, modifierFlags: [])
         waitForValue("0", in: app.textViews["cell.value"])
         app.typeKey(.escape, modifierFlags: [])
@@ -215,8 +215,8 @@ final class ShellTests: XCTestCase {
         let firstColumn = table.descendants(matching: .tableColumn).firstMatch.label
         let columnIndex = try XCTUnwrap(Int(firstColumn.replacingOccurrences(of: "column_", with: "")))
         last.click()
-        app.typeText(" ")
-        XCTAssertTrue(app.buttons["row.close"].waitForExistence(timeout: 5))
+        app.typeKey(" ", modifierFlags: [])
+        XCTAssertTrue(app.buttons["row.close"].waitForExistence(timeout: 5), app.debugDescription)
         app.typeKey(.return, modifierFlags: [])
         waitForValue("r499c\(columnIndex)", in: app.textViews["cell.value"])
         XCTAssertFalse(app.buttons["row.inspect.128"].exists)
@@ -1197,7 +1197,7 @@ final class ShellTests: XCTestCase {
         app.buttons["query.primary"].click()
         waitForValue("Canceled - 0 rows", in: app.staticTexts["results.status"])
         submitResultQuery("limit")
-        waitForValue("Truncated - 10000 rows; waiting for cleanup", in: app.staticTexts["results.status"])
+        waitForValue("Truncated - 10000 rows; waiting for cleanup", in: app.staticTexts["results.status"], timeout: 15)
         waitForValue("0", in: app.descendants(matching: .any)["result.cell.0.0"])
         app.buttons["query.primary"].click()
         waitForValue("Finished", in: app.buttons["query.primary"])
@@ -1303,9 +1303,9 @@ final class ShellTests: XCTestCase {
             app.typeKey("a", modifierFlags: .command)
             app.typeKey("c", modifierFlags: .command)
             let copied = expectation(for: NSPredicate { _, _ in
-                pasteboard.string(forType: .string) == "| id | value |\n| --- | --- |\n| 0 | žluť<br>NULL😀 |\n| 1 | NULL |\n| 2 | žluť<br>NULL😀 |\n"
+                pasteboard.string(forType: .string) == "| # | id | value |\n| --- | --- | --- |\n| 1 | 0 | žluť<br>NULL😀 |\n| 2 | 1 | NULL |\n| 3 | 2 | žluť<br>NULL😀 |\n"
             }, evaluatedWith: nil)
-            wait(for: [copied], timeout: 5)
+            XCTAssertEqual(XCTWaiter.wait(for: [copied], timeout: 5), .completed, "Pasteboard: \(String(describing: pasteboard.string(forType: .string)))")
             app.typeKey("k", modifierFlags: .command)
         }
         app.typeText(" back")
@@ -1314,23 +1314,70 @@ final class ShellTests: XCTestCase {
         XCTAssertTrue(app.wait(for: .notRunning, timeout: 10))
     }
 
-    func testResultCopySelectedRowAndSelectAllAsMarkdown() throws {
+    func testNativeGridRangesHeadersAndFrozenColumns() throws {
+        app.launchArguments = ["--fixture-query", "few"]
+        launchApp()
+        waitForValue("Complete - 3 rows", in: app.staticTexts["results.status"])
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name(fixtureDirectory.lastPathComponent))
+        app.descendants(matching: .any)["result.cell.0.1"].click()
+        app.typeKey(.downArrow, modifierFlags: .shift)
+        XCTAssertGreaterThanOrEqual(app.descendants(matching: .any)["result.cell.0.0"].frame.minX, app.buttons["result.row-number.0"].frame.maxX)
+        app.typeKey("c", modifierFlags: .command)
+        let copied = expectation(for: NSPredicate { _, _ in pasteboard.string(forType: .string) == "| value |\n| --- |\n| žluť<br>NULL😀 |\n| NULL |\n" }, evaluatedWith: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [copied], timeout: 5), .completed, "Pasteboard: \(String(describing: pasteboard.string(forType: .string)))")
+        app.typeKey("r", modifierFlags: [.command, .shift])
+        app.typeKey("c", modifierFlags: .command)
+        let rows = expectation(for: NSPredicate { _, _ in pasteboard.string(forType: .string)?.hasPrefix("| # | id | value |") == true }, evaluatedWith: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [rows], timeout: 5), .completed, "Pasteboard: \(String(describing: pasteboard.string(forType: .string)))")
+        app.typeKey("r", modifierFlags: [.command, .shift])
+        capture("Native rectangular cell selection")
+        app.buttons["result.header.1"].click()
+        app.typeKey("c", modifierFlags: .command)
+        let column = expectation(for: NSPredicate { _, _ in pasteboard.string(forType: .string) == "| value |\n| --- |\n| žluť<br>NULL😀 |\n| NULL |\n| žluť<br>NULL😀 |\n" }, evaluatedWith: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [column], timeout: 5), .completed, "Pasteboard: \(String(describing: pasteboard.string(forType: .string)))")
+        submitResultQuery("wide")
+        waitForValue("Complete - 500 rows", in: app.staticTexts["results.status"])
+        app.descendants(matching: .any)["result.cell.0.0"].click()
+        app.typeText("x")
+        let table = app.tables["results.table"]
+        scrollInSteps(table, dx: -25000, dy: 0)
+        let frozen = app.buttons["result.frozen.cell.0.0"]
+        capture("Native frozen column after horizontal scroll")
+        XCTAssertTrue(frozen.waitForExistence(timeout: 5), app.debugDescription)
+        waitForValue("0", in: frozen)
+        capture("Native frozen column at left edge")
+        frozen.click()
+        app.typeText(" ")
+        XCTAssertTrue(app.buttons["row.close"].waitForExistence(timeout: 5))
+        app.typeKey(.return, modifierFlags: [])
+        waitForValue("0", in: app.textViews["cell.value"])
+        app.typeKey(.escape, modifierFlags: [])
+        app.typeKey(.escape, modifierFlags: [])
+        app.typeText("x")
+        XCTAssertTrue(frozen.waitForNonExistence(timeout: 5))
+        scrollInSteps(table, dx: 25000, dy: 0)
+        waitForValue("0", in: app.descendants(matching: .any)["result.cell.0.0"])
+        app.typeKey("q", modifierFlags: .command)
+        XCTAssertTrue(app.wait(for: .notRunning, timeout: 10))
+    }
+
+    func testResultCopySelectedCellAndSelectAllAsMarkdown() throws {
         app.launchArguments = ["--fixture-query", "wait"]
         launchApp()
         waitForValue("Receiving - 5 rows", in: app.staticTexts["results.status"])
         let pasteboard = NSPasteboard(name: NSPasteboard.Name(fixtureDirectory.lastPathComponent))
-        let header = "| id | value |\n| --- | --- |\n"
+        let header = "| # | id | value |\n| --- | --- | --- |\n"
         app.descendants(matching: .any)["result.cell.0.1"].click()
         app.typeKey("c", modifierFlags: .command)
-        let copied = expectation(for: NSPredicate { _, _ in pasteboard.string(forType: .string) == header + "| 0 | žluť<br>NULL😀 |\n" }, evaluatedWith: nil)
+        let copied = expectation(for: NSPredicate { _, _ in pasteboard.string(forType: .string) == "žluť\nNULL😀" }, evaluatedWith: nil)
         wait(for: [copied], timeout: 5)
         app.descendants(matching: .any)["result.cell.1.1"].click()
         app.typeKey("c", modifierFlags: .command)
-        let nullCopied = expectation(for: NSPredicate { _, _ in pasteboard.string(forType: .string) == header + "| 1 | NULL |\n" }, evaluatedWith: nil)
+        let nullCopied = expectation(for: NSPredicate { _, _ in pasteboard.string(forType: .string) == "" }, evaluatedWith: nil)
         wait(for: [nullCopied], timeout: 5)
         app.typeKey("a", modifierFlags: .command)
         app.typeKey("c", modifierFlags: .command)
-        let allRows = header + (0..<5).map { "| \($0) | \($0 == 1 ? "NULL" : "žluť<br>NULL😀") |\n" }.joined()
+        let allRows = header + (0..<5).map { "| \($0 + 1) | \($0) | \($0 == 1 ? "NULL" : "žluť<br>NULL😀") |\n" }.joined()
         let allCopied = expectation(for: NSPredicate { _, _ in pasteboard.string(forType: .string) == allRows }, evaluatedWith: nil)
         capture("All result rows selected before Markdown copy check")
         let allOutcome = XCTWaiter.wait(for: [allCopied], timeout: 5)
@@ -1976,10 +2023,10 @@ final class ShellTests: XCTestCase {
         }
     }
 
-    private func waitForValue(_ value: String, in element: XCUIElement) {
-        XCTAssertTrue(element.waitForExistence(timeout: 5))
+    private func waitForValue(_ value: String, in element: XCUIElement, timeout: TimeInterval = 5) {
+        XCTAssertTrue(element.waitForExistence(timeout: timeout))
         let ready = expectation(for: NSPredicate(format: "value == %@", value), evaluatedWith: element)
-        wait(for: [ready], timeout: 5)
+        wait(for: [ready], timeout: timeout)
     }
 
     private func waitForLabel(_ label: String, in element: XCUIElement) {

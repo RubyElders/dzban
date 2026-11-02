@@ -51,6 +51,11 @@ public struct NativeCommands: Commands {
                 .keyboardShortcut(.space, modifiers: [.command, .shift])
                 .disabled(!store.canPreview)
         }
+        CommandMenu("Results") {
+            Button("Copy Selection") { store.results.gridAction?("copy") }.disabled(!store.results.isFocusable)
+            Button("Toggle Whole Rows") { store.results.gridAction?("rows") }.keyboardShortcut("r", modifiers: [.command, .shift]).disabled(!store.results.isFocusable)
+            Button("Freeze or Unfreeze Column") { store.results.gridAction?("freeze") }.disabled(!store.results.isFocusable || store.results.grid?.state.cursor?.column == 0)
+        }
         #if DZBAN_TEST_FIXTURES
         if ProcessInfo.processInfo.arguments.contains("--metrics-output") {
             CommandMenu("Testing") {

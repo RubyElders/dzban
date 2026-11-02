@@ -2,6 +2,7 @@ mod catalog;
 mod editor;
 #[cfg(feature = "test-fixtures")]
 mod fixture;
+mod grid;
 mod handles;
 mod service;
 mod transport;
@@ -211,6 +212,43 @@ pub unsafe extern "C" fn dzban_result_view(data: *const u8, length: usize) -> Br
                 length,
             },
             None => BridgeBuffer::status(6),
+        }
+    }))
+    .unwrap_or_else(|_| BridgeBuffer::status(5))
+}
+
+/// # Safety
+/// `data` must point to `length` readable bytes for the duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dzban_result_grid(
+    handle: u64,
+    data: *const u8,
+    length: usize,
+) -> BridgeBuffer {
+    catch_unwind(AssertUnwindSafe(|| {
+        if data.is_null() || length > 32 * 1024 * 1024 {
+            return BridgeBuffer::status(7);
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(data, length) };
+        let Some(payload) = grid::apply(handle, bytes) else {
+            return BridgeBuffer::status(7);
+        };
+        let created = payload["handle"].as_u64().filter(|id| *id != handle);
+        let record =
+            serde_json::to_vec(&json!({"schema":1,"revision":0,"payload":payload})).unwrap();
+        match handles::buffer(record) {
+            Some((token, data, length)) => BridgeBuffer {
+                status: 0,
+                token,
+                data,
+                length,
+            },
+            None => {
+                if let Some(created) = created {
+                    handles::release(created);
+                }
+                BridgeBuffer::status(6)
+            }
         }
     }))
     .unwrap_or_else(|_| BridgeBuffer::status(5))

@@ -11,11 +11,11 @@ extension ApplicationClient {
         let scope = address.scope
         return try await bridge.request(.readCell(session: scope.session, document: scope.document, generation: scope.generation, row: address.row, column: address.column, offset: offset, count: count), as: CellChunk.self)
     }
-    public func export(_ scope: ResultScope, row: Int? = nil, column: Int? = nil, ranges: [ExportRowRange]? = nil) async throws -> (text: String, isNull: Bool) {
+    public func export(_ scope: ResultScope, row: Int? = nil, column: Int? = nil, ranges: [ExportRowRange]? = nil, columns: [Int]? = nil) async throws -> (text: String, isNull: Bool) {
         let id = UUID()
         let bridge = bridge
         let start = Task.detached {
-            try await bridge.request(.startExport(id, session: scope.session, document: scope.document, generation: scope.generation, row: row, column: column, ranges: ranges), as: [String: Bool].self)
+            try await bridge.request(.startExport(id, session: scope.session, document: scope.document, generation: scope.generation, row: row, column: column, ranges: ranges, columns: columns), as: [String: Bool].self)
         }
         _ = try await start.value
         defer { Task { _ = try? await bridge.request(.closeExport(id), as: [String: Bool].self) } }

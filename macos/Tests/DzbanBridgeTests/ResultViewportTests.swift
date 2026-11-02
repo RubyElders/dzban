@@ -449,6 +449,14 @@ final class NativeResultPreviewTests: XCTestCase {
         XCTAssertEqual(previews, 4)
         XCTAssertEqual(releases.count, 3)
         XCTAssertEqual(Double(try XCTUnwrap(releases.last)), 10, accuracy: 1)
+        table.keyDown(with: try event(.keyDown, timestamp: 5))
+        let nextPress = try event(.keyDown, timestamp: 6)
+        XCTAssertNotNil(table.routePeekEvent(nextPress))
+        table.keyDown(with: nextPress)
+        XCTAssertNil(table.routePeekEvent(try event(.keyUp, timestamp: 6.02)))
+        XCTAssertEqual(previews, 6)
+        XCTAssertEqual(releases.count, 4)
+        XCTAssertEqual(Double(try XCTUnwrap(releases.last)), 20, accuracy: 1)
     }
 
 }

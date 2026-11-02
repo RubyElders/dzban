@@ -9,6 +9,13 @@ public protocol ResultSource: Sendable {
     func cell(_ address: ResultAddress, offset: Int, count: Int) async throws -> CellChunk
     func originalCell(_ address: ResultAddress) async throws -> OriginalCell
     func markdown(_ scope: ResultScope, rows: IndexSet) async throws -> String
+    func gridText(_ scope: ResultScope, ranges: [ExportRowRange], columns: [Int]) async throws -> String
+}
+
+extension ResultSource {
+    public func gridText(_ scope: ResultScope, ranges: [ExportRowRange], columns: [Int]) async throws -> String {
+        throw NSError(domain: "Dzban.ResultSource", code: 1, userInfo: [NSLocalizedDescriptionKey: "This result source does not support selection export"])
+    }
 }
 
 public struct BridgeResultSource: ResultSource {
@@ -27,6 +34,9 @@ public struct BridgeResultSource: ResultSource {
     }
     public func markdown(_ scope: ResultScope, rows: IndexSet) async throws -> String {
         try await application.export(scope, ranges: rows.rangeView.map { ExportRowRange(start: $0.lowerBound, end: $0.upperBound) }).text
+    }
+    public func gridText(_ scope: ResultScope, ranges: [ExportRowRange], columns: [Int]) async throws -> String {
+        try await application.export(scope, ranges: ranges, columns: columns).text
     }
     public func cell(_ address: ResultAddress, offset: Int, count: Int) async throws -> CellChunk {
         try await application.resultCell(address, offset: offset, count: count)
@@ -86,6 +96,12 @@ public final class ResultViewport: ObservableObject {
     public static let pageRows = 64
     public static let pageColumns = 8
     var tablePositions: [UUID: ResultTablePosition] = [:]
+    private var grids: [UUID: ResultGrid] = [:]
+    private var restoringGrid: ResultGrid?
+    func stopGridRestoration() { restoringGrid = nil }
+    func removeGrid(for document: UUID) { grids.removeValue(forKey: document) }
+    var grid: ResultGrid? { scope.flatMap { grids[$0.document] } }
+    var gridAction: ((String) -> Void)?
     var isFinished: Bool { terminal }
     weak var focusCycle: WorkspaceFocusCycle?
     var isFocusable: Bool { availableRows > 0 && !columns.isEmpty }
@@ -138,6 +154,8 @@ public final class ResultViewport: ObservableObject {
     public func update(session: UUID, document: DocumentSnapshot) {
         let next = ResultScope(session: session, document: document.document, generation: document.generation)
         if scope != next {
+            restoringGrid = grids[next.document]
+            if let previous = grids[next.document] { grids[next.document] = try? previous.clone() }
             copyTask?.cancel()
             copyError = nil
             epoch &+= 1
@@ -190,6 +208,8 @@ public final class ResultViewport: ObservableObject {
         copyError = nil
         epoch &+= 1
         scope = nil
+        restoringGrid = nil
+        gridAction = nil
         for item in active.values { item.task.cancel() }
         cache.clear()
         columns = []
@@ -198,6 +218,45 @@ public final class ResultViewport: ObservableObject {
         selected = nil
         canRead = false
         revision &+= 1
+    }
+
+    func reportGridError(_ error: Error) { loadError = error.localizedDescription }
+
+    func prepareGrid() {
+        guard let scope, !columns.isEmpty else { return }
+        do {
+            if let previous = restoringGrid, previous.schema == columns {
+                let restored = try previous.clone()
+                try restored.apply("resize", ["rows": availableRows])
+                grids[scope.document] = restored
+                if terminal { restoringGrid = nil }
+            } else if grids[scope.document]?.schema != columns {
+                grids[scope.document] = try ResultGrid(columns: columns, rows: availableRows)
+                restoringGrid = nil
+            } else { try grids[scope.document]?.apply("resize", ["rows": availableRows]) }
+        } catch { loadError = error.localizedDescription }
+    }
+
+    func copyGrid(to pasteboard: NSPasteboard? = nil) {
+        guard let scope, let state = grid?.state, !state.ranges.isEmpty, !state.columns.isEmpty else { return }
+        let pasteboard = pasteboard ?? ResultMarkdown.pasteboard
+        copyTask?.cancel()
+        copyError = nil
+        copyTask = Task { [weak self, source] in
+            do {
+                let text = try await source.gridText(scope, ranges: state.ranges, columns: state.columns)
+                try Task.checkCancellation()
+                guard self?.scope == scope else { return }
+                let single = state.ranges.count == 1 && state.ranges[0].end == state.ranges[0].start + 1 && state.columns.count == 1 && state.columns[0] > 0
+                pasteboard.declareTypes(single ? [.string] : [.string, NSPasteboard.PasteboardType("net.daringfireball.markdown")], owner: nil)
+                pasteboard.setString(text, forType: .string)
+                if !single { pasteboard.setString(text, forType: NSPasteboard.PasteboardType("net.daringfireball.markdown")) }
+            } catch is CancellationError {
+            } catch {
+                guard !Task.isCancelled, self?.scope == scope else { return }
+                self?.copyError = error.localizedDescription
+            }
+        }
     }
 
     func copyRows(_ rows: IndexSet, to pasteboard: NSPasteboard? = nil) {
@@ -269,8 +328,11 @@ public final class ResultViewport: ObservableObject {
         let worstTileBytes = Self.pageRows * Self.pageColumns * (256 * 4 + 64) + Self.pageRows * 64 + 128
         let count = min(cache.maximumPages, max(1, cache.maximumBytes / worstTileBytes))
         var keys: [ResultTileKey] = []
+        let normal = Array(stride(from: firstColumn, through: lastColumn, by: Self.pageColumns))
+        let pinned = (grid?.state.frozen ?? []).filter { $0 > 0 && $0 <= columns.count }.map { ($0 - 1) / Self.pageColumns * Self.pageColumns }
+        let requested = Array(NSOrderedSet(array: pinned + normal)) as? [Int] ?? normal
         for row in stride(from: firstRow, through: lastRow, by: Self.pageRows) {
-            for column in stride(from: firstColumn, through: lastColumn, by: Self.pageColumns) {
+            for column in requested {
                 keys.append(ResultTileKey(row: row, column: column))
                 if keys.count == count { return keys }
             }
