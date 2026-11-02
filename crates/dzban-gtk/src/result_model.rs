@@ -116,6 +116,7 @@ struct Source {
 
 mod imp {
     use super::*;
+    use gtk4::glib;
 
     #[derive(Default)]
     pub struct ResultListModel {
