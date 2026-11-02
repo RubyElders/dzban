@@ -7,6 +7,7 @@ pub enum Handle {
     App(Arc<App>),
     Stream(Arc<Stream>),
     Syntax(Arc<Mutex<dzban_core::sql::SqlLexer>>),
+    Grid(Arc<Mutex<dzban_core::outputs::grid::ResultGrid>>),
 }
 
 #[derive(Default)]
@@ -52,6 +53,16 @@ pub fn syntax(id: u64) -> Option<Arc<Mutex<dzban_core::sql::SqlLexer>>> {
     }
 }
 
+pub fn insert_grid(grid: dzban_core::outputs::grid::ResultGrid) -> Option<u64> {
+    insert(Handle::Grid(Arc::new(Mutex::new(grid))))
+}
+pub fn grid(id: u64) -> Option<Arc<Mutex<dzban_core::outputs::grid::ResultGrid>>> {
+    match registry().lock().unwrap().handles.get(&id)? {
+        Handle::Grid(grid) => Some(grid.clone()),
+        _ => None,
+    }
+}
+
 pub fn app(id: u64) -> Option<Arc<App>> {
     match registry().lock().unwrap().handles.get(&id)? {
         Handle::App(app) => Some(app.clone()),
@@ -77,7 +88,7 @@ pub fn release(id: u64) -> bool {
     drop(registry);
     match handle {
         Some(Handle::Stream(stream)) => stream.close(),
-        Some(Handle::App(_) | Handle::Syntax(_)) => (),
+        Some(Handle::App(_) | Handle::Syntax(_) | Handle::Grid(_)) => (),
         None => return false,
     }
     true

@@ -66,14 +66,18 @@ final class WindowActionsModel: ObservableObject {
         let title: String
         let detail: String
         let enabled: Bool
+        var ownsFocus = false
         let perform: () -> Void
     }
 
     var items: [ActionItem] {
         let store = store
         var items = [
-            ActionItem(id: "focus-query", title: "Focus Query Editor", detail: "Return to SQL at the current cursor position", enabled: store.document != nil && store.navigationAvailable) { if let document = store.document { store.editor(for: document).requestFocus() } },
-            ActionItem(id: "focus-results", title: "Focus Results", detail: "Navigate result rows and cells", enabled: store.document != nil && store.navigationAvailable && store.results.isFocusable) { store.results.requestFocus() },
+            ActionItem(id: "focus-query", title: "Focus Query Editor", detail: "Return to SQL at the current cursor position", enabled: store.document != nil && store.navigationAvailable, ownsFocus: true) { if let document = store.document { store.editor(for: document).requestFocus() } },
+            ActionItem(id: "focus-results", title: "Focus Results", detail: "Navigate result rows and cells", enabled: store.document != nil && store.navigationAvailable && store.results.isFocusable, ownsFocus: true) { store.results.requestFocus() },
+            ActionItem(id: "copy-results", title: "Copy Result Selection", detail: "Copy one value as text or a selection as Markdown", enabled: store.results.isFocusable && store.navigationAvailable, ownsFocus: true) { store.results.gridAction?("copy") },
+            ActionItem(id: "result-rows", title: "Toggle Whole Result Rows", detail: "Switch between cells and whole rows", enabled: store.results.isFocusable && store.navigationAvailable, ownsFocus: true) { store.results.gridAction?("rows") },
+            ActionItem(id: "freeze-column", title: "Freeze or Unfreeze Result Column", detail: "Keep the current column at the nearest table edge", enabled: store.results.isFocusable && store.navigationAvailable && store.results.grid?.state.cursor?.column != 0, ownsFocus: true) { store.results.gridAction?("freeze") },
             ActionItem(id: "connections", title: "Show Connections", detail: "Choose a database connection", enabled: store.navigationAvailable) { Task { await store.chooseConnections() } },
             ActionItem(id: "history", title: "Query History", detail: "Show saved queries on the left", enabled: true) { store.historyVisible = true },
             ActionItem(id: "new", title: "New Query Tab", detail: "Choose a connection for a new query", enabled: store.navigationAvailable) { Task { await store.newDocument() } },
@@ -122,7 +126,7 @@ final class WindowActionsModel: ObservableObject {
     func submit(restoreFocus: () -> Void) {
         guard let action = items.first(where: { $0.enabled && $0.id == highlighted }) else { return }
         dismiss()
-        restoreFocus()
+        if !action.ownsFocus { restoreFocus() }
         action.perform()
     }
 }

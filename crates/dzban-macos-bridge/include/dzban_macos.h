@@ -15,6 +15,9 @@ uint32_t dzban_abi_version(void);
 /* Pure policy with no I/O; may run on the UI thread. Input is at most 32 MiB JSON.
  * Status 7 means invalid input. Successful buffers use the normal token release rules. */
 BridgeBuffer dzban_result_view(const uint8_t *data, size_t length);
+/* Grid create/clone responses own a handle released with dzban_release.
+ * Other commands mutate that handle without I/O. Release each returned buffer token. */
+BridgeBuffer dzban_result_grid(uint64_t handle, const uint8_t *data, size_t length);
 uint64_t dzban_create(void);
 /* Syntax work has no I/O but belongs on a background worker. Copies up to 32 MiB of UTF-8.
  * Read sequential binary batches of at most 512 spans; release each buffer token and the lexer handle.

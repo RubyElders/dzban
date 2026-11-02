@@ -33,7 +33,7 @@ struct ResultTable: NSViewRepresentable {
         scroll.rulersVisible = true
         table.delegate = context.coordinator
         table.dataSource = context.coordinator
-        table.headerView = NSTableHeaderView()
+        table.headerView = ResultGridHeaderView()
         table.style = .plain
         table.usesAlternatingRowBackgroundColors = true
         table.columnAutoresizingStyle = .noColumnAutoresizing
@@ -45,7 +45,7 @@ struct ResultTable: NSViewRepresentable {
         table.intercellSpacing = .zero
         table.setAccessibilityIdentifier("results.table")
         table.setAccessibilityLabel("Query results")
-        table.setAccessibilityHelp("Copy selected rows as Markdown. Select All selects the full result. Space opens the row preview; double-click opens a full cell value.")
+        table.setAccessibilityHelp("Copy a cell as text or a selection as Markdown. Shift extends a selection. Command Shift R toggles whole rows. X freezes the current column. Space opens the row preview; double-click opens a full cell value.")
         context.coordinator.table = table
         table.userNavigated = { [weak coordinator = context.coordinator] in coordinator?.cancelRestoration() }
         table.didLayout = { [weak coordinator = context.coordinator] in
@@ -72,12 +72,13 @@ struct ResultTable: NSViewRepresentable {
         table.cancelQuery = cancel
         table.peekRow = { [weak table, weak coordinator] in
             if let table, let coordinator {
-                let visible = table.columnIndexes(in: table.dataVisibleRect)
+                let visible = table.gridVisibleColumns
                 let selected = coordinator.model.selected
                 let selectedVisible = selected.map { visible.contains($0.column) } ?? false
-                if !selectedVisible, let visibleColumn = visible.first {
+                if table.rowNumberSelected || !selectedVisible, let visibleColumn = visible.first {
                     let column = selected == nil ? 0 : visibleColumn
-                    let row = selected?.row ?? max(0, table.rows(in: table.visibleRect).location)
+                    let visibleRow = table.rows(in: table.visibleRect).location
+                    let row = selected?.row ?? (visibleRow == NSNotFound ? 0 : max(0, visibleRow))
                     coordinator.model.select(row: row, column: column)
                 }
             }
@@ -114,12 +115,14 @@ struct ResultTable: NSViewRepresentable {
                 header.leadingInset = index == 0 ? WorkspaceLayout.gutterInset : WorkspaceLayout.columnInset
                 header.trailingInset = index == model.columns.count - 1 ? WorkspaceLayout.textInset : WorkspaceLayout.columnInset
                 native.headerCell = header
-                native.width = max(60, (column.name as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 12)]).width + 24)
+                native.width = max(60, (column.name as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 12)]).width + 44)
                 native.minWidth = 60
                 native.maxWidth = .greatestFiniteMagnitude
                 table.addTableColumn(native)
             }
         }
+        model.prepareGrid()
+        coordinator.configureGrid()
         coordinator.sizeColumns()
         let selectedRows = table.selectedRowIndexes.intersection(IndexSet(integersIn: 0..<model.availableRows))
         table.reloadData()
@@ -134,6 +137,7 @@ struct ResultTable: NSViewRepresentable {
             if clip.bounds.minY > maximumY { clip.scroll(to: NSPoint(x: clip.bounds.minX, y: maximumY)) }
         }
         coordinator.restorePosition()
+        coordinator.syncGrid()
         coordinator.applying = false
         model.focusCycle?.update(table, included: model.isFocusable) { [weak coordinator] in coordinator?.focus() }
         coordinator.scheduleVisible()
@@ -204,13 +208,21 @@ struct ResultTable: NSViewRepresentable {
             let description = value.map { $0.text == nil ? "SQL NULL" : ResultCellDisplay.preview($0) } ?? "Loading"
             cell.textField?.setAccessibilityHelp("Row \(row + 1), \(model.columns[column].name): \(description)")
             cell.setAccessibilityLabel("Row \(row + 1), \(model.columns[column].name): \(description)")
-            cell.cellSelected = (tableView as? NativeResultTable)?.rowNumberSelected != true && model.selected?.row == row && model.selected?.column == column
+            cell.cellSelected = model.grid?.state.contains(row: row, column: column + 1) == true
+            cell.cursor = model.grid?.state.cursor == ResultPosition(row: row, column: column + 1)
             return cell
         }
+        func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? { ResultGridRowView() }
         func tableViewSelectionDidChange(_ notification: Notification) {
             guard !applying, let table else { return }
+            if let state = model.grid?.state {
+                var rows = IndexSet()
+                for range in state.ranges { rows.insert(integersIn: range.start..<range.end) }
+                if rows == table.selectedRowIndexes { return }
+            }
             cancelRestoration()
             model.select(row: table.selectedRow, column: min(table.focusedColumn, max(0, columns.count - 1)))
+            if table.selectedRow >= 0 { performGrid("cell", ["row": table.selectedRow, "column": table.focusedColumn + 1, "extend": false]) }
             rememberPosition()
             table.enclosingScrollView?.verticalRulerView?.needsDisplay = true
         }
@@ -220,14 +232,15 @@ struct ResultTable: NSViewRepresentable {
             if model.selected == nil, model.availableRows > 0, table.numberOfColumns > 0 {
                 let visible = table.rows(in: table.visibleRect)
                 let row = visible.location == NSNotFound ? 0 : min(max(0, visible.location), model.availableRows - 1)
-                let column = table.columnIndexes(in: table.dataVisibleRect).first ?? 0
+                let column = table.gridVisibleColumns.first ?? 0
                 model.select(row: row, column: column)
                 table.focusedColumn = column
                 table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
             }
             if let selected = model.selected {
                 table.scrollRowToVisible(selected.row)
-                table.scrollColumnToVisible(selected.column)
+                if table.grid != nil { table.revealGridColumn(table.grid?.state.cursor?.column ?? selected.column + 1) }
+                else { table.scrollColumnToVisible(selected.column) }
             }
             window.makeFirstResponder(table)
         }
@@ -289,7 +302,7 @@ struct ResultTable: NSViewRepresentable {
             }
         }
 
-        func cancelRestoration() { pendingPosition = nil; layoutPosition = nil }
+        func cancelRestoration() { pendingPosition = nil; layoutPosition = nil; model.stopGridRestoration() }
 
         func tableViewColumnDidResize(_ notification: Notification) {
             guard !applying else { return }
@@ -302,7 +315,7 @@ struct ResultTable: NSViewRepresentable {
             guard scope == model.scope, columns == model.columns, let table, table.tableColumns.count == columns.count else { return }
             if sizing.count != columns.count {
                 sizing = table.tableColumns.enumerated().map { index, column in
-                    ResultColumnSizing(preferred: max(60, (columns[index].name as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 12)]).width + 24), assigned: column.width)
+                    ResultColumnSizing(preferred: max(60, (columns[index].name as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 12)]).width + 44), assigned: column.width)
                 }
             }
             let rows = min(16, model.availableRows)
@@ -328,6 +341,75 @@ struct ResultTable: NSViewRepresentable {
                 sizing[index].assigned = widths[index]
                 if abs(table.tableColumns[index].width - widths[index]) > 0.5 { table.tableColumns[index].width = widths[index] }
             }
+        }
+
+        func configureGrid() {
+            guard let table else { return }
+            table.grid = model.grid
+            table.gridChanged = { [weak self] action, arguments in self?.performGrid(action, arguments) }
+            table.gridValue = { [weak model] row, column in model?.value(row: row, column: column) }
+            table.copySelection = { [weak model] in model?.copyGrid() }
+            model.gridAction = { [weak self] action in
+                guard let self, let table = self.table else { return }
+                self.focus()
+                if action == "copy" { self.model.copyGrid() }
+                else if action == "freeze" { self.performGrid("freeze", ["column": self.model.grid?.state.cursor?.column ?? table.focusedColumn + 1]) }
+                else { self.performGrid("toggle_rows", ["visible": [0] + table.gridVisibleColumns.map { $0 + 1 }]) }
+            }
+        }
+
+        func performGrid(_ action: String, _ arguments: [String: Any] = [:]) {
+            guard let grid = model.grid, let table else { return }
+            if action == "freeze", arguments["column"] as? Int == 0 { return }
+            cancelRestoration()
+            do {
+                let state = try grid.apply(action, arguments)
+                let wasApplying = applying
+                applying = true
+                defer { applying = wasApplying }
+                if let cursor = state.cursor {
+                    model.select(row: cursor.row, column: max(0, cursor.column - 1))
+                    table.focusedColumn = max(0, cursor.column - 1)
+                    table.rowNumberSelected = cursor.column == 0 || state.mode == "rows"
+                }
+                var rows = IndexSet()
+                for range in state.ranges { rows.insert(integersIn: range.start..<range.end) }
+                table.selectRowIndexes(rows, byExtendingSelection: false)
+                table.reloadData()
+                table.headerView?.needsDisplay = true
+                table.enclosingScrollView?.verticalRulerView?.needsDisplay = true
+                if ["move", "cell"].contains(action), let cursor = state.cursor {
+                    table.scrollRowToVisible(cursor.row)
+                    table.revealGridColumn(cursor.column)
+                }
+                (table.enclosingScrollView as? ResultScrollView)?.refreshFrozen()
+                rememberPositionAfterGrid()
+                scheduleVisible()
+            } catch { model.reportGridError(error) }
+        }
+
+        private func rememberPositionAfterGrid() {
+            let wasApplying = applying
+            applying = false
+            rememberPosition()
+            applying = wasApplying
+        }
+
+        func syncGrid() {
+            guard let table, let grid = model.grid else { return }
+            if let selected = model.selected {
+                if grid.state.mode == "rows" {
+                    if grid.state.cursor?.row != selected.row { _ = try? grid.apply("row", ["row": selected.row, "gesture": "replace"]) }
+                } else if grid.state.cursor?.row != selected.row || grid.state.cursor?.column != selected.column + 1 && grid.state.cursor?.column != 0 {
+                    _ = try? grid.apply("cell", ["row": selected.row, "column": selected.column + 1, "extend": false])
+                }
+            }
+            if grid.state.cursor != nil {
+                var rows = IndexSet()
+                for range in grid.state.ranges { rows.insert(integersIn: range.start..<range.end) }
+                table.selectRowIndexes(rows, byExtendingSelection: false)
+            }
+            (table.enclosingScrollView as? ResultScrollView)?.refreshFrozen()
         }
 
         func scheduleVisible() {
@@ -376,6 +458,10 @@ public enum ResultCellDisplay {
 final class NativeResultTable: NSTableView {
     var didLayout: (() -> Void)?
     var userNavigated: (() -> Void)?
+    var grid: ResultGrid?
+    var gridChanged: ((String, [String: Any]) -> Void)?
+    var gridValue: ((Int, Int) -> ViewportCell?)?
+    var copySelection: (() -> Void)?
     override func layout() { super.layout(); didLayout?() }
     private var accessibleColumns: [Int: NSAccessibilityElement] = [:]
     private func accessibleArray(_ attribute: NSAccessibility.Attribute) -> [Any]? {
@@ -450,20 +536,24 @@ final class NativeResultTable: NSTableView {
     }
     private struct PeekEventResult: @unchecked Sendable { let event: NSEvent? }
     private func beginPeek(_ event: NSEvent) {
-        guard peekStarted == nil else { return }
+        resetPeek()
         peekStarted = event.timestamp
-        peekRow?()
         peekMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp]) { [weak self] event in
             MainActor.assumeIsolated {
                 guard let self else { return PeekEventResult(event: event) }
                 return PeekEventResult(event: self.routePeekEvent(event))
             }.event
         }
+        peekRow?()
     }
 
     func routePeekEvent(_ event: NSEvent) -> NSEvent? {
         guard [.keyDown, .keyUp].contains(event.type), event.keyCode == 49, let start = peekStarted else { return event }
-        if event.type == .keyDown { return nil }
+        if event.type == .keyDown {
+            if event.isARepeat { return nil }
+            resetPeek()
+            return event
+        }
         releaseRow?(UInt64(max(0, event.timestamp - start) * 1000))
         resetPeek()
         return nil
@@ -485,11 +575,23 @@ final class NativeResultTable: NSTableView {
             rect.size.width = ruler.bounds.width
             return (ruler, rect.intersection(ruler.visibleRect))
         }
+        if let anchor = (enclosingScrollView as? ResultScrollView)?.frozenAnchor(row: selectedRow, column: focusedColumn) { return anchor }
         let cell = frameOfCell(atColumn: focusedColumn, row: selectedRow).intersection(dataVisibleRect)
         return cell.isEmpty ? nil : (self, cell)
     }
     var rowNumberSelected = false
-    func selectNumberedRow(_ row: Int) {
+    func focusGrid() {
+        window?.makeFirstResponder(self)
+        if grid?.state.cursor == nil, numberOfRows > 0, numberOfColumns > 0 {
+            gridChanged?("cell", ["row": 0, "column": (gridVisibleColumns.first ?? 0) + 1, "extend": false])
+        }
+    }
+    func selectNumberedRow(_ row: Int, modifiers: NSEvent.ModifierFlags = []) {
+        if grid != nil {
+            window?.makeFirstResponder(self)
+            gridChanged?("row", ["row": row, "gesture": Self.gesture(modifiers)])
+            return
+        }
         guard row >= 0, row < numberOfRows else { return }
         rowNumberSelected = true
         focusedColumn = columnIndexes(in: dataVisibleRect).first ?? 0
@@ -512,10 +614,48 @@ final class NativeResultTable: NSTableView {
         let row = row(at: point)
         let column = column(at: point)
         if column >= 0 { focusedColumn = column }
-        super.mouseDown(with: event)
-        selectCell?(row, column)
+        if grid != nil, row < 0 || column < 0 { focusGrid(); return }
+        if row >= 0, column >= 0, grid != nil {
+            window?.makeFirstResponder(self)
+            gridChanged?("cell", ["row": row, "column": column + 1, "extend": event.modifierFlags.contains(.shift)])
+            if event.clickCount == 2 { inspectCell?() }
+        } else {
+            super.mouseDown(with: event)
+            selectCell?(row, column)
+        }
+    }
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if window?.firstResponder === self, event.modifierFlags.intersection([.command, .control, .option, .shift]) == .command {
+            if event.charactersIgnoringModifiers == "a" { selectAll(nil); return true }
+            if event.charactersIgnoringModifiers == "c" { copy(nil); return true }
+        }
+        return super.performKeyEquivalent(with: event)
     }
     override func keyDown(with event: NSEvent) {
+        let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
+        if grid != nil {
+            if modifiers == .control && event.keyCode == 49 {
+                gridChanged?("toggle_rows", ["visible": [0] + gridVisibleColumns.map { $0 + 1 }]); return
+            }
+            if modifiers.isEmpty && event.charactersIgnoringModifiers == "x" {
+                gridChanged?("freeze", ["column": grid?.state.cursor?.column ?? focusedColumn + 1]); return
+            }
+            if modifiers.isEmpty || modifiers == .shift {
+                let delta: (Int, Int)?
+                switch event.keyCode {
+                case 123: delta = (-1, 0)
+                case 124: delta = (1, 0)
+                case 125: delta = (0, 1)
+                case 126: delta = (0, -1)
+                case 116: delta = (0, -max(1, Int(visibleRect.height / rowHeight)))
+                case 121: delta = (0, max(1, Int(visibleRect.height / rowHeight)))
+                case 115: delta = (0, -numberOfRows)
+                case 119: delta = (0, numberOfRows)
+                default: delta = nil
+                }
+                if let delta { gridChanged?("move", ["horizontal": delta.0, "vertical": delta.1, "extend": modifiers == .shift]); return }
+            }
+        }
         let plain = event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty
         if plain && [115, 116, 119, 121, 123, 124, 125, 126].contains(event.keyCode) { userNavigated?() }
         if plain && event.keyCode == 49, canPeek { if !event.isARepeat { beginPeek(event) }; return }
@@ -530,9 +670,10 @@ final class NativeResultTable: NSTableView {
         super.keyDown(with: event)
     }
     override func selectAll(_ sender: Any?) {
+        if grid != nil { gridChanged?("all", [:]); return }
         selectRowIndexes(IndexSet(integersIn: 0..<numberOfRows), byExtendingSelection: false)
     }
-    @objc func copy(_ sender: Any?) { if !selectedRowIndexes.isEmpty { copyRows?(selectedRowIndexes) } }
+    @objc func copy(_ sender: Any?) { if grid != nil { copySelection?() } else if !selectedRowIndexes.isEmpty { copyRows?(selectedRowIndexes) } }
     override func validateUserInterfaceItem(_ item: NSValidatedUserInterfaceItem) -> Bool {
         if item.action == #selector(selectAll(_:)) { return numberOfRows > 0 }
         if item.action == #selector(copy(_:)) { return !selectedRowIndexes.isEmpty }
@@ -544,6 +685,7 @@ final class NativeResultTable: NSTableView {
 private final class ResultCellView: NSTableCellView {
     var leadingInset: CGFloat = WorkspaceLayout.columnInset
     var trailingInset: CGFloat = WorkspaceLayout.columnInset
+    var cursor = false { didSet { if oldValue != cursor { needsDisplay = true } } }
     var cellSelected = false { didSet { if oldValue != cellSelected { needsDisplay = true } } }
     override func layout() {
         super.layout()
@@ -551,7 +693,8 @@ private final class ResultCellView: NSTableCellView {
     }
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        if cellSelected {
+        if cellSelected { NSColor.controlAccentColor.withAlphaComponent(0.18).setFill(); bounds.fill() }
+        if cursor {
             NSColor.controlAccentColor.setStroke()
             let border = NSBezierPath(rect: bounds.insetBy(dx: 1, dy: 1))
             border.lineWidth = 2
@@ -572,6 +715,15 @@ private final class ResultColumnHeaderCell: NSTableHeaderCell {
         paragraph.lineBreakMode = .byTruncatingTail
         let attributes: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.labelColor, .paragraphStyle: paragraph]
         let height = (stringValue as NSString).size(withAttributes: attributes).height
+        if let table = (controlView as? NSTableHeaderView)?.tableView as? NativeResultTable,
+           let column = table.tableColumns.firstIndex(where: { $0.headerCell === self }) {
+            if table.grid?.state.mode == "columns", table.grid?.state.columns.contains(column + 1) == true {
+                NSColor.controlAccentColor.withAlphaComponent(0.2).setFill(); cellFrame.fill()
+            }
+            if table.grid?.state.frozen.contains(column + 1) == true {
+                NSImage(systemSymbolName: "lock.fill", accessibilityDescription: "Frozen column")?.draw(in: NSRect(x: cellFrame.maxX - 18, y: cellFrame.midY - 6, width: 12, height: 12))
+            }
+        }
         let textRect = NSRect(x: cellFrame.minX + leadingInset, y: cellFrame.midY - height / 2, width: max(0, cellFrame.width - leadingInset - trailingInset), height: height)
         (stringValue as NSString).draw(in: textRect, withAttributes: attributes)
         let pixel = 1 / (controlView.window?.backingScaleFactor ?? 1)
@@ -646,7 +798,7 @@ private final class ResultRowNumbers: NSRulerView {
         guard let table else { return }
         let point = table.convert(event.locationInWindow, from: nil)
         let row = table.row(at: NSPoint(x: 0, y: point.y))
-        table.selectNumberedRow(row)
+        table.selectNumberedRow(row, modifiers: event.modifierFlags)
     }
 
     override func accessibilityChildren() -> [Any]? {
@@ -698,12 +850,31 @@ final class RowNumberElement: NSAccessibilityElement {
 final class ResultScrollView: NSScrollView {
     override class var isCompatibleWithResponsiveScrolling: Bool { false }
 
+    override func mouseDown(with event: NSEvent) {
+        if let table = documentView as? NativeResultTable, table.grid != nil {
+            table.focusGrid()
+        } else { super.mouseDown(with: event) }
+    }
+
     private let numberHeader = RowNumberHeader(frame: .zero)
+    private let frozenLeft = ResultFrozenPane(frame: .zero)
+    private let frozenRight = ResultFrozenPane(frame: .zero)
+    private let frozenLeftHeader = ResultFrozenPane(frame: .zero)
+    private let frozenRightHeader = ResultFrozenPane(frame: .zero)
 
     override init(frame: NSRect) {
         super.init(frame: frame)
         numberHeader.isHidden = true
         addSubview(numberHeader)
+        for pane in [frozenLeft, frozenRight, frozenLeftHeader, frozenRightHeader] {
+            pane.isHidden = true
+            pane.setAccessibilityElement(true)
+            pane.setAccessibilityRole(.group)
+            pane.setAccessibilityIdentifier("results.frozen")
+            addSubview(pane)
+        }
+        frozenLeftHeader.header = true
+        frozenRightHeader.header = true
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -718,6 +889,40 @@ final class ResultScrollView: NSScrollView {
         if clipView === contentView {
             alignHeader()
             verticalRulerView?.needsDisplay = true
+            refreshFrozen()
+        }
+    }
+
+    override func accessibilityChildren() -> [Any]? {
+        var children = super.accessibilityChildren() ?? []
+        for pane in [frozenLeft, frozenRight, frozenLeftHeader, frozenRightHeader] where !pane.isHidden {
+            if !children.contains(where: { ($0 as AnyObject) === pane }) { children.append(pane) }
+        }
+        return children
+    }
+
+    func frozenAnchor(row: Int, column: Int) -> (view: NSView, rect: NSRect)? {
+        guard let table = documentView as? NativeResultTable else { return nil }
+        for pane in [frozenLeft, frozenRight] where !pane.isHidden {
+            if let index = pane.columns.firstIndex(of: column) {
+                let x = pane.columns.prefix(index).reduce(CGFloat.zero) { $0 + table.tableColumns[$1].width }
+                let source = pane.convert(table.rect(ofRow: row), from: table)
+                let rect = NSRect(x: x, y: source.minY, width: table.tableColumns[column].width, height: source.height).intersection(pane.bounds)
+                if !rect.isEmpty { return (pane, rect) }
+            }
+        }
+        return nil
+    }
+
+    func refreshFrozen() {
+        guard let table = documentView as? NativeResultTable, let layout = table.gridLayout() else { return }
+        for (pane, header, columns, right) in [(frozenLeft, frozenLeftHeader, layout.left, false), (frozenRight, frozenRightHeader, layout.right, true)] {
+            let actual = columns.filter { $0 > 0 }.map { $0 - 1 }
+            let width = actual.reduce(CGFloat.zero) { $0 + table.tableColumns[$1].width }
+            for view in [pane, header] { view.table = table; view.columns = actual; view.isHidden = actual.isEmpty; view.needsDisplay = true }
+            let x = right ? contentView.frame.maxX - width : max(contentView.frame.minX, verticalRulerView?.frame.maxX ?? 0)
+            pane.frame = NSRect(x: x, y: contentView.frame.minY, width: width, height: contentView.frame.height)
+            header.frame = NSRect(x: x, y: numberHeader.frame.minY, width: width, height: numberHeader.frame.height)
         }
     }
 
@@ -731,19 +936,35 @@ final class ResultScrollView: NSScrollView {
         frame.size.width = max(0, contentView.frame.maxX - frame.minX)
         headerClip.frame = frame
         headerClip.scroll(to: NSPoint(x: contentView.bounds.minX + frame.minX - contentView.frame.minX, y: headerClip.bounds.minY))
+        numberHeader.table = table as? NativeResultTable
         numberHeader.frame = NSRect(x: ruler.frame.minX, y: frame.minY, width: frame.minX - ruler.frame.minX, height: frame.height)
         numberHeader.isHidden = false
         addSubview(numberHeader, positioned: .above, relativeTo: headerClip)
+        refreshFrozen()
     }
 }
 
 @MainActor
 private final class RowNumberHeader: NSView {
+    nonisolated override func accessibilityPerformPress() -> Bool {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let table = self.table else { return }
+            table.window?.makeFirstResponder(table)
+            table.gridChanged?("column", ["column": 0, "gesture": "replace"])
+        }
+        return true
+    }
+    weak var table: NativeResultTable?
+    override func mouseDown(with event: NSEvent) {
+        table?.window?.makeFirstResponder(table)
+        table?.gridChanged?("column", ["column": 0, "gesture": NativeResultTable.gesture(event.modifierFlags)])
+    }
     override init(frame: NSRect) {
         super.init(frame: frame)
         setAccessibilityElement(true)
-        setAccessibilityRole(.staticText)
+        setAccessibilityRole(.button)
         setAccessibilityLabel("Row numbers")
+        setAccessibilityHelp("Select the row-number column. Row numbers stay visible while scrolling.")
         setAccessibilityValue("#")
         setAccessibilityIdentifier("results.row-number-header")
     }

@@ -1078,3 +1078,70 @@ fn moving_tabs_preserves_selection_and_document_identity() {
     request(app, json!({"command":"shutdown"}));
     assert!(dzban_release(app));
 }
+
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn grid_exports_project_columns_and_preserve_original_single_cell_text() {
+    let app = dzban_macos_bridge::dzban_create_fixture();
+    let session = request(app, json!({"command":"connect","profile":"fixture"}))["session"].clone();
+    let document =
+        request(app, json!({"command":"open_document","session":session}))["document"].clone();
+    request(
+        app,
+        json!({"command":"submit","session":session,"document":document,"sql":"few"}),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        assert!(std::time::Instant::now() < deadline);
+        if request(
+            app,
+            json!({"command":"observe_document","session":session,"document":document}),
+        )["execution"]
+            == "finished"
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    for (ranges, columns, expected, is_null) in [
+        (
+            json!([{"start":0,"end":1}]),
+            json!([2]),
+            "žluť\nNULL😀",
+            false,
+        ),
+        (json!([{"start":1,"end":2}]), json!([2]), "", true),
+        (
+            json!([{"start":0,"end":2}]),
+            json!([2]),
+            "| value |\n| --- |\n| žluť<br>NULL😀 |\n| NULL |\n",
+            false,
+        ),
+        (
+            json!([{"start":0,"end":1}]),
+            json!([0, 1]),
+            "| # | id |\n| --- | --- |\n| 1 | 0 |\n",
+            false,
+        ),
+    ] {
+        let export = uuid::Uuid::new_v4();
+        let opened = request(
+            app,
+            json!({"command":"start_export","export":export,"session":session,"document":document,"generation":1,"ranges":ranges,"columns":columns}),
+        );
+        assert_eq!(opened["opened"], true);
+        let mut text = String::new();
+        loop {
+            let result = request(app, json!({"command":"read_export","export":export}));
+            text.push_str(result["text"].as_str().unwrap());
+            assert_eq!(result["is_null"], is_null);
+            if result["done"] == true {
+                break;
+            }
+        }
+        assert_eq!(text, expected);
+        request(app, json!({"command":"close_export","export":export}));
+    }
+    request(app, json!({"command":"shutdown"}));
+    assert!(dzban_release(app));
+}

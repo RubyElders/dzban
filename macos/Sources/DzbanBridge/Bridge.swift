@@ -190,7 +190,7 @@ public struct History: Decodable, Sendable {
     public let entries: [Entry]
 }
 
-public struct ExportRowRange: Encodable, Sendable {
+public struct ExportRowRange: Codable, Sendable {
     public let start: Int
     public let end: Int
     public init(start: Int, end: Int) { self.start = start; self.end = end }
@@ -233,6 +233,7 @@ public struct BridgeCommand: Encodable, Sendable {
     var input: NativeInput?
     var export: UUID?
     var ranges: [ExportRowRange]?
+    var columns: [Int]?
     var location: WorkspaceLocation?
     var drafts: [WorkspaceDraft]?
 
@@ -269,8 +270,8 @@ public struct BridgeCommand: Encodable, Sendable {
     }
     public static func cancelPreview(session: UUID, requestRevision: UInt64? = nil) -> Self { Self(command: "cancel_preview", session: session, requestRevision: requestRevision) }
     public static func history(session: UUID) -> Self { Self(command: "history", session: session) }
-    public static func startExport(_ export: UUID, session: UUID, document: UUID, generation: UInt64, row: Int? = nil, column: Int? = nil, ranges: [ExportRowRange]? = nil) -> Self {
-        Self(command: "start_export", session: session, document: document, generation: generation, row: row, column: column, export: export, ranges: ranges)
+    public static func startExport(_ export: UUID, session: UUID, document: UUID, generation: UInt64, row: Int? = nil, column: Int? = nil, ranges: [ExportRowRange]? = nil, columns: [Int]? = nil) -> Self {
+        Self(command: "start_export", session: session, document: document, generation: generation, row: row, column: column, export: export, ranges: ranges, columns: columns)
     }
     public static func readExport(_ export: UUID) -> Self { Self(command: "read_export", export: export) }
     public static func closeExport(_ export: UUID) -> Self { Self(command: "close_export", export: export) }
